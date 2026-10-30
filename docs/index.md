@@ -4,7 +4,7 @@ title: FeverLink3
 
 **Several players build in one shared world, each in their own game.**
 
-Version 0.2.9 · Windows and Steam · source available (PolyForm Noncommercial) · unofficial · Last updated 2026-10-27
+Version 0.2.10 · Windows and Steam · source available (PolyForm Noncommercial) · unofficial · Last updated 2026-10-30
 
 FeverLink3 is in beta: keep backups of the saves you play with.
 
@@ -19,6 +19,7 @@ FeverLink3 is in beta: keep backups of the saves you play with.
 - **Built into the game.** No separate launcher or program to run: start Transport Fever 3 from Steam as usual. Host, join, chat, sync and updates all live in the game's bottom bar and window.
 - **Build together.** Roads, rail, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
 - **Your other mods work together too.** Mods that change your world by themselves, such as Auto Line Namer, Auto Color Lines or Auto Assign Terminals, stay in sync: the host's copy makes the change and every game applies it at the same moment, and what you set in such a mod's own window reaches every game (new in 0.2.4; seen with two games on one PC).
+- **Companies.** The host starts the session with one shared company: everyone builds and pays from one account, as before. A company for each player, with its own money, is upcoming: it shows as a grayed button until it has been played between two PCs.
 - **The full game.** Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 - **Easy to join.** Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
 - **Steam invites.** Invite friends from Steam's own invite dialog; with a world loaded they join by themselves (played between two PCs over the internet).
@@ -36,11 +37,11 @@ A coloured icon in the game's bottom bar shows the session at a glance: white (n
 
 ## Quick start
 
-1. Download `FeverLink3-0.2.9.zip` from [GitHub Releases](https://github.com/AZalshehri7/FeverLink3/releases/latest) or [Nexus Mods](https://www.nexusmods.com/transportfever3/mods/19) and extract it.
+1. Download `FeverLink3-0.2.10.zip` from [GitHub Releases](https://github.com/AZalshehri7/FeverLink3/releases/latest) or [Nexus Mods](https://www.nexusmods.com/transportfever3/mods/19) and extract it.
 2. Close the game. In Steam, right-click **Transport Fever 3** → **Manage** → **Browse local files**.
 3. Copy `winhttp.dll` and the `mods` folder into that folder (merge the folders when Windows asks).
 4. Start the game from Steam, and turn on **FeverLink3 Multiplayer** in the mod list when you start or load a game.
-5. **Host:** click the FeverLink3 icon in the bottom bar → **Host a game** → **Copy code** and send it to your friend → **Start the session** when they appear. **Join:** open the FeverLink3 window, paste the code (`Ctrl+V`) and press **Join**. Only join people you trust.
+5. **Host:** click the FeverLink3 icon in the bottom bar → **Host a game** → **Copy code** and send it to your friend → when they appear, start the session with **One shared company**. **Join:** open the FeverLink3 window, paste the code (`Ctrl+V`) and press **Join**. Only join people you trust.
 
 Every player installs FeverLink3 and needs the same game version. After this first install, updates arrive automatically. More in the [playing guide](PLAYING.html).
 

@@ -109,6 +109,15 @@ local function steps(path)
 	return out
 end
 
+-- A resource of a mod is named by a pair: the text gives its path as the member's value and the mod as the member's `.first`
+-- (friend session 2026-10-30 and lab v030bay1: a stop on a Bus And Truck Bay street, `roadTemplate` res:"infrastructure/street/town/
+-- town_new_small_truck_bay.street_template", `roadTemplate.first` res:"deadeye_tpf3_bus_bay"; the reader refused the whole text as
+-- "path through a value" and every stop on such a street was cancelled). Joined as the game itself names it: "mod::/path".
+local function modResource(mod, path)
+	if type(mod) ~= "string" or mod == "" then return path end
+	return mod .. "::/" .. path:gsub("^::/", "")
+end
+
 -- Parses the text. Returns the tree and a header table { line = "=== portable ..." } or nil and why. Lines that carry no input are
 -- skipped; a line that cannot be read makes the whole text unusable (nothing is guessed).
 function M.parse(text)
@@ -128,6 +137,9 @@ function M.parse(text)
 				local last = #st
 				local isCount = st[last] == "#"
 				if isCount then last = last - 1 end
+				-- the mod half of a resource name: joined into the path the member holds (or will hold, once its own line is read)
+				local resMod = not isCount and last > 1 and st[last] == "first" and value:sub(1, 4) == "res:"
+				if resMod then last = last - 1 end
 				for i = 1, last - 1 do
 					local k = st[i]
 					if node[k] == nil then node[k] = {} end
@@ -135,7 +147,11 @@ function M.parse(text)
 					if type(node) ~= "table" then return nil, "path through a value: " .. path end
 				end
 				local k = st[last]
-				if isCount then
+				if resMod then
+					if type(node[k]) == "string" then node[k] = modResource(v, node[k]) else node[k] = { modOf = v } end
+				elseif type(node[k]) == "table" and node[k].modOf and type(v) == "string" then
+					node[k] = modResource(node[k].modOf, v)
+				elseif isCount then
 					if node[k] == nil then node[k] = {} end
 					node[k].n = v
 				else

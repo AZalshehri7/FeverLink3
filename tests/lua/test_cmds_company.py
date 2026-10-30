@@ -14,6 +14,7 @@ docs/COMPANIES.md section 8.
 
 Run:  python -I tests/lua/test_cmds_company.py        (or: python -I -m unittest discover -s tests/lua -p "test_*.py")
 """
+import glob
 import os
 import shutil
 import sys
@@ -139,114 +140,205 @@ class CompanyUnit(unittest.TestCase):
         self.assertIn(text, str(why))
         self.assertEqual(self.C.serialize(self.co), before, "a refused operation changed the registry: %s" % fields)
 
+    def seat(self, *pairs):
+        """Players say who they are (OPS.me): seat(0, "Boss", 1, "Alice")."""
+        for i in range(0, len(pairs), 2):
+            self.must(pairs[i], op="me", name=pairs[i + 1])
+
+    def companies(self):
+        """Boss (0) in c1 "One", bound to the savegame's player s:7; Alice (1) in c2 "Two", bound to the player entity 0:2."""
+        self.seat(0, "Boss", 1, "Alice")
+        self.must(0, op="found", name="One")
+        self.must(1, op="found", name="Two")
+        self.must(0, op="bind", company="c1", entity="s:7")
+        self.must(0, op="bind", company="c2", entity="0:2")
+
+    def test_the_games_loan_and_subsidy_scripts_run_for_every_company(self):
+        # stand-ins of the game's scripts (loan.script.tl, subventions.script.tl, subvention_util.tl): they book to getPlayer()
+        out = self.L.execute("""
+            local Co = ...
+            local util = { getPlayer = function() return 7 end }
+            local booked = {}
+            local loanUtil = { createAvailableLoans = function() return { { type = "Small" } } end }
+            local loan = {
+                update = function(_, state, dt)
+                    local t = state:get(); t.months = (t.months or 0) + 1; state:set(t)
+                    booked[#booked + 1] = "repay:" .. util.getPlayer()
+                end,
+                handleEvent = function(_, state, _, id, name, loans)
+                    local t = state:get(); table.insert(t.obtainedLoans, loans[2].amount); state:set(t)
+                    booked[#booked + 1] = name .. ":" .. util.getPlayer()
+                end,
+            }
+            local subUtil = { applyBonusMalus = function(b) booked[#booked + 1] = b.type .. ":" .. util.getPlayer() end }
+            local subState = { activeSubventions = {}, proposedSubventions = {
+                { uid = 1, data = { upfront = { { type = "up1" } }, complete = { { type = "done1" } } } },
+                { uid = 2, data = { upfront = { { type = "up2" } }, complete = { { type = "done2" } } } } } }
+            local stateOf = function(t) return { get = function() return t end, set = function() end } end
+            local sub = {
+                update = function(_, state)
+                    for _, v in ipairs(state:get().activeSubventions) do subUtil.applyBonusMalus(v.data.complete[1], true) end
+                end,
+                handleEvent = function(_, state, _, id, name, p)
+                    local st = state:get()
+                    for i, v in ipairs(st.proposedSubventions) do
+                        if v.uid == p.uid then
+                            table.insert(st.activeSubventions, v); table.remove(st.proposedSubventions, i)
+                            subUtil.applyBonusMalus(v.data.upfront[1], true)
+                            break
+                        end
+                    end
+                    state:set(st)   -- the game's script saves its table at the end
+                end,
+            }
+            local loaded = { [Co.LOAN_SCRIPT] = loan, [Co.LOAN_UTIL] = loanUtil, [Co.SUBSIDY_SCRIPT] = sub, [Co.SUBSIDY_UTIL] = subUtil }
+            local others = {}
+            local deps = { loaded = loaded, util = util, others = function() return others end }
+            local done = Co.scriptCompanies(deps)
+            local again = Co.scriptCompanies(deps)
+            local real = { obtainedLoans = {} }
+            loan.update(nil, stateOf(real), 1)        -- shared mode: the script as it is
+            others = { 9 }
+            loan.update(nil, stateOf(real), 1)
+            loan.handleEvent(nil, stateOf(real), "", "Loan", "Obtain", { nil, { amount = 5, fl3player = 9 } })
+            loan.handleEvent(nil, stateOf(real), "", "Loan", "Obtain", { nil, { amount = 3 } })
+            sub.handleEvent(nil, stateOf(subState), "", "Subvention", "onAccept", { uid = 1, fl3player = 9 })
+            sub.handleEvent(nil, stateOf(subState), "", "Subvention", "onAccept", { uid = 2 })
+            sub.update(nil, stateOf(subState), 1)
+            return { done = table.concat(done, ","), again = #again, booked = table.concat(booked, " "),
+                main = real.months, mainLoans = table.concat(real.obtainedLoans, ","), theirs = real.fl3["p9"].months,
+                theirLoans = table.concat(real.fl3["p9"].obtainedLoans, ","), offers = #real.fl3["p9"].availableLoans,
+                tag = tostring(subState.activeSubventions[1].fl3player), untagged = tostring(subState.activeSubventions[2].fl3player),
+                restored = util.getPlayer() }
+        """, self.Co)
+        self.assertEqual(out["done"], "loans,subsidies")
+        self.assertEqual(out["again"], 0, "wrapped once")
+        self.assertEqual(out["booked"], "repay:7 repay:7 repay:9 Obtain:9 Obtain:7 up1:9 up2:7 done1:9 done2:7")
+        self.assertEqual((out["main"], out["mainLoans"]), (2, "3"))
+        self.assertEqual((out["theirs"], out["theirLoans"], out["offers"]), (1, "5", 1))
+        self.assertEqual((out["tag"], out["untagged"], out["restored"]), ("9", "nil", 7))
+
     def test_registry_operations_and_who_may_do_them(self):
-        """found, assign, join, leave, rename, open, remove, bind, mode, addPlayer: each by whom it may, each refusal leaving the registry as it was."""
-        fx = self.must(0, op="found", name="  Ironworks \t", color=[0.9, 0.2, 0.2])
+        """me, found, join, leave, rename, remove, bind, mode, addPlayer: each by whom it may, each refusal leaving the registry as it was."""
+        self.refused(1, "has not said who they are", op="found", name="Mine")
+        self.seat(0, "Boss", 1, "  Alice ", 2, "Carol")
+        reg = self.reg()
+        self.assertEqual(reg["seats"], {0: "boss", 1: "alice", 2: "carol"}, "keyed by the name, trimmed, in lower case")
+        self.assertEqual(reg["people"]["alice"], {"name": "Alice"})
+        # any player founds a company, owns it and moves into it; names are unique whatever their case
+        fx = self.must(1, op="found", name="  Ironworks \t", color=[0.9, 0.2, 0.2])
         self.assertEqual(fx["company"], "c1")
         c = self.reg()["companies"]["c1"]
-        self.assertEqual((c["name"], c["owner"], c["open"], c.get("entity")), ("Ironworks", 0, False, None))
+        self.assertEqual((c["name"], c["owner"], c.get("entity")), ("Ironworks", "alice", None))
         self.assertEqual([c["color"][1], c["color"][2], c["color"][3]], [0.9, 0.2, 0.2])
-        self.refused(1, "only the host", op="found", name="Mine")
+        self.assertEqual(self.reg()["people"]["alice"]["company"], "c1")
+        self.refused(2, "exists already", op="found", name="IRONWORKS")
         self.refused(0, "needs a name", op="found", name="   ")
-        self.assertEqual(self.must(0, op="found", name="Bakery", open=True)["company"], "c2", "keys are never reused")
-        self.refused(1, "closed", op="join", company="c1")
-        self.must(1, op="join", company="c2")
-        self.assertEqual(self.reg()["members"], {1: "c2"})
-        self.refused(1, "no such company", op="join", company="c9")
-        self.refused(2, "only the host", op="assign", player=2, company="c1")
-        self.must(0, op="assign", player=2, company="c1")
-        self.assertEqual(self.reg()["members"], {1: "c2", 2: "c1"})
-        self.refused(0, "bad player", op="assign", player=-1, company="c1")
-        self.refused(0, "no such company", op="assign", player=3, company="c7")
-        self.must(1, op="leave")
-        self.must(0, op="assign", player=2)     # no company: takes the player out
-        self.assertEqual(self.reg()["members"], {})
-        # the host may always join; the owner of a closed company too
+        self.assertEqual(self.must(2, op="found", name="Bakery")["company"], "c2", "keys are never reused")
+        # anyone joins any company; a company holds several players
         self.must(0, op="join", company="c1")
-        self.assertEqual(self.reg()["members"], {0: "c1"})
-        self.fresh()
-        self.must(0, op="found", name="One")
-        self.must(0, op="assign", player=1, company="c1")
-        self.refused(1, "host or the owner", op="rename", company="c1", name="Mine")      # a member is not the owner
-        self.must(0, op="rename", company="c1", name="Uno")
-        self.assertEqual(self.reg()["companies"]["c1"]["name"], "Uno")
-        self.refused(0, "needs a name", op="rename", company="c1", name="")
-        self.must(0, op="open", company="c1", open=True)
-        self.assertTrue(self.reg()["companies"]["c1"]["open"])
-        self.must(0, op="bind", company="c1", entity="s:7")
-        self.refused(0, "another company", op="found", name="Two", entity="s:7")
-        self.must(0, op="found", name="Two", entity="0:4")
-        self.refused(0, "another company", op="bind", company="c2", entity="s:7")
-        self.refused(0, "bad entity key", op="bind", company="c2", entity="seven")
-        self.refused(1, "only the host", op="remove", company="c2")
-        self.must(0, op="assign", player=2, company="c2")
-        self.must(0, op="remove", company="c2")
-        self.assertNotIn("c2", self.reg()["companies"])
-        self.assertEqual(self.reg()["members"], {1: "c1"}, "members of a removed company are taken out")
-        self.assertEqual(self.must(0, op="found", name="Three")["company"], "c3")
+        self.refused(0, "no such company", op="join", company="c9")
+        self.assertEqual({w: p.get("company") for w, p in self.reg()["people"].items()}, {"alice": "c1", "boss": "c1", "carol": "c2"})
+        self.assertEqual(self.Co.companyOf(self.co, 0), "c1")
+        self.must(2, op="leave")
+        self.assertIsNone(self.Co.companyOf(self.co, 2))
+        # the owner and the host rename and remove; a member who is not the owner does not
+        self.refused(0, "exists already", op="rename", company="c2", name="ironworks")
+        self.must(2, op="join", company="c1")
+        self.refused(2, "host or the owner", op="rename", company="c1", name="Mine")
+        self.must(1, op="rename", company="c1", name="Uno")
+        self.must(0, op="rename", company="c2", name="Dos")
+        self.assertEqual((self.reg()["companies"]["c1"]["name"], self.reg()["companies"]["c2"]["name"]), ("Uno", "Dos"))
+        self.refused(1, "host or the owner", op="remove", company="c2")
+        self.must(1, op="remove", company="c1")
+        self.assertNotIn("c1", self.reg()["companies"])
+        self.assertEqual([p.get("company") for p in self.reg()["people"].values()], [None, None, None], "its players are taken out")
+        # the same person on another session id (a rejoin, the next session) takes their seat and their company along
+        self.must(0, op="join", company="c2")
+        self.must(5, op="me", name="BOSS")
+        reg = self.reg()
+        self.assertEqual((reg["seats"].get(0), reg["seats"][5], reg["people"]["boss"]["name"]), (None, "boss", "BOSS"))
+        self.assertEqual(self.Co.companyOf(self.co, 5), "c2")
+        # an operation carrying `as` seats its sender first (the window's records do)
+        self.must(7, op="found", name="Mill", **{"as": "Dave"})
+        self.assertEqual((self.reg()["seats"][7], self.Co.companyOf(self.co, 7)), ("dave", "c3"))
         self.fresh()
         self.assertTrue(self.Co.pristine(self.co))
         self.assertIsNone(self.Co.digest(self.co))
-        self.must(0, op="found", name="One")
+        self.seat(0, "Boss")
         self.assertFalse(self.Co.pristine(self.co))
         rev = self.reg()["rev"]
-        self.must(0, op="assign", player=1, company="c1")
-        self.assertEqual(self.reg()["rev"], rev + 1)
-        self.must(0, op="assign", player=1, company="c1")      # no change: the window does not redraw
-        self.assertEqual(self.reg()["rev"], rev + 1)
+        self.must(0, op="me", name="Boss")       # no change: the window does not redraw
+        self.assertEqual(self.reg()["rev"], rev)
         self.refused(0, "unknown company action", op="dance")
-        self.assertEqual(self.reg()["rev"], rev + 1)
         ok, why = self.Co.apply(self.co, self.ctx(0), 5)
         self.assertFalse(ok)
-        self.fresh()
         for i in range(16):
             self.must(0, op="found", name="C%d" % i)
-        self.refused(0, "too many", op="found", name="One more")
+        self.refused(0, "16 companies already", op="found", name="One more")
         self.must(0, op="remove", company="c3")
         self.assertEqual(self.must(0, op="found", name="x" * 200)["company"], "c17")
         self.assertEqual(len(self.reg()["companies"]["c17"]["name"]), 40)
         self.fresh()
+        self.seat(0, "Boss")
         # Arabic, two bytes a character: 20 characters make 40 bytes. Euro signs, three bytes: 13 characters make 39.
-        self.must(0, op="found", name="\u0634\u0631\u0643\u0629" * 12)
-        self.must(0, op="found", name="\u20ac" * 20)
-        self.must(0, op="found", name="x" * 39 + "\u0634")           # the second byte of the last character would not fit
+        self.must(0, op="found", name="شركة" * 12)
+        self.must(0, op="found", name="€" * 20)
+        self.must(0, op="found", name="x" * 39 + "ش")           # the second byte of the last character would not fit
         names = [self.reg()["companies"]["c%d" % i]["name"] for i in (1, 2, 3)]     # raises on bytes that are not UTF-8
-        self.assertEqual(names, ["\u0634\u0631\u0643\u0629" * 5, "\u20ac" * 13, "x" * 39])
+        self.assertEqual(names, ["شركة" * 5, "€" * 13, "x" * 39])
         self.assertTrue(all(len(n.encode("utf-8")) <= 40 for n in names))
+        # the gameplay type: a company for each player only with the native capability; the host's roster is seated and each
+        # player without a company gets one named after them
         self.fresh()
-        self.must(0, op="found", name="One", entity="s:7")
-        self.must(0, op="found", name="Two")
-        self.refused(1, "only the host", op="mode", mode="separate", experimental=True)
-        self.refused(0, "experimental", op="mode", mode="separate")
-        self.refused(0, "no player entity", op="mode", mode="separate", experimental=True)
-        self.must(0, op="bind", company="c2", entity="0:3")
-        self.must(0, op="mode", mode="separate", experimental=True)
-        self.assertEqual(self.reg()["mode"], "separate")
-        self.refused(0, "needs its player entity", op="found", name="Three")
+        self.seat(1, "Alice")
+        self.must(1, op="found", name="Alice")
+        self.refused(1, "only the host", op="mode", mode="separate", acting=True)
+        self.refused(0, "is not available in this game", op="mode", mode="separate")
         self.refused(0, "unknown mode", op="mode", mode="chaos")
+        self.must(0, op="mode", mode="separate", acting=True, players=[{"id": 0, "name": "Boss"}, {"id": 1, "name": "Alice"}, {"id": 2, "name": "Carol"}])
+        reg = self.reg()
+        self.assertEqual(reg["mode"], "separate")
+        self.assertEqual({k: (c["name"], c["owner"]) for k, c in reg["companies"].items()}, {"c1": ("Alice", "alice"), "c2": ("Boss", "boss"), "c3": ("Carol", "carol")})
+        self.must(3, op="me", name="Alice")                       # someone else called Alice: their own company, another name
+        self.must(4, op="me", name="Dave")
+        self.assertEqual((self.Co.companyOf(self.co, 3), self.Co.companyOf(self.co, 4)), ("c1", "c4"), "the same name is the same person")
+        self.refused(4, "join another one", op="leave")
+        self.refused(4, "cannot be deleted", op="remove", company="c4")
+        self.must(4, op="join", company="c2")
+        self.must(4, op="remove", company="c4")                    # empty now
         self.must(0, op="mode", mode="shared")
         self.assertEqual(self.reg()["mode"], "shared")
-        self.fresh()
-        r = self.Co.addPlayer(self.co, self.ctx(0, key="0:5"), "Ironworks", self.lua({"x": 0.1, "y": 0.2, "z": 0.3}))
+        # the host's game binds the companies to player entities: makeGameAddPlayerCmd binds the company of that name
+        self.must(0, op="bind", company="c2", entity="s:7")
+        self.refused(0, "another company", op="bind", company="c1", entity="s:7")
+        self.refused(0, "bad entity key", op="bind", company="c1", entity="seven")
+        self.refused(1, "only the host", op="bind", company="c1", entity="0:4")
+        r = self.Co.addPlayer(self.co, self.ctx(0, key="0:5"), "ALICE", self.lua({"x": 0.1, "y": 0.2, "z": 0.3}))
         self.assertTrue(r[0])
-        c = self.reg()["companies"]["c1"]
-        self.assertEqual((c["name"], c["entity"], c["owner"]), ("Ironworks", "0:5", 0))
+        self.assertEqual(self.reg()["companies"]["c1"]["entity"], "0:5")
+        r = self.Co.addPlayer(self.co, self.ctx(0, key="0:6"), "Ironworks", self.lua({"x": 0.1, "y": 0.2, "z": 0.3}))
+        c = self.reg()["companies"][r[1]["company"]]
+        self.assertEqual((c["name"], c["entity"]), ("Ironworks", "0:6"))
         self.assertEqual([c["color"][1], c["color"][2], c["color"][3]], [0.1, 0.2, 0.3])
         before = self.C.serialize(self.co)
-        for sender, key, name, text in [(1, "1:5", "Mine", "only the host"), (0, None, "Mine", "no action key"), (0, "0:6", " ", "needs a name")]:
+        for sender, key, name, text in [(1, "1:5", "Mine", "only the host"), (0, None, "Mine", "no action key"), (0, "0:7", " ", "needs a name")]:
             ok, why = self.Co.addPlayer(self.co, self.ctx(sender, key=key), name, None)
             self.assertFalse(ok)
             self.assertIn(text, why)
         self.assertEqual(self.C.serialize(self.co), before)
+        # a registry of an older save: membership by session id is dropped, the rest kept
+        old = self.lua({"v": 1, "rev": 3, "mode": "shared", "serial": 1, "companies": {"c1": {"key": "c1", "name": "One", "color": [0.5, 0.5, 0.5], "owner": 0, "open": True}},
+                        "members": {1: "c1"}, "limits": {}, "denied": {}, "ledger": {}, "made": {}, "nmade": 0})
+        self.Co.upgrade(old)
+        up = to_py(old)
+        self.assertEqual((up["people"], up["seats"], up.get("members"), up["companies"]["c1"]["name"], up["companies"]["c1"].get("owner")), ({}, {}, None, "One", None))
 
     def resolver(self, table):
         return self.L.eval("function(t) return function(k) return t[k] end end")(self.lua(table))
 
     def test_actor_rewrites_the_player_per_sender_and_postings_land_on_the_companys_entity(self):
-        self.must(0, op="found", name="One", entity="s:7")
-        self.must(0, op="found", name="Two", entity="0:2")
-        self.must(0, op="assign", player=0, company="c1")
-        self.must(0, op="assign", player=1, company="c2")
+        self.companies()
         resolve = self.resolver({"s:7": 7, "0:2": 52001, "s:55": 55})
         # shared mode: every sender keeps this game's own player entity
         for sender in (0, 1, 2):
@@ -254,7 +346,7 @@ class CompanyUnit(unittest.TestCase):
             self.Co.actor(c)
             self.assertEqual(c.player, 7)
             self.assertIsNone(c.refuse)
-        self.must(0, op="mode", mode="separate", experimental=True)
+        self.must(0, op="mode", mode="separate", acting=True)
         got = {}
         for sender in (0, 1, 2):
             c = self.L.table_from({"player": 7, "from": sender, "co": self.co, "resolve": resolve})
@@ -380,16 +472,14 @@ class CompanyUnit(unittest.TestCase):
         led = self.reg()["ledger"][1]
         self.assertEqual((led["n"]["spend"], led["made"]["makeVehicleBuyCmd"], led["gross"], led["refund"]), (2, 2, {}, 0))
 
-        self.must(0, op="found", name="One", entity="s:7")
-        self.must(0, op="found", name="Two", entity="0:2")
-        self.must(0, op="assign", player=0, company="c1")
-        self.must(0, op="assign", player=1, company="c2")
-        self.must(0, op="assign", player=2, company="c2")
+        self.companies()
+        self.must(2, op="me", name="Carol")
+        self.must(2, op="join", company="c2")
         fx = self.must(1, op="pay", to=0, amount=10000, memo="the station")
         self.assertNotIn("postings", fx, "shared mode: nothing moves in the game")
         led = self.reg()["ledger"]
-        self.assertEqual((led[1]["paid"], led[0]["received"]), (10000, 10000))
-        self.must(0, op="mode", mode="separate", experimental=True)
+        self.assertEqual((led["alice"]["paid"], led["boss"]["received"]), (10000, 10000), "a seated player's ledger is kept by identity")
+        self.must(0, op="mode", mode="separate", acting=True)
         fx = self.must(1, op="pay", to=0, amount=2500, memo="fee")
         self.assertEqual([(p["company"], p["amount"]) for p in fx["postings"].values()], [("c2", -2500), ("c1", 2500)])
         fx = self.must(1, op="pay", to=2, amount=100)
@@ -403,10 +493,18 @@ class CompanyUnit(unittest.TestCase):
         self.refused(1, "pays themselves", op="pay", to=1, amount=5)
         self.refused(1, "bad payee", op="pay", to="x", amount=5)
         led = self.reg()["ledger"]
-        self.assertEqual((led[1]["paid"], led[0]["received"]), (10000 + 2500 + 100 + 700, 10000 + 2500 + 700))
+        self.assertEqual((led["alice"]["paid"], led["boss"]["received"]), (10000 + 2500 + 100 + 700, 10000 + 2500 + 700))
+        # the window's Pay: to a company, from the sender's own; the receiving company's owner counts it as received
+        fx = self.must(1, op="pay", toCompany="c1", amount=900)
+        self.assertEqual([(p["company"], p["amount"]) for p in fx["postings"].values()], [("c2", -900), ("c1", 900)])
+        self.assertEqual((self.reg()["ledger"]["alice"]["paid"], self.reg()["ledger"]["boss"]["received"]), (14200, 14100))
+        self.refused(1, "nobody pays themselves", op="pay", toCompany="c2", amount=5)
+        self.refused(1, "no such company", op="pay", toCompany="c9", amount=5)
+        self.refused(0, "paid by its own players", op="pay", toCompany="c2", amount=5, **{"from": 1})
+        self.must(0, op="mode", mode="shared")
+        self.refused(1, "nothing to pay between companies", op="pay", toCompany="c1", amount=5)
         self.fresh()
-        self.must(0, op="found", name="One", entity="s:7")
-        self.must(0, op="found", name="Two", entity="0:2")
+        self.companies()
         booked = self.L.eval("{}")
         engine = self.L.eval("function(booked) return { bookJournalFor = function(e, n, kind) booked[#booked + 1] = e .. ':' .. n .. ':' .. tostring(kind) end } end")(booked)
         ctx = self.L.table_from({"co": self.co, "resolve": self.resolver({"s:7": 7, "0:2": 52001})})
@@ -424,7 +522,7 @@ class CompanyUnit(unittest.TestCase):
         done, failed = self.Co.runEffects(ctx, fx, nobook)
         self.assertEqual((int(done), len(failed)), (0, 2))
         self.fresh()
-        self.must(0, op="found", name="One")
+        self.must(0, op="limit", player=1, amount=5)
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 30000}))
         a = self.C.hashValue(self.Co.digest(self.co))
         self.Co.record(self.co, 2, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 100}))
@@ -432,15 +530,19 @@ class CompanyUnit(unittest.TestCase):
         self.assertNotEqual(a, b, "another player's purchase changes the digest")
         # same actions, another measured cost: same digest
         other = self.Co.new()
-        self.Co.apply(other, self.ctx(0), self.lua({"op": "found", "name": "One"}))
+        self.Co.apply(other, self.ctx(0), self.lua({"op": "limit", "player": 1, "amount": 5}))
         self.Co.record(other, 1, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 29990}))
         self.Co.record(other, 2, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 5}))
         self.assertEqual(self.C.hashValue(self.Co.digest(other)), b)
         self.Co.record(other, 2, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 5}))
         self.assertNotEqual(self.C.hashValue(self.Co.digest(other)), b, "one more action does")
+        # a ledger kept by session id before the player said who they are goes into their identity's
+        self.must(1, op="me", name="Alice")
+        led = self.reg()["ledger"]
+        self.assertNotIn(1, led)
+        self.assertEqual((led["alice"]["n"]["spend"], led["alice"]["gross"]["spend"]), (1, 30000))
         self.fresh()
-        self.must(0, op="found", name="One", entity="s:7", color=[0.5, 0.5, 0.5])
-        self.must(0, op="assign", player=1, company="c1")
+        self.companies()
         self.must(0, op="limit", player=1, amount=1000, per=5000)
         self.must(1, op="pay", to=0, amount=5, memo="x")
         self.Co.record(self.co, 1, 100, self.lua({"fn": "makeLineCreateCmd", "category": "build", "cost": 12, "created": {"key": "1:2", "kind": "LINE"}}))
@@ -465,21 +567,23 @@ class CompanyUnit(unittest.TestCase):
         self.assertEqual(got, {1: 900}, "vehicles are not lines, unreadable lines count for nothing")
 
     def test_the_status_table_the_command_codecs_and_the_window_records(self):
-        self.must(0, op="found", name="Ironworks", open=True)
-        self.must(0, op="assign", player=1, company="c1")
+        self.seat(0, "Boss", 1, "Alice", 4, "Erin")
+        self.must(1, op="found", name="Ironworks")
+        self.must(0, op="join", company="c1")
+        self.must(4, op="found", name="Mill")
         self.must(0, op="limit", player=1, amount=50000)
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 45000}))
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeLineCreateCmd", "category": "build", "cost": 3000}))
         self.Co.record(self.co, 0, 0, self.lua({"fn": "makeWorldBuildProposalCmd", "category": "build", "cost": 20000}))
         self.Co.record(self.co, 0, 0, self.lua({"fn": "makeWorldBuildProposalCmd", "category": "bulldoze", "cost": -1500}))
         self.Co.record(self.co, 5, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 10}))     # left the session
-        view = self.lua({"self": 1, "names": {0: "Boss", 1: "Alice", 2: "Carol"}, "now": 0, "earned": {1: 800}, "hostEntityKey": "s:7",
+        view = self.lua({"self": 1, "names": {0: "Boss", 1: "Alice", 2: "Carol"}, "now": 0, "earned": {"alice": 800}, "hostEntityKey": "s:7",
                          "yearLength": 96000, "monthLength": 8000, "perms": {"build": True, "bulldoze": False, "spend": True, "other": True}})
         st = to_py(self.Co.status(self.co, view))
         self.assertEqual((st["yearLength"], st["monthLength"], st["perms"]["bulldoze"], st["perms"]["build"]), (96000, 8000, False, True))
-        self.assertEqual((st["mode"], st["self"], st["isHost"], st["hostEntityKey"], st["openCompanies"]), ("shared", 1, False, "s:7", {1: "c1"}))
-        self.assertEqual([p["id"] for p in st["players"].values()], [0, 1, 2, 5])
-        self.assertEqual([p["present"] for p in st["players"].values()], [True, True, True, False], "a player who left stays in the report")
+        self.assertEqual((st["mode"], st["acting"], st["self"], st["isHost"], st["hostEntityKey"], st["identity"], st["company"]), ("shared", False, 1, False, "s:7", "alice", "c1"))
+        self.assertEqual([p["id"] for p in st["players"].values()], [0, 1, 2, 4, 5])
+        self.assertEqual([p["present"] for p in st["players"].values()], [True, True, True, False, False], "a player who left stays in the report")
         boss, alice, carol = st["players"][1], st["players"][2], st["players"][3]
         self.assertEqual((alice["name"], alice["you"], alice["company"], alice["bought"], alice["built"], alice["total"]), ("Alice", True, "c1", 1, 1, 48000))
         self.assertEqual((alice["limit"]["amount"], alice["used"], alice["remaining"], alice["blocked"]), (50000, 48000, 2000, False))
@@ -487,17 +591,53 @@ class CompanyUnit(unittest.TestCase):
         self.assertEqual([m["label"] for m in alice["made"].values()], ["lines created", "vehicles bought"])
         self.assertEqual((boss["refunded"], boss["bulldozed"], boss["total"]), (1500, 1, 20000))
         self.assertEqual((carol["name"], carol["total"], carol.get("company")), ("Carol", 0, None))
-        c1 = st["companies"][1]
-        self.assertEqual((c1["key"], c1["name"], c1["members"], c1["spent"], c1["bound"], c1["you"]), ("c1", "Ironworks", {1: 1}, 48000, False, True))
+        c1, mill = st["companies"][1], st["companies"][2]
+        self.assertEqual((c1["key"], c1["name"], c1["spent"], c1["spentText"], c1["bound"], c1["you"], c1["mine"], c1["mayEdit"], c1["ownerName"]),
+                         ("c1", "Ironworks", 68000, "68,000", False, True, True, True, "Alice"))
+        self.assertEqual([(m["name"], m["you"], m["online"]) for m in c1["members"].values()], [("Alice", True, True), ("Boss", False, True)])
+        self.assertEqual([(m["name"], m["online"]) for m in mill["members"].values()], [("Erin", False)], "a seat the roster does not list is away")
+        self.assertFalse(mill["mayEdit"])
         self.assertTrue(any("used 96% of the spending limit" in w for w in st["warnings"].values()), st["warnings"])
         lines = list(st["lines"].values())
         self.assertEqual(lines[1], "Alice (you): 1 built, 1 bought; spent 48,000; lines 800; limit 50,000, used 48,000")
         self.assertEqual(lines[2], "Carol: nothing yet")
+        # the window's Companies tab draws this (feverlink3_hud.lua H.companyView, the words of feverlink3_text.lua)
+        H = self.L.execute(tl.HUD_SRC)
+        W = self.L.execute(tl.TEXT_SRC).COMPANY
+        v = to_py(H.companyView(self.Co.status(self.co, view), W))
+        self.assertEqual((v["intro"], v["mine"]), (W.modeShared, "Your company: Ironworks"))
+        self.assertEqual([(r["title"], r["detail"], r["join"], r["leave"], r["remove"]) for r in v["rows"].values()],
+                         [("Ironworks", "Players: Alice (you), Boss;  spent 68,000", False, True, True), ("Mill", "Players: Erin (away)", True, False, False)])
         # at the limit
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 5000}))
         st = to_py(self.Co.status(self.co, view))
         self.assertTrue(st["players"][2]["blocked"])
         self.assertTrue(any("reached the spending limit" in w for w in st["warnings"].values()))
+        # a refusal reaches the window; company for each player shows each company's money and offers no Leave
+        self.refused(1, "exists already", op="found", name="mill")
+        self.Co.refuse(self.co, 1, "a company called mill exists already")
+        self.must(0, op="mode", mode="separate", acting=True)
+        sview = self.lua({"self": 1, "names": {0: "Boss", 1: "Alice"}, "acting": True, "balances": {"c1": 1234567}})
+        v = to_py(H.companyView(self.Co.status(self.co, sview), W))
+        self.assertEqual((v["intro"], v["refused"]), (W.modeSeparate, "Not done: a company called mill exists already"))
+        self.assertEqual([(r["detail"], r["leave"], r["remove"]) for r in v["rows"].values()],
+                         [("Players: Alice (you), Boss;  money 1,234,567", False, False), ("Players: Erin (away)", False, False)])
+        self.assertEqual(([r["pay"] for r in v["rows"].values()], v.get("handOver")), ([False, False], None), "no account yet: no Pay, no Give line")
+        # Pay on every other company with an account; Give line only for the line selected in the game (the page's `selected`): a hint
+        # without one, the companies it can go to when one's own company owns it, whose it is otherwise
+        self.must(0, op="bind", company="c1", entity="s:7")
+        self.must(0, op="bind", company="c2", entity="0:2")
+        st = self.Co.status(self.co, sview)
+        v = to_py(H.companyView(st, W))
+        self.assertEqual(([r["pay"] for r in v["rows"].values()], v["handOver"], v["hint"], v.get("selected")), ([False, True], True, W.selectHint, None))
+        st.selected = self.lua({"id": 301, "name": "Bus 1", "vehicles": 2, "stops": 5, "mine": True, "company": "c1"})
+        v = to_py(H.companyView(st, W))
+        self.assertEqual((v["selected"], v["give"], [t["key"] for t in v["targets"].values()], v.get("owner")),
+                         ("Selected line: Bus 1 (2 vehicles, 5 stops)", 301, ["c2"], None))
+        st.selected = self.lua({"id": 302, "name": "Tram", "vehicles": 1, "stops": 2, "mine": False, "company": "c2", "companyName": "Ironworks"})
+        v = to_py(H.companyView(st, W))
+        self.assertEqual((v.get("give"), v["owner"]), (None, "This line belongs to Ironworks: only its own company can give it away."))
+        self.assertEqual([H.amountOf(t) for t in ("250,000", " 1 000 ", "0", "-5", "x", None)], [250000, 1000, None, None, None, None])
         # without a registry or a view the table is still whole
         st = to_py(self.Co.status(None, None))
         self.assertEqual((st["mode"], len(st["players"]), len(st["companies"])), ("shared", 0, 0))
@@ -555,13 +695,29 @@ class CompanyUnit(unittest.TestCase):
         ctx0["co"] = self.co
         ok, why = pair(self.M.commands.makeEntitySetPlayerCmd.apply(ctx0, self.lua({}), self.lua({})))
         self.assertTrue(ok)
+        # separate mode: a company hands over what it owns there (Give to company), to another company or to nobody; nothing else
+        self.companies()
+        self.must(0, op="mode", mode="separate", acting=True)
+        owners = self.lua({100: 52001, 101: 7})
+        hand = lambda sender, entity, to, player=52001: pair(self.M.commands.makeEntitySetPlayerCmd.apply(
+            self.ctx(sender, co=self.co, player=player, resolve=self.resolver({"s:7": 7, "0:2": 52001}), ownerOf=L.eval("function(t) return function(e) return t[e] end end")(owners)),
+            self.lua({}), self.lua({"n": 2, 1: entity, 2: to})))[0]
+        self.assertEqual([bool(hand(1, 100, 7)), bool(hand(1, 100, -1)), bool(hand(1, 101, 52001)), bool(hand(1, 100, 99)), bool(hand(1, 100, 7, player=7))],
+                         [True, True, False, False, False], "own -> a company, own -> nobody; not another's, not to a stranger, not as someone else")
+        # what Give line moves: the base game's recipe, only what the giver owns; a station group another line of the giver uses goes to nobody
+        eng = L.eval("""{ ownerOf = function(e) return ({ [1] = 5, [2] = 5, [3] = 8, [10] = 5, [11] = 5, [12] = 5, [20] = 5, [21] = 5, [22] = 5, [30] = 8 })[e] end,
+            lineVehicles = function(l) return ({ [1] = { 2, 3 } })[l] or {} end,
+            lineGroups = function(l) return ({ [1] = { 10, 20, 30 }, [40] = { 20 } })[l] or {} end,
+            groupStations = function(g) return ({ [10] = { 11 }, [20] = { 21 } })[g] or {} end,
+            stationConstruction = function(s) return ({ [11] = 12, [21] = 22 })[s] or -1 end,
+            linesOf = function(p) return { 1, 40 } end }""")
+        plan = [(s["entity"], s["to"]) for s in to_py(self.Co.transferPlan(1, 5, 6, eng)).values()]
+        self.assertEqual(plan, [(2, 6), (1, 6), (10, 6), (11, 6), (12, 6), (20, -1), (21, -1), (22, -1)])
         self.fresh()
         api = self.L.eval("""{ cmd = { makeGameAddPlayerCmd = function(n, c) return { add = n, r = c.x, g = c.y, b = c.z } end,
                                        feverlink3Company = function(p) return { company = p.op } end },
                                type = { Vec3f = { new = function(x, y, z) return { x = x, y = y, z = z } end } } }""")
-        add = self.Co.windowCommand(self.lua({"op": "add", "name": " Bakery ", "color": [0.1, 0.2, 0.3]}), api)
-        self.assertEqual((add.add, add.r, add.g, add.b), ("Bakery", 0.1, 0.2, 0.3))
-        self.assertEqual(self.Co.windowCommand(self.lua({"op": "add", "name": ""}), api).add, "Company")
+        self.assertIsNone(self.Co.windowCommand(self.lua({"op": "add", "name": "Bakery"}), api), "player entities are the host game's business")
         for op in self.Co.OPS.values():
             self.assertEqual(self.Co.windowCommand(self.lua({"op": op}), api).company, op)
         self.assertIsNone(self.Co.windowCommand(self.lua({"op": "format"}), api))
@@ -748,6 +904,7 @@ function MAKE_API()
     calculateBalance = function(list, from, to, flag) return LINE_RESULT[list[1]] or 0 end,
   }
   api.util = { getDefaultYearDuration = function() return 12000 end }
+  api.engine.system.transportVehicleSystem = { getLineVehicles = function(l) return {} end }
   return api
 end
 
@@ -810,8 +967,10 @@ class CompanyGameTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="feverlink3-")
-        self.A = CoGame("host", 0, self.tmp, 50000)
-        self.B = CoGame("client", 1, self.tmp, 51000)
+        # ids differ between the games, and stay within the gap the scan for new player entities allows (entitiesScan: a real world's ids
+        # are dense, the engine cannot loop over PLAYER)
+        self.A = CoGame("host", 0, self.tmp, 2000)
+        self.B = CoGame("client", 1, self.tmp, 3000)
         self.relay = tl.Relay([self.A, self.B])
 
     def tearDown(self):
@@ -822,7 +981,9 @@ class CompanyGameTest(unittest.TestCase):
     # ---- scenario helpers
 
     def op(self, game, ticks=15, **fields):
-        """A registry operation issued from `game`'s interface, as the company page does; returns its callback result."""
+        """A registry operation issued from `game`'s interface, as the company page does (it says who sends it: `as`, the
+        player's name); returns its callback result."""
+        fields.setdefault("as", game.label)
         game.send_gui("LAST_OP = nil; api.cmd.sendCommand(api.cmd.feverlink3Company(%s), function(d, s) LAST_OP = s end)" % lit(fields))
         self.tick(ticks)
         return game.ev("LAST_OP")
@@ -916,7 +1077,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.op(self.B, op="pay", to=0, amount=12000))
         self.assertEqual(self.both("ACCOUNT.balance"), balances)
         self.assertEqual(self.both("#JOURNAL"), (0, 0))
-        self.assertEqual(self.A.registry()["ledger"][1]["paid"], 12000)
+        self.assertEqual(self.A.registry()["ledger"]["client"]["paid"], 12000)
         self.assertSameRegistry()
         # a registry that differs on one game is named
         self.B.L.execute("local st = STATE:get(); st.co.limits[3] = { amount = 5 }; STATE:set(st)")
@@ -932,14 +1093,14 @@ class CompanyGameTest(unittest.TestCase):
     def test_limits_stop_spending_at_the_originator_and_every_game_refuses_a_forged_action(self):
         self.start()
         self.tick(10)
-        # only the host sets limits and founds companies; every game counts the refusal alike
+        # only the host sets limits and the gameplay type; every game counts the refusal alike
         self.assertFalse(self.op(self.B, op="limit", player=1, amount=999999999))
-        self.assertFalse(self.op(self.B, op="found", name="Mine"))
+        self.assertFalse(self.op(self.B, op="mode", mode="shared"))
         self.assertSameRegistry()
         reg = self.A.registry()
         self.assertEqual((reg["limits"], reg["companies"]), ({}, {}))
-        self.assertEqual(reg["ledger"][1]["refused"], 2)
-        self.assertIn("only the host", reg["ledger"][1]["last"])
+        self.assertEqual(reg["ledger"]["client"]["refused"], 2)
+        self.assertIn("only the host", reg["ledger"]["client"]["last"])
         # issued in the same tick, so stamped alike: the host's operation (sender 0) is applied before the client's purchase
         self.A.send_gui('api.cmd.sendCommand(api.cmd.feverlink3Company({ op = "limit", player = 1, amount = 1 }))')
         self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(api.engine.util.getPlayer(), 55, { vehicles = {} }), function(d, s) SAME_BUY = s end)")
@@ -947,15 +1108,15 @@ class CompanyGameTest(unittest.TestCase):
         self.assertSameRegistry()
         reg = self.A.registry()
         self.assertEqual(reg["limits"], {1: {"amount": 1}})
-        self.assertEqual(reg["ledger"][1]["gross"], {"spend": 30000}, "nothing was spent yet when the purchase was checked")
+        self.assertEqual(reg["ledger"]["client"]["gross"], {"spend": 30000}, "nothing was spent yet when the purchase was checked")
         self.assertEqual(self.A.applied(), self.B.applied())
         self.assertFalse(self.buy(self.B), "and now the limit holds")
         # a forged action beyond the limit is refused by every game alike
-        before, refused = len(self.A.applied()), self.A.registry()["ledger"][1]["refused"]
+        before, refused = len(self.A.applied()), self.A.registry()["ledger"]["client"]["refused"]
         self.forge(self.BUY_BODY)
         self.assertEqual((len(self.A.applied()), len(self.B.applied())), (before, before), "neither game applied it")
         self.assertSameRegistry()
-        led = self.A.registry()["ledger"][1]
+        led = self.A.registry()["ledger"]["client"]
         self.assertEqual(led["refused"], refused + 1, "each game refused it once, and the registry (identical on both) counts it once")
         self.assertIn("spending limit reached", led["last"])
         # a loan is a `spend` event: over the limit it is stopped where it is issued; repaying it is not
@@ -980,7 +1141,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(host, [e for e in client if not e.startswith("Notifications/")], "both games' scripts got them at the same times")
         self.assertTrue(any(e.startswith("Notifications/add@") for e in client), "the client's own game got its notification")
         self.assertSameRegistry()
-        led = self.A.registry()["ledger"][1]
+        led = self.A.registry()["ledger"]["client"]
         self.assertEqual(led["made"], {"makeVehicleBuyCmd": 1, "event Loan/Repay": 1, "event Companies/applyLevel": 1})
         self.assertEqual((led["n"], led["gross"]), ({"spend": 2, "other": 1}, {"spend": 30000}), "no money was booked for an event")
         labels = sorted(m["label"] for m in row(self.B.status(), 1)["made"].values())
@@ -1003,20 +1164,20 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.op(self.A, op="limit", player=1))      # the host lifts it
         self.assertTrue(self.buy(self.B))
         self.assertSameRegistry()
-        self.assertEqual(self.A.registry()["ledger"][1]["gross"]["spend"], 90000)
+        self.assertEqual(self.A.registry()["ledger"]["client"]["gross"]["spend"], 90000)
 
     def limit_per_period(self):
         self.assertTrue(self.op(self.A, op="limit", player=1, amount=10000, per=1000000))
         self.assertTrue(self.buy(self.B))
         self.assertFalse(self.buy(self.B), "30 000 of 10 000 in this period")
-        self.assertEqual(self.A.registry()["ledger"][1]["per"], {"idx": 0, "gross": 30000})
+        self.assertEqual(self.A.registry()["ledger"]["client"]["per"], {"idx": 0, "gross": 30000})
         self.assertEqual(row(self.A.status(), 1)["limit"], {"amount": 10000, "per": 1000000})
         for game in (self.A, self.B):          # a million game-time units later
             game.L.execute("GAME.time = GAME.time + 1000000")
         self.tick(10)
         self.assertTrue(self.buy(self.B), "a new period, a fresh count")
-        self.assertEqual(self.A.registry()["ledger"][1]["per"]["idx"], 1)
-        self.assertEqual(self.A.registry()["ledger"][1]["gross"]["spend"], 60000, "the history is kept")
+        self.assertEqual(self.A.registry()["ledger"]["client"]["per"]["idx"], 1)
+        self.assertEqual(self.A.registry()["ledger"]["client"]["gross"]["spend"], 60000, "the history is kept")
         self.assertSameRegistry()
 
     def forbidden_category(self):
@@ -1030,7 +1191,7 @@ class CompanyGameTest(unittest.TestCase):
         self.forge(self.BUY_BODY)              # a client that sends it anyway is refused by every game
         self.assertEqual(self.both("#GAME.applied"), (1, 1), "only the line was built")
         self.assertSameRegistry()
-        led = self.A.registry()["ledger"][1]
+        led = self.A.registry()["ledger"]["client"]
         self.assertEqual((led["refused"], led["last"]), (1, "not allowed to spend"))
         self.assertTrue(self.op(self.A, op="perm", player=1, category="spend", allowed=True))
         self.assertTrue(self.buy(self.B))
@@ -1058,7 +1219,7 @@ class CompanyGameTest(unittest.TestCase):
             lambda: 'api.cmd.feverlink3Company({ op = "limit", player = 1, amount = %d })' % rnd.choice([1, 1, 25000, 70000]),
             lambda: 'api.cmd.feverlink3Company({ op = "limit", player = 1 })',
             lambda: 'api.cmd.feverlink3Company({ op = "perm", player = 1, category = "%s", allowed = %s })' % (rnd.choice(["build", "spend", "spend", "bulldoze"]), rnd.choice(["true", "false", "false"])),
-            lambda: 'api.cmd.feverlink3Company({ op = "assign", player = 1, company = "%s" })' % rnd.choice(["c1", "c2"]),
+            lambda: 'api.cmd.feverlink3Company({ op = "join", company = "%s" })' % rnd.choice(["c1", "c2"]),
             lambda: 'api.cmd.feverlink3Company({ op = "reset" })',
             lambda: 'api.cmd.feverlink3Company({ op = "pay", to = 1, amount = %d, from = 0 })' % rnd.randint(1, 900),
             lambda: 'api.cmd.makeVehicleBuyCmd(api.engine.util.getPlayer(), 55, { vehicles = {} })',
@@ -1085,18 +1246,58 @@ class CompanyGameTest(unittest.TestCase):
         self.assertFalse(self.log_has("company layer failed"))
         self.assertFalse(self.log_has("LATE"))
 
-    # ---- separate companies (experimental): attribution on every game
+    # ---- a company for each player: attribution on every game
 
     def separate(self, start_balance=2000000):
-        """The host's company is the savegame's player; a second company is a player entity added by command; the client
-        belongs to it. Then the host switches the mode."""
+        """The host and the client found a company each; the host picks a company for each player (its module reports
+        acting_player); the host's game binds its own company to the savegame's player and adds a player entity for the
+        client's by itself (X.companyChores)."""
         self.A.L.execute("START_BALANCE = %d" % start_balance)
         self.B.L.execute("START_BALANCE = %d" % start_balance)
-        self.assertTrue(self.op(self.A, op="found", name="Host Co", entity="s:7"))
-        self.add_company("Ironworks")
-        self.assertTrue(self.op(self.A, op="assign", player=0, company="c1"))
-        self.assertTrue(self.op(self.A, op="assign", player=1, company="c2"))
-        self.assertTrue(self.op(self.A, op="mode", mode="separate", experimental=True))
+        self.assertTrue(self.op(self.A, op="found", name="Host Co"))
+        self.assertTrue(self.op(self.B, op="found", name="Ironworks", color=[0.9, 0.2, 0.2]))
+        self.assertFalse(self.op(self.A, op="mode", mode="separate"), "not without the capability")
+        self.assertTrue(self.op(self.A, op="mode", mode="separate", acting=True))
+        self.tick(30)
+
+    def test_the_interface_player_follows_the_company_and_the_host_reloads_once(self):
+        """native iplayer.rs (module listing `interface_player`): each game asks its module to make the interface act as its own company;
+        the host asks its controller for ONE resync once a company's player entity was made in the session (the build tools take the
+        player at a world load); the module's savegame player stays the canonical player (checksum account, record `player`)."""
+        ready = ('ready\tnative\t{["build"]="40425",["clock"]=false,["hooks"]={[1]="interface_player"},["poolpatch"]=false,'
+                 '["sites"]=0,["version"]="test"}\n')
+        for g in (self.A, self.B):
+            with open(os.path.join(g.dir, "native_events.log"), "w", encoding="utf-8", newline="") as f:
+                f.write(ready)
+            g.L.execute(tl.FIND_UP)
+        self.start()
+        self.tick(10)
+        self.A.L.execute("FIND_UP('X').CO_RELOAD_DELAY_S = 0")
+        self.separate()
+        self.tick(10)
+        pa, pb = self.both("GAME.applied[1].entity")
+
+        def orders(g):
+            text = "".join(tl.read_text(p) or "" for p in sorted(glob.glob(os.path.join(g.dir, "native_ctl.*.log"))))
+            return [l.split(TAB)[2] for l in text.splitlines() if l.startswith("interface_player" + TAB)]
+
+        self.assertEqual(orders(self.B), ['{["entity"]=%d}' % pb], "the client's interface acts as its company")
+        self.assertEqual(orders(self.A), ['{["entity"]=7}'], "the host's company is the savegame's player")
+        self.assertIn("interface player: asking the native module to act as entity %d" % pb, self.B.log())
+        resyncs = [l for l in (tl.read_text(os.path.join(self.A.dir, "ctl_cmd.log")) or "").splitlines() if l.startswith("resync" + TAB)]
+        self.assertEqual(len(resyncs), 1, "one resync round for the company made in this session")
+        self.assertIn("company: c2 got its player entity in this session", self.A.log())
+        self.assertFalse(os.path.exists(os.path.join(self.B.dir, "ctl_cmd.log")), "only the host asks")
+        # the client's module answers: the savegame's player is canonical while the interface's own getPlayer names the company
+        with open(os.path.join(self.B.dir, "native_events.log"), "a", encoding="utf-8", newline="") as f:
+            f.write('interface_player\tnative\t{["front"]=%d,["player"]=%d,["savegame"]=7,["why"]="",["world"]=1}\n' % (pb, pb))
+        # the game's own getPlayer of the interface now names the company (the module wrote it into the state the interface reads)
+        self.B.L.execute("local f = FIND_UP('engine').canonicalPlayer; for i = 1, 30 do if debug.getupvalue(f, i) == 'realGetPlayer' then "
+                         "debug.setupvalue(f, i, function() return %d end) end end" % pb)
+        self.tick(5)
+        self.assertEqual(self.B.ev("FIND_UP('engine').canonicalPlayer()"), 7)
+        self.assertIn("interface player: the native module acts as entity %d (savegame player 7" % pb, self.B.log())
+        self.assertEqual(orders(self.B), ['{["entity"]=%d}' % pb], "said once")
 
     def test_separate_companies_act_as_the_senders_company_on_every_game(self):
         self.start()
@@ -1109,11 +1310,14 @@ class CompanyGameTest(unittest.TestCase):
         self.assertSameRegistry()
         reg = self.A.registry()
         self.assertEqual(reg["mode"], "separate")
+        self.assertEqual(reg["companies"]["c1"]["entity"], "s:7", "the host's company is the savegame's player")
         c = reg["companies"]["c2"]
-        self.assertEqual((c["name"], c["entity"], c["owner"]), ("Ironworks", "0:2", 0))
+        key = c["entity"]
+        self.assertEqual((c["name"], c["owner"], key.split(":")[0]), ("Ironworks", "client", "0"))
+        self.assertIn("company: adding a player entity for company c2 (Ironworks)", self.A.log())
         self.assertEqual([c["color"][1], c["color"][2], c["color"][3]], [0.9, 0.2, 0.2])
         self.assertEqual(self.A.ev("WORLD[%d].NAME" % pa), "Ironworks")
-        self.assertEqual(self.both("STATE:get().bind['0:2']"), (pa, pb), "the simulation state keeps each game's own binding")
+        self.assertEqual(self.both("STATE:get().bind['%s']" % key), (pa, pb), "the simulation state keeps each game's own binding")
         # the game's windows follow the registry; the simulation half is never switched
         self.assertEqual(self.B.ev("GUI_API.engine.util.getPlayer()"), pb, "the client's windows act as its company")
         self.assertEqual(self.A.ev("GUI_API.engine.util.getPlayer()"), 7, "the host's company is the savegame's player")
@@ -1127,13 +1331,51 @@ class CompanyGameTest(unittest.TestCase):
         # the money left that company's account, on both games; the savegame's player was not touched; the ledger measured it there
         self.assertEqual((self.A.ev("ACCOUNTS[%d].balance" % pa), self.B.ev("ACCOUNTS[%d].balance" % pb)), (2000000 - 30000, 2000000 - 30000))
         self.assertEqual(self.both("ACCOUNT.balance"), (1000000, 1000000))
-        self.assertEqual(self.A.registry()["ledger"][1]["gross"], {"spend": 30000})
+        self.assertEqual(self.A.registry()["ledger"]["client"]["gross"], {"spend": 30000})
         # the host acts as its company, which is the savegame's player (key s:7)
         self.assertTrue(self.line(self.A))
         self.assertEqual(self.A.ev("OWNER[%d]" % self.A.ev("GAME.applied[3].entity")), 7)
         self.assertEqual(self.both("GAME.applied[3].args[3]"), (7, 7))
         self.assertEqual(self.both("ACCOUNT.balance"), (1000000 - 5000, 1000000 - 5000))
         self.assertEqual(self.A.applied(), self.B.applied())
+        # Give to company: the client cannot take the host's line (refused at the stamp on every game); the host's window gives it
+        # (the page shows it once the player selected it in the game: a click on one of its vehicles, then its line window, whose
+        # closing ends the selection), the client's gives it back
+        la, lb = self.both("GAME.applied[3].entity")
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeEntitySetPlayerCmd(%d, %d))" % (lb, pb))
+        self.tick(15)
+        self.assertEqual(self.both("#GAME.applied"), (3, 3))
+        self.assertIn("can hand it over", self.A.registry()["ledger"]["client"]["last"])
+        self.assertIsNone(self.A.status().get("selected"))
+        gui = "GUI.guiHandleEvent(nil, STATE, GSTATE, 0, '%s', '%s', %s)"
+        self.A.L.execute("WORLD[2900] = { TRANSPORT_VEHICLE = { line = %d } }; " % la + gui % ("mainView", "select", "2900"))
+        self.tick(5)
+        sel = self.A.status()["selected"]
+        self.assertEqual((sel["id"], sel["mine"], sel["company"], sel["vehicles"], sel["stops"]), (la, True, "c1", 0, 0))
+        self.assertIn("company: selected line %d (" % la, self.A.log())
+        self.A.L.execute(gui % ("temp.view.entity_%d" % la, "idAdded", "{}") + "; " + gui % ("temp.view.entity_2900", "destroy", "{}"))
+        self.tick(5)
+        self.assertEqual(self.A.status()["selected"]["id"], la, "the vehicle's window closed, the line's is open")
+        self.A.L.execute(gui % ("temp.view.entity_%d" % la, "destroy", "{}"))
+        self.tick(5)
+        self.assertIsNone(self.A.status().get("selected"))
+        self.assertIn("company: selected line %d cleared (temp.view.entity_%d/destroy)" % (la, la), self.A.log())
+        self.B.L.execute(gui % ("temp.view.entity_%d" % lb, "idAdded", "{}"))
+        self.tick(5)
+        sel = self.B.status()["selected"]
+        self.assertEqual((sel["mine"], sel["companyName"]), (False, "Host Co"), "the client sees whose line it is")
+        self.assertTrue(self.A.ui_company(op="give", line=la, company="c2"))
+        self.tick(20)
+        self.assertEqual((self.A.ev("OWNER[%d]" % la), self.B.ev("OWNER[%d]" % lb)), (pa, pb))
+        self.assertIn("company: give line %d to c2 (Ironworks): 1 move(s)" % la, self.A.log())
+        self.assertTrue(self.B.ui_company(op="give", line=lb, company="c1"))
+        self.tick(20)
+        self.assertEqual(self.both("OWNER[GAME.applied[3].entity]"), (7, 7))
+        self.assertEqual(self.both("#GAME.applied"), (5, 5))
+        self.assertTrue(self.B.ui_company(op="give", line=lb, company="c1"))
+        self.tick(10)
+        self.assertIn("not given away: your company does not own that line", self.B.log())
+        self.assertEqual(self.both("#GAME.applied"), (5, 5))
         # the operations module's commands follow the sender's company: a rename in the finance window, a journal booking (the cost of a
         # marketing campaign) that lands on the sender's company and in the ledger
         self.B.send_gui('api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(api.engine.util.getPlayer(), "Ironworks Ltd"))')
@@ -1145,8 +1387,8 @@ class CompanyGameTest(unittest.TestCase):
         self.tick(15)
         self.assertEqual((self.A.ev("ACCOUNTS[%d].balance" % pa), self.B.ev("ACCOUNTS[%d].balance" % pb)), (2000000 - 34000, 2000000 - 34000))
         self.assertEqual(self.both("ACCOUNT.balance"), (1000000 - 5000, 1000000 - 5000))
-        led = self.A.registry()["ledger"][1]
-        self.assertEqual((led["gross"], led["made"]), ({"spend": 34000}, {"makeVehicleBuyCmd": 1, "makeEntitySetNameCmd": 1, "makeJournalBookAssetCmd": 1}))
+        led = self.A.registry()["ledger"]["client"]
+        self.assertEqual((led["gross"], led["made"]), ({"spend": 34000}, {"makeVehicleBuyCmd": 1, "makeEntitySetPlayerCmd": 1, "makeEntitySetNameCmd": 1, "makeJournalBookAssetCmd": 1}))
         self.assertSameRegistry()
         # a payment between companies is a journal entry on each account, not a replicated action
         applied = self.both("#GAME.applied")
@@ -1155,7 +1397,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.both("ACCOUNT.balance"), (1000000 + 7000, 1000000 + 7000))
         self.assertEqual((self.A.ev("JOURNALS[%d][#JOURNALS[%d]]" % (pa, pa)), self.A.ev("JOURNALS[7][#JOURNALS[7]]")), (-12000, 12000))
         reg = self.A.registry()
-        self.assertEqual((reg["ledger"][1]["paid"], reg["ledger"][0]["received"]), (12000, 12000))
+        self.assertEqual((reg["ledger"]["client"]["paid"], reg["ledger"]["host"]["received"]), (12000, 12000))
         self.assertSameRegistry()
         self.assertEqual(self.both("#GAME.applied"), applied)
         self.assertTrue(self.op(self.A, op="pay", to=0, amount=500, **{"from": 1}))      # the host charges the client a fee
@@ -1188,13 +1430,14 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.B.ev("ACCOUNT.balance"), own, "corrected once the same difference was seen twice")
         self.assertEqual(self.B.ev("JOURNALS[7][#JOURNALS[7]]"), -5000)
         self.assertEqual((self.B.ev("ACCOUNTS[%d].balance" % pb), self.B.ev("#(JOURNALS[%d] or {})" % pb)), (company_b, journals_b))
-        # leaving the company restores the game's own player, joining again switches back
-        self.assertTrue(self.op(self.B, op="leave"))
+        # nobody leaves in this mode; joining the host's company plays as the savegame's player, joining back switches back
+        self.assertFalse(self.op(self.B, op="leave"))
+        self.assertTrue(self.op(self.B, op="join", company="c1"))
         self.assertEqual(self.B.ev("GUI_API.engine.util.getPlayer()"), 7)
-        self.assertTrue(self.op(self.A, op="assign", player=1, company="c2"))
+        self.assertTrue(self.op(self.B, op="join", company="c2"))
         self.assertEqual(self.B.ev("GUI_API.engine.util.getPlayer()"), pb)
         # a company whose entity this game does not know (it lost the binding) refuses instead of guessing
-        self.B.L.execute("local st = STATE:get(); st.bind['0:2'] = nil; STATE:set(st)")
+        self.B.L.execute("local st = STATE:get(); st.bind['%s'] = nil; STATE:set(st)" % key)
         before = len(self.B.applied())
         self.buy(self.B)
         self.assertEqual(len(self.B.applied()), before, "the client's game did not buy with a wrong player")
@@ -1257,7 +1500,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.op(self.A, ticks=8, op="found", name="Bakery"))
         self.assertSameRegistry()
         reg = self.A.registry()
-        self.assertEqual((sorted(reg["companies"]), reg["members"]), (["c1", "c2"], {1: "c1"}))
+        self.assertEqual((sorted(reg["companies"]), {w: p.get("company") for w, p in reg["people"].items()}), (["c1", "c2"], {"client": "c1", "host": "c2"}))
         # the game resumes: the registry goes on from where the pause left it
         self.relay.pauseAt, self.relay.speed = None, 2
         self.relay.session()
@@ -1287,7 +1530,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.B.registry(), reg, "the registry is part of the script state the savegame carries")
         status = self.B.status()
         self.assertEqual(row(status, 1)["total"], 30000)
-        self.assertEqual(status["companies"][1]["members"], {1: 1})
+        self.assertEqual([m["name"] for m in status["companies"][1]["members"].values()], ["client", "host"], "members by their stable identity")
         # the reloaded mod goes on: the limit still applies. (The window's callback is not asked: the reloaded mod numbers
         # its actions from 1 again, so the key of the first one is a key the state already holds a result for.)
         applied = len(self.A.applied())
@@ -1414,13 +1657,18 @@ class CompanyGameTest(unittest.TestCase):
         self.assertSameRegistry()
         self.assertTrue(self.B.ui_company(op="join", company="c1"))
         self.tick(20)
-        self.assertEqual(self.A.registry()["members"], {1: "c1"})
+        self.assertEqual(self.A.registry()["seats"], {0: "host", 1: "client"}, "each record says who sends it")
+        self.assertEqual(self.A.registry()["people"]["client"]["company"], "c1")
         self.assertTrue(self.A.ui_company(op="format the disk"))       # a record the module does not know is ignored
         self.tick(10)
-        self.assertTrue(self.A.ui_company(op="add", name="Mill", color=[0.1, 0.2, 0.3]))     # the engine command that adds a player
+        # the gameplay type the host's window picks: this game's module has no acting_player capability, so a company for each
+        # player is refused on every game (the window greys it out)
+        self.assertTrue(self.A.ui_company(op="mode", mode="separate"))
         self.tick(20)
-        self.assertEqual(self.A.registry()["companies"]["c2"]["name"], "Mill")
-        self.assertEqual(self.both("#GAME.applied"), (2, 2))
+        self.assertEqual(self.A.registry()["mode"], "shared")
+        self.assertIn("is not available in this game", self.A.registry()["ledger"]["host"]["last"])
+        self.assertFalse(self.A.status()["acting"])
+        self.assertEqual(self.both("#GAME.applied"), (1, 1))
         self.assertSameRegistry()
         # an api whose command table refuses assignment: nothing is wrapped, so an operation or a new player would apply on this game
         # alone; the record is dropped and the log says why
@@ -1429,7 +1677,6 @@ class CompanyGameTest(unittest.TestCase):
         self.start()
         self.tick(10)
         self.assertIn("sendCommand is read-only", self.B.log())
-        self.assertTrue(self.B.ui_company(op="add", name="Mill"))
         self.assertTrue(self.B.ui_company(op="leave"))
         self.tick(10)
         self.assertIn("company action not sent", self.B.log())

@@ -368,6 +368,10 @@ pub struct HostSession {
     pause_last: Option<i64>,
     /// A checksum round asked for at a pause before every game said where it stands: stamped at the furthest once they have.
     pending_paused_checksum: bool,
+    /// The latest stamp of an action or commit relayed with a normal stamp (not one of the pause order). At the start the games stand at
+    /// the save's time while an action made before it (the host's gameplay type, chosen at Start) is stamped a lead later: `start`
+    /// runs the session on to it and pauses there.
+    relayed_stamp_max: Option<i64>,
     /// The stalled games and the promise the host keeps for each (`stall.rs`).
     stalls: BTreeMap<u16, Stall>,
     /// Players caught up after a drop whose world has not been compared in a checksum round yet: a difference reloads them at once.
@@ -397,6 +401,9 @@ impl fmt::Debug for HostSession {
 impl HostSession {
     pub const HOST_ID: u16 = 0;
     pub const UNASSIGNED: u16 = 0xFFFF;
+    /// How far past the start an action made before it may lie for the start to run the session on to it (`start`): 60 steps,
+    /// ten seconds at the slowest speed, many leads.
+    pub const START_RUN_ON_STEPS: i64 = 60;
     pub const PROTOCOL_VERSION: i32 = FrameHeader::CURRENT_VERSION as i32;
     /// Bytes of the random nonce in a Challenge.
     pub const NONCE_SIZE: usize = 16;
@@ -471,6 +478,7 @@ impl HostSession {
             pause_held: Vec::new(),
             pause_last: None,
             pending_paused_checksum: false,
+            relayed_stamp_max: None,
             stalls: BTreeMap::new(),
             resume_checks: BTreeSet::new(),
             partly_built: BTreeSet::new(),
@@ -1207,6 +1215,10 @@ impl HostSession {
                                 parts::MAX_MESSAGE
                             ));
                         } else {
+                            if m.allowed {
+                                self.relayed_stamp_max =
+                                    Some(self.relayed_stamp_max.map_or(m.stamp, |s| s.max(m.stamp)));
+                            }
                             self.broadcast(MessageKind::Action, &relayed, Some(from));
                             self.actions_relayed += 1;
                         }
@@ -1236,6 +1248,7 @@ impl HostSession {
                         self.pause_held.push(PauseItem::Commit(m));
                         self.flush_pause();
                     } else if !self.refuse_stalled(from, m.seq, m.stamp, "commit") {
+                        self.relayed_stamp_max = Some(self.relayed_stamp_max.map_or(m.stamp, |s| s.max(m.stamp)));
                         self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), Some(from));
                     }
                 }
@@ -1378,10 +1391,36 @@ impl HostSession {
         times.sort_unstable();
         times.dedup();
         let common = if times.len() == 1 { Some(times[0]) } else { None };
-        self.state = SessionState { started: true, speed: 0, pause_at: common, ..self.state.clone() };
+        // A world saved paused starts paused at the save's time, but an action made before the start (the host's gameplay type, chosen at
+        // Start) is stamped a lead after it, so it applied only after someone resumed (lab 2026-10-27: the mode four minutes after the
+        // start, at the resume). The host decides: every game runs on to one step past the last such stamp at the slowest speed (the
+        // pause's run-on: `pause_at` ahead of the clocks with a speed, like `pause_inner`) and stands still there, the same step on every
+        // game. A stamp further than START_RUN_ON_STEPS ahead is left to the resume, as before (a game cannot make every game run on far).
+        let run_on = match (common, self.relayed_stamp_max) {
+            (Some(t), Some(s)) if s >= t && s <= t + Self::START_RUN_ON_STEPS * Lockstep::STEP => {
+                Some(Lockstep::round_up_to_step(s as f64) + Lockstep::STEP)
+            }
+            _ => None,
+        };
+        let (speed, pause_at) = match run_on {
+            Some(p) => (1, Some(p)),
+            None => (0, common),
+        };
+        self.state = SessionState { started: true, speed, pause_at, ..self.state.clone() };
         let ready = self.players.values().filter(|p| p.ready).count();
         let at = common.map_or("different times".to_owned(), |t| t.to_string());
         self.log(format!("session started with {ready} ready game(s) at {at}"));
+        match (run_on, self.relayed_stamp_max) {
+            (Some(p), Some(s)) => self.log(format!(
+                "session start: an action is stamped {s}, after the start: every game runs on to {p} ({} step(s)) and pauses there",
+                (p - common.unwrap_or(p)) / Lockstep::STEP
+            )),
+            (None, Some(s)) if common.is_some_and(|t| s > t) => self.log(format!(
+                "session start: an action is stamped {s}, more than {} steps after the start: it applies after the resume",
+                Self::START_RUN_ON_STEPS
+            )),
+            _ => {}
+        }
         self.broadcast_session();
         if times.len() > 1 {
             // The games report different times, so they are not in the same world: bring everyone into the
@@ -1393,6 +1432,9 @@ impl HostSession {
                 self.outsiders.extend(others);
             }
             self.begin_resync("session start");
+        } else if run_on.is_some() {
+            // the first round at the pause, once every game stands at it (flush_pause): a running round would be spread past it
+            self.pending_paused_checksum = true;
         } else {
             self.request_checksum_inner();
         }

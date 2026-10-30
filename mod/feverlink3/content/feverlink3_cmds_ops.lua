@@ -1320,6 +1320,22 @@ local function plainEvent(category, check, localFor)
 	return h
 end
 
+-- An event that books money to the player who sent it (a loan, a subsidy accepted): in company-for-each-player mode the acting
+-- company's player entity (ctx.player, Co.actor) goes with it as `fl3player`, on the loan record (`where` "loan": the parameter is
+-- {offer, loan}) or on the parameter itself, so the game's script runs for that company (Co.scriptCompanies). The game's own
+-- scripts ignore the extra field.
+local function actorEvent(category, where)
+	local h = plainEvent(category)
+	h.decode = guarded("decode", function(param, ctx)
+		if type(param) ~= "table" or type(ctx.player) ~= "number" then return param end
+		local p = copy(param)
+		local t = where == "loan" and p[2] or p
+		if type(t) == "table" then t.fl3player = ctx.player end
+		return p
+	end)
+	return h
+end
+
 -- the time of day follows this machine's clock in the "Local" mode: no two games would agree, so it is each player's own setting
 local function localTimeMode(param)
 	local ok, mode = pcall(function() return param.mode end)
@@ -1329,8 +1345,8 @@ end
 M.events = {
 	-- loans live in a game script (game_mechanics/finance/loan.script.tl): replaying the event on every game makes
 	-- each one pay the loan out and book its repayments, with the same offers; the parameter is {offer, loan}
-	Loan = { Obtain = plainEvent("spend"), Repay = plainEvent("spend") },
-	Subvention = { onAccept = plainEvent("other"), onDecline = plainEvent("other") },
+	Loan = { Obtain = actorEvent("spend", "loan"), Repay = actorEvent("spend", "loan") },
+	Subvention = { onAccept = actorEvent("other"), onDecline = plainEvent("other") },
 	Companies = {
 		startMarketingCampaign = fieldEvent("spend", { townEntity = "town", companyEntity = "player" }),
 		spawnIndustry = fieldEvent("spend", { townEntity = "town", companyEntity = "player" }),

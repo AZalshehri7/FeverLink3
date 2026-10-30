@@ -113,6 +113,12 @@ pub struct HookConfig {
     /// Freed ids join the free-id queue sorted by entity id (`freeorder.rs`); on by default, `FEVERLINK3_FREE_ORDER=0` off, and then
     /// on every game of the session.
     pub free_order: bool,
+    /// The interface acts as this game's own company (`iplayer.rs`): the front state's local player is the mod's `interface_player`,
+    /// the simulation's states keep the savegame's. On by default with the hooks; `FEVERLINK3_INTERFACE_PLAYER=0` off.
+    pub interface_player: bool,
+    /// The games autosave together at the host's stamp (`autosave.rs`): the game's own timer held off while the mod's hold stands. On by
+    /// default with the hooks; `FEVERLINK3_SYNC_AUTOSAVE=0` off.
+    pub sync_autosave: bool,
 }
 
 impl HookConfig {
@@ -135,6 +141,8 @@ impl HookConfig {
             inject_convert: !off(crate::inject::INJECT_VAR),
             smooth_pace: !off(crate::pace::SMOOTH_PACE_VAR),
             free_order: !off(crate::freeorder::FREE_ORDER_VAR),
+            interface_player: !off(crate::iplayer::INTERFACE_VAR),
+            sync_autosave: !off(crate::autosave::SYNC_VAR),
         }
     }
 
@@ -242,6 +250,16 @@ pub enum Feature {
     BatchPace,
     /// The call-site redirect of the free-id queue's append in `EndModification`: each batch of freed ids sorted by id (`freeorder.rs`).
     FreeOrder,
+    /// `iplayer.rs`: the detour on `CGame::StartGameSim` (the savegame's player read, the first front written).
+    InterfaceStart,
+    /// `iplayer.rs`: the detour on `GameState::Replicate` (every simulation copy keeps the savegame's player).
+    InterfaceReplicate,
+    /// `iplayer.rs`: the call of `CGame::Sync` redirected for the front write when smooth pacing is off (with it on, its hook does both).
+    InterfaceSync,
+    /// `autosave.rs`: the detour on `CGameUI::AutoSave` (the game's own call dropped while the session holds it off).
+    AutosaveCall,
+    /// `autosave.rs`: the detour on `CGameUI`'s per-frame update (the mod's `autosave {now}` runs there).
+    AutosaveStep,
 }
 
 impl Feature {
@@ -266,6 +284,11 @@ impl Feature {
             Feature::PreviewOwner => "preview_owner",
             Feature::BatchPace => crate::pace::HOOK_NAME,
             Feature::FreeOrder => crate::freeorder::HOOK_NAME,
+            Feature::InterfaceStart => crate::iplayer::START_HOOK,
+            Feature::InterfaceReplicate => crate::iplayer::REPLICATE_HOOK,
+            Feature::InterfaceSync => crate::iplayer::SYNC_HOOK,
+            Feature::AutosaveCall => crate::autosave::AUTOSAVE_HOOK,
+            Feature::AutosaveStep => crate::autosave::STEP_HOOK,
         }
     }
 }
@@ -403,6 +426,12 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
         }
         if cfg.smooth_pace {
             plan_batch_pace(build, image, &mut p);
+        }
+        if cfg.interface_player {
+            plan_interface(build, image, &mut p);
+        }
+        if cfg.sync_autosave {
+            plan_autosave(build, image, &mut p);
         }
     }
     if cfg.town_seed {
@@ -631,6 +660,64 @@ fn plan_batch_pace(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     }
 }
 
+/// The interface player (`iplayer.rs`): both detours and the call of `Sync`, all or nothing. With smooth pacing in the plan its call
+/// redirect does the front write too; without it the same call is redirected for the front write alone. A build whose row or bytes are
+/// not the verified ones has the piece off with the reason, and the game plays as before (the tools act as the savegame's player).
+fn plan_interface(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let row = match crate::iplayer::check(build, image) {
+        Ok(row) => row,
+        Err(reason) => {
+            return p.skipped.push(Skip { feature: Feature::InterfaceStart, name: crate::iplayer::READY_NAME, reason });
+        }
+    };
+    p.steps.push(Step::Detour {
+        feature: Feature::InterfaceStart,
+        name: crate::iplayer::START_HOOK,
+        rva: row.start.rva,
+        expected: row.start.prologue,
+    });
+    p.steps.push(Step::Detour {
+        feature: Feature::InterfaceReplicate,
+        name: crate::iplayer::REPLICATE_HOOK,
+        rva: row.replicate.rva,
+        expected: row.replicate.prologue,
+    });
+    if !p.has(Feature::BatchPace) {
+        // `check` verified the call and its callee
+        let Some(site) = &build.batch_pace else { return };
+        p.steps.push(Step::CallPatch {
+            feature: Feature::InterfaceSync,
+            name: crate::iplayer::SYNC_HOOK,
+            rva: site.rva,
+            expected: site.expected,
+            callee: site.callee.rva,
+        });
+    }
+}
+
+/// The synchronised autosave (`autosave.rs`): both detours or neither. A build whose row or bytes are not the verified ones has the
+/// piece off with the reason (FAIL-CLOSED), and the game autosaves on its own timer as before.
+fn plan_autosave(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let row = match crate::autosave::check(build.timestamp, build.name, image) {
+        Ok(row) => row,
+        Err(reason) => {
+            return p.skipped.push(Skip { feature: Feature::AutosaveCall, name: crate::autosave::READY_NAME, reason });
+        }
+    };
+    p.steps.push(Step::Detour {
+        feature: Feature::AutosaveCall,
+        name: crate::autosave::AUTOSAVE_HOOK,
+        rva: row.autosave.rva,
+        expected: row.autosave.prologue,
+    });
+    p.steps.push(Step::Detour {
+        feature: Feature::AutosaveStep,
+        name: crate::autosave::STEP_HOOK,
+        rva: row.step.rva,
+        expected: row.step.prologue,
+    });
+}
+
 /// The canonical free-id order: the call in `EndModification` and the callee's prologue must both match. Unlike smooth pacing a build
 /// without the site is a skip with its reason: the switch asked for a determinism piece (the caller makes the missing piece a stop fault).
 fn plan_free_order(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
@@ -803,6 +890,8 @@ mod tests {
             smooth_pace: true,
             free_order: true,
             inject_convert: true,
+            interface_player: true,
+            sync_autosave: true,
             ..Default::default()
         };
         assert_eq!(
@@ -820,6 +909,8 @@ mod tests {
             (crate::pace::SMOOTH_PACE_VAR, "0"),
             (crate::freeorder::FREE_ORDER_VAR, "0"),
             (crate::inject::INJECT_VAR, "0"),
+            (crate::iplayer::INTERFACE_VAR, "0"),
+            (crate::autosave::SYNC_VAR, "0"),
         ]));
         assert_eq!(none, HookConfig::default(), "=0 turns each of them off");
         assert!(!HookConfig::default().any());
@@ -833,6 +924,8 @@ mod tests {
                 smooth_pace: true,
                 free_order: true,
                 inject_convert: true,
+                interface_player: true,
+                sync_autosave: true,
                 ..cfg(true, true, true)
             }
         );
@@ -851,6 +944,8 @@ mod tests {
                     smooth_pace: on_by_default,
                     free_order: on_by_default,
                     inject_convert: on_by_default,
+                    interface_player: on_by_default,
+                    sync_autosave: on_by_default,
                     ..Default::default()
                 },
                 "{off:?} must not switch anything else on"

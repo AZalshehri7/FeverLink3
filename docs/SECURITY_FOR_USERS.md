@@ -1,6 +1,6 @@
 # What is in winhttp.dll, and how to check it
 
-For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-10-27 (version 0.2.9). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
+For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-10-30 (version 0.2.10). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
 
 ## The short version
 
@@ -38,7 +38,7 @@ When Windows loads the DLL, its start routine does this and nothing else:
 4. Inside the game, if an earlier game run downloaded an update, it finishes it now (renames files in the game folder, before the game reads its mods) or puts the previous version back ("Automatic updates" below).
 5. Inside the game it starts one thread named `feverlink3-live` and one named `feverlink3-update` (the update check, once, then it ends).
 
-**On a game build whose places it can prove, it patches the game's code in memory, and only while a FeverLink3 session exists.** The DLL contains inline detours and byte patches (`native/src/hooks.rs`, `detour.rs`, `patch.rs`) and finds where they go at each start by comparing whole functions of the running game with a proof file built from build 40425 (`search.rs`, `tools/addr/out/proof-6ad9ce10.bin`); a build where any place is not proven gets no patch. Five pieces are on by default: a hook that counts the simulation's commands, a hook on the command list that can hold a construction command until the session says when to apply it, a patch that makes the script pool single-threaded, a patch that pins the seed of Lua's string hash, and a one-byte patch that makes the engine's tickCount getter return the simulation's step count. Each checks the bytes it is about to change against what the search found and installs nothing (and logs why) on an unknown build or different bytes; each is turned off by setting its variable to `0` (`FEVERLINK3_HOOKS`, `FEVERLINK3_HOLD`, `FEVERLINK3_POOLPATCH`, `FEVERLINK3_LUA_SEED`, `FEVERLINK3_STEP_SEED`). The diagnostic hooks (town seed and growth logs) are off unless a developer sets their variable to `1`. See "What may change" below.
+**On a game build whose places it can prove, it patches the game's code in memory, and only while a FeverLink3 session exists.** The DLL contains inline detours and byte patches (`native/src/hooks.rs`, `detour.rs`, `patch.rs`) and finds where they go at each start by comparing whole functions of the running game with a proof file built from build 40425 (`search.rs`, `tools/addr/out/proof-6ad9ce10.bin`); a build where any place is not proven gets no patch. Five pieces are on by default: a hook that counts the simulation's commands, a hook on the command list that can hold a construction command until the session says when to apply it, a patch that makes the script pool single-threaded, a patch that pins the seed of Lua's string hash, and a one-byte patch that makes the engine's tickCount getter return the simulation's step count. Each checks the bytes it is about to change against what the search found and installs nothing (and logs why) on an unknown build or different bytes; each is turned off by setting its variable to `0` (`FEVERLINK3_HOOKS`, `FEVERLINK3_HOLD`, `FEVERLINK3_POOLPATCH`, `FEVERLINK3_LUA_SEED`, `FEVERLINK3_STEP_SEED`). New in 0.2.10, and on by default: when the hold hook applies a build command it already holds, it first rewrites, in memory, who owns the pieces of that build, so that in a "Company for each player" session the build belongs to the company of the player who made it (`native/src/acting.rs`); 0.2.10 offers only one shared company, where the owner it writes is the one already there. It changes nothing else, writes nothing to disk and sends nothing over the network; `FEVERLINK3_ACTING_PLAYER=0` turns it off (every player of a session must then turn it off too). The diagnostic hooks (town seed and growth logs) are off unless a developer sets their variable to `1`. See "What may change" below.
 
 ### 3. What the thread does while the game runs
 
@@ -150,8 +150,8 @@ Each release has these files: `FeverLink3-<version>.zip`, `FeverLink3-<version>.
 In PowerShell, in the folder with the downloaded files:
 
 ```powershell
-(Get-FileHash .\FeverLink3-0.2.9.zip -Algorithm SHA256).Hash.ToLower()
-Get-Content .\FeverLink3-0.2.9.zip.sha256
+(Get-FileHash .\FeverLink3-0.2.10.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content .\FeverLink3-0.2.10.zip.sha256
 
 # the DLL you installed against the manifest (your game folder: Steam, right-click Transport Fever 3, Manage, Browse local files)
 $m = Get-Content .\manifest.json -Raw | ConvertFrom-Json

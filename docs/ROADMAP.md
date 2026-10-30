@@ -1,6 +1,6 @@
 # Roadmap
 
-Status as of 2026-10-26. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html); what has been seen working in the real game is on the [status page](site/status.html).
+Status as of 2026-10-30. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html); what has been seen working in the real game is on the [status page](site/status.html).
 
 ## Done
 
@@ -25,12 +25,18 @@ Not yet seen in the real game at that time: joining from a Steam invite by itsel
 
 **0.2.7: terrain editing, partly.** Terrain heights (raise, lower, flatten, smooth, roughen) and ground paint are shared: every game applies the same change at the same moment. FeverLink3 finds its places in the game by itself at every start, so a game update no longer always needs a FeverLink3 update. Builds land sooner (0.8 s at x1). Fixes from issue #3: no repair sync for industry names in different languages; the tree, plant and rock tools are grayed out in a session. Seen with two games on one PC.
 
+**0.2.8 (2026-10-26): trees, plants and rocks shared.** The tree, plant and rock brushes and the vegetation eraser work in a session, and every game applies the same change at the same moment. Seen with two games on one PC.
+
+**0.2.9 (2026-10-27): other mods' tools and big builds.** A build another mod's tool or window sends (the bus bay upgrade, the crossing window) is applied at the same moment on every game; big builds such as 3-track stations travel in parts, up to 3 MB (before, anything over about 480 KB was refused; one Steam message carries at most 512 KB); the update check runs when a host with a newer FeverLink3 refuses you. Seen with two games on one PC (builds of 620 KB and 1.23 MB); big builds in parts over Steam between two PCs not seen yet.
+
+**0.2.10 (2026-10-30): one shared company and fixes from play between two PCs.** The host starts with "One shared company"; "Company for each player" shows as upcoming. A bus stop on another mod's road (bus and truck bay roads) is shared; the window title shows the version. Seen with two games on one PC, not yet between two PCs.
+
 ## Next
 
 - Find the cause of the object id order differences, so these repair syncs stop.
 - See other mods' shared changes and settings between two PCs, and make line edits apply faster.
-- Separate companies for each player.
-- Terrain editing: partly done. Heights and ground paint are shared since 0.2.7; trees, plants, rocks and the eraser are next (grayed out during a session until then).
+- Company for each player (own money, builds, lines, loans and subsidies; in the code, shown grayed as upcoming in 0.2.10): play it between two PCs, and reach the end of a subsidy (reward or fine) in a company game.
+- See the games autosave together between two PCs (seen so far with two game windows on one PC).
 - Code signing of the files at 1.0.0 (releases are unsigned until then).
 
 ## Later

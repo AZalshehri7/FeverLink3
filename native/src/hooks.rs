@@ -928,7 +928,149 @@ unsafe extern "system-unwind" fn pace_hook(cgame: u64, arg2: u64, arg3: u64, arg
         // SAFETY: every address is checked with the OS before it is read or written (pace_after_sync).
         crate::log::guarded("batch pace", || unsafe { pace_after_sync(&crate::pace::PACER, cgame as usize, now) });
     }
+    // the interface player (iplayer.rs): Sync may have made another state the front. Every call, as the static reading does not tie the
+    // front assignment (0x11f899) to the return value; one pointer and one int are read while an order stands, nothing otherwise.
+    crate::log::guarded("interface player", || crate::iplayer::STATE.after_front(&GameMemory, cgame as usize));
     ret
+}
+
+/// The game's memory for `iplayer.rs`: reads through the guarded reader, a write only where the OS says the int is writable.
+pub struct GameMemory;
+
+impl crate::iplayer::Memory for GameMemory {
+    fn word(&self, addr: usize) -> Option<usize> {
+        crate::memguard::read_value::<usize>(addr)
+    }
+    fn int(&self, addr: usize) -> Option<i32> {
+        crate::memguard::read_value::<i32>(addr)
+    }
+    fn set_int(&self, addr: usize, value: i32) -> bool {
+        if crate::memguard::read_value::<i32>(addr).is_none() {
+            return false; // also refuses a misaligned address
+        }
+        // SAFETY: the OS is asked first; a 4-byte aligned store into the engine's own int field (atomic on x86-64).
+        if !unsafe { mem::writable(addr as *const u8, 4) } {
+            return false;
+        }
+        unsafe { core::ptr::write_volatile(addr as *mut i32, value) };
+        true
+    }
+}
+
+/// The call of `CGame::Sync` in `CGame::Step` when smooth pacing is off (`FEVERLINK3_SMOOTH_PACE=0`) and the interface player is on:
+/// the real `Sync` with every register argument as given (as [`pace_hook`]), then the front write alone.
+unsafe extern "system-unwind" fn sync_front_hook(cgame: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::SYNC_FRONT_HOOK);
+    let callee = PACE_CALLEE.load(Ordering::Acquire);
+    if callee == 0 {
+        return 0;
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+    // SAFETY: the real function at the call's original target; it takes at most these four register slots.
+    let original: Original = unsafe { core::mem::transmute(callee) };
+    let ret = unsafe { original(cgame, arg2, arg3, arg4) };
+    crate::log::guarded("interface player", || crate::iplayer::STATE.after_front(&GameMemory, cgame as usize));
+    ret
+}
+
+/// The trampolines of the interface player's two detours; 0 until published.
+static START_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static REPLICATE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+
+/// `CGame::StartGameSim(this)` (0x11f0a0, main thread, once per loaded world; it reads only `rcx`, 0x11f0b6): before it, the savegame's
+/// player is read from the loaded state; after it (the first front is set at 0x11f29c), the front gets the interface player. The real
+/// function runs in this plain frame, outside any guard (log.rs THE RULE): a C++ exception of the game passes through.
+unsafe extern "system-unwind" fn start_game_sim_hook(cgame: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::START_HOOK);
+    let original = START_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    crate::log::guarded("interface player", || crate::iplayer::STATE.world_start(&GameMemory, cgame as usize));
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline of the detoured function; it takes at most these four register slots.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    let ret = unsafe { original(cgame, arg2, arg3, arg4) };
+    crate::log::guarded("interface player", || crate::iplayer::STATE.after_front(&GameMemory, cgame as usize));
+    ret
+}
+
+/// `GameState::Replicate(src, dst, flag)` (0x255e70; called by the simulation loop at 0x11eaaa on the simulation thread and by
+/// StartGameSim): after the copy, `dst`'s local player is the savegame's again, so no simulation state keeps the interface player.
+unsafe extern "system-unwind" fn replicate_hook(src: u64, dst: u64, flag: u64, arg4: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::REPLICATE_HOOK);
+    let original = REPLICATE_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline of the detoured function; it takes these three register slots (the fourth is passed through unread).
+    let original: Original = unsafe { core::mem::transmute(original) };
+    let ret = unsafe { original(src, dst, flag, arg4) };
+    crate::log::guarded("interface player", || crate::iplayer::STATE.after_replicate(&GameMemory, dst as usize));
+    ret
+}
+
+impl crate::autosave::Memory for GameMemory {
+    fn word(&self, addr: usize) -> Option<usize> {
+        crate::memguard::read_value::<usize>(addr)
+    }
+    fn int(&self, addr: usize) -> Option<i32> {
+        crate::memguard::read_value::<i32>(addr)
+    }
+    fn byte(&self, addr: usize) -> Option<u8> {
+        crate::memguard::read_value::<u8>(addr)
+    }
+}
+
+/// The trampolines of the synchronised autosave's two detours (`autosave.rs`); 0 until published.
+static AUTOSAVE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static GAMEUI_STEP_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+
+/// `UI::CGameUI::AutoSave(this)` (0x65a150; its only caller is the autosave decision of the per-frame update, 0x65f87d; it reads
+/// only `rcx`): while the session holds the game's own timer off, the game's own call returns without saving (the caller restarts the
+/// timer as after a save); the module's own call (`gameui_step_hook`) passes. The real function runs in this plain frame, outside any
+/// guard (log.rs THE RULE).
+unsafe extern "system-unwind" fn autosave_hook(gameui: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::AUTOSAVE_HOOK);
+    let original = AUTOSAVE_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    let run = crate::log::guarded("sync autosave", || crate::autosave::STATE.let_through(crate::pace::clock_ms()));
+    if run == Some(false) {
+        return 0; // a void function
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline of the detoured function; it reads one register argument (the others are passed through unread).
+    let original: Original = unsafe { core::mem::transmute(original) };
+    unsafe { original(gameui, arg2, arg3, arg4) }
+}
+
+/// `CGameUI`'s per-frame update (0x65ecd0, vtable slot 52, the thread the game's own autosave decision runs on; it reads `rcx`, `rdx`
+/// and `r8`, the frame's microseconds): before it, the mod's `autosave {now}` runs the original AutoSave with this `CGameUI`, unless
+/// a save is under way (AutoSave's own assert would end the game). Both real functions run in this plain frame, outside any guard.
+unsafe extern "system-unwind" fn gameui_step_hook(gameui: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::GAMEUI_STEP_HOOK);
+    let original = GAMEUI_STEP_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    let due = crate::log::guarded("sync autosave", || {
+        crate::autosave::STATE.take_due(&GameMemory, gameui as usize, crate::pace::clock_ms())
+    });
+    let autosave = AUTOSAVE_ORIGINAL.load(Ordering::Acquire);
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+    if due == Some(true) && autosave != 0 {
+        crate::autosave::STATE.own_call(true);
+        // SAFETY: the trampoline of AutoSave, called as the game calls it (0x65f87a: `mov rcx, rsi`, this CGameUI) on its thread.
+        let autosave: Original = unsafe { core::mem::transmute(autosave) };
+        unsafe { autosave(gameui, 0, 0, 0) };
+        crate::autosave::STATE.own_call(false);
+    }
+    // SAFETY: the trampoline of the detoured function; it takes these three register slots (the fourth is passed through unread).
+    let original: Original = unsafe { core::mem::transmute(original) };
+    unsafe { original(gameui, arg2, arg3, arg4) }
 }
 
 /// Where the redirected free-id append leads after [`free_order_hook`]: the real `deque<int>::_Insert_range` (`0x2bb62a0`); 0 until
@@ -1213,6 +1355,13 @@ pub struct Targets {
     pub free_order: usize,
     /// The call-site hook where the game interface makes its builder-preview listener ([`preview_owner_hook`]).
     pub preview_owner: usize,
+    /// The interface player's hooks (`iplayer.rs`): [`start_game_sim_hook`], [`replicate_hook`], [`sync_front_hook`].
+    pub start: usize,
+    pub replicate: usize,
+    pub sync_front: usize,
+    /// The synchronised autosave's detours (`autosave.rs`): [`autosave_hook`], [`gameui_step_hook`].
+    pub autosave: usize,
+    pub gameui_step: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -1392,6 +1541,10 @@ pub unsafe fn execute(
                 Feature::Convert => targets.convert,
                 Feature::ConvertUpdate => targets.convert_update,
                 Feature::PreviewEvent => targets.preview,
+                Feature::InterfaceStart => targets.start,
+                Feature::InterfaceReplicate => targets.replicate,
+                Feature::AutosaveCall => targets.autosave,
+                Feature::AutosaveStep => targets.gameui_step,
                 _ => targets.add,
             };
             match unsafe { Detour::prepare(at, expected) } {
@@ -1414,6 +1567,10 @@ pub unsafe fn execute(
     CONVERT_ORIGINAL.store(original_of("script_convert"), Ordering::Release);
     CONVERT_UPDATE_ORIGINAL.store(original_of("script_convert_update"), Ordering::Release);
     PREVIEW_ORIGINAL.store(original_of("preview_event"), Ordering::Release);
+    START_ORIGINAL.store(original_of(crate::iplayer::START_HOOK), Ordering::Release);
+    REPLICATE_ORIGINAL.store(original_of(crate::iplayer::REPLICATE_HOOK), Ordering::Release);
+    AUTOSAVE_ORIGINAL.store(original_of(crate::autosave::AUTOSAVE_HOOK), Ordering::Release);
+    GAMEUI_STEP_ORIGINAL.store(original_of(crate::autosave::STEP_HOOK), Ordering::Release);
     rt.set_preview_original(original_of("preview_event"));
     observer(Stage::Prepared);
 
@@ -1445,6 +1602,7 @@ pub unsafe fn execute(
             let (hook, prefix): (usize, &[u8]) = match feature {
                 Feature::GrowthSort => (targets.sort, &[]),
                 Feature::BatchPace => (targets.pace, &[]),
+                Feature::InterfaceSync => (targets.sync_front, &[]),
                 Feature::FreeOrder => (targets.free_order, &[]),
                 Feature::PreviewOwner => (targets.preview_owner, &[]),
                 Feature::GrowthField => (targets.field, &[]),
@@ -1454,7 +1612,7 @@ pub unsafe fn execute(
             let callee_addr = base + *callee as usize;
             match feature {
                 Feature::GrowthSort => SORT_CALLEE.store(callee_addr, Ordering::Release),
-                Feature::BatchPace => PACE_CALLEE.store(callee_addr, Ordering::Release),
+                Feature::BatchPace | Feature::InterfaceSync => PACE_CALLEE.store(callee_addr, Ordering::Release),
                 Feature::FreeOrder => FREE_ORDER_CALLEE.store(callee_addr, Ordering::Release),
                 Feature::PreviewOwner => PREVIEW_OWNER_CALLEE.store(callee_addr, Ordering::Release),
                 Feature::GrowthField => FIELD_CALLEE.store(callee_addr, Ordering::Release),
@@ -1673,6 +1831,10 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         crate::inject::INJECT_VAR,
     ) {
         rt.enable_native_inject(settings);
+        // separate companies (on by default, `FEVERLINK3_ACTING_PLAYER=0` off): an injected build belongs to and is paid by its carrier's player (`acting.rs`)
+        if crate::acting::switch_on(|n| std::env::var(n).ok()) {
+            rt.enable_acting_player();
+        }
     }
     let targets = Targets {
         apply: apply_hook as *const () as usize,
@@ -1691,6 +1853,11 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         pace: pace_hook as *const () as usize,
         free_order: free_order_hook as *const () as usize,
         preview_owner: preview_owner_hook as *const () as usize,
+        start: start_game_sim_hook as *const () as usize,
+        replicate: replicate_hook as *const () as usize,
+        sync_front: sync_front_hook as *const () as usize,
+        autosave: autosave_hook as *const () as usize,
+        gameui_step: gameui_step_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -1717,6 +1884,8 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     let sort_on = installed.hook_names().contains(&"town_sort");
     let pick_on = installed.hook_names().contains(&"town_pick");
     let field_on = installed.hook_names().contains(&"town_field");
+    arm_interface_player(&cfg, &plan, &installed.hook_names(), log);
+    arm_sync_autosave(&cfg, &plan, &installed.hook_names(), base, log);
     rt.set_installed(mod_hooks.clone(), installed.poolpatch());
     let anything = !installed.is_empty();
     let hooked = !mod_hooks.is_empty();
@@ -1777,6 +1946,81 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     } else {
         log("hooks: no session folder: counters only in memory, no control link");
     }
+}
+
+/// The interface player (`iplayer.rs`) is armed only when both detours and the call of `Sync` (smooth pacing's or its own) are in
+/// place; otherwise its hooks only call the originals and the mod is never told it may send `interface_player`.
+fn arm_interface_player(cfg: &HookConfig, plan: &Plan, names: &[&'static str], log: fn(&str)) {
+    if !(cfg.hooks && cfg.interface_player) {
+        if cfg.hooks {
+            log(&format!(
+                "interface player: off ({}=0): the interface acts as the savegame's player",
+                crate::iplayer::INTERFACE_VAR
+            ));
+        }
+        return;
+    }
+    if let Some(skip) = plan.skipped.iter().find(|s| s.feature == Feature::InterfaceStart) {
+        log(&format!("interface player: OFF, not installed: {}", skip.reason));
+        return;
+    }
+    let has = |n: &str| names.contains(&n);
+    let sync = if has(crate::pace::HOOK_NAME) { crate::pace::HOOK_NAME } else { crate::iplayer::SYNC_HOOK };
+    let missing: Vec<&str> =
+        [crate::iplayer::START_HOOK, crate::iplayer::REPLICATE_HOOK, sync].into_iter().filter(|n| !has(n)).collect();
+    if !missing.is_empty() {
+        log(&format!(
+            "interface player: OFF, {} not in place (the lines above say why): the hooks only call the originals",
+            missing.join(", ")
+        ));
+        return;
+    }
+    crate::iplayer::STATE.arm();
+    log(&format!(
+        "interface player: ready (StartGameSim and Replicate detoured, the front written after {sync}; {}=0 off): nothing is written until the mod names a company",
+        crate::iplayer::INTERFACE_VAR
+    ));
+}
+
+/// The synchronised autosave (`autosave.rs`) is armed only when both detours are in place; otherwise the hooks only call the originals,
+/// the mod is never told it may send `autosave` and every game keeps its own autosave timer (FAIL-CLOSED).
+fn arm_sync_autosave(cfg: &HookConfig, plan: &Plan, names: &[&'static str], base: usize, log: fn(&str)) {
+    if !(cfg.hooks && cfg.sync_autosave) {
+        if cfg.hooks {
+            log(&format!("sync autosave: off ({}=0): the game autosaves on its own timer", crate::autosave::SYNC_VAR));
+        }
+        return;
+    }
+    if let Some(skip) = plan.skipped.iter().find(|s| s.feature == Feature::AutosaveCall) {
+        log(&format!(
+            "FAIL-CLOSED [sync autosave]: not installed, the game autosaves on its own timer: {}",
+            skip.reason
+        ));
+        return;
+    }
+    let missing: Vec<&str> = [crate::autosave::AUTOSAVE_HOOK, crate::autosave::STEP_HOOK]
+        .into_iter()
+        .filter(|n| !names.contains(n))
+        .collect();
+    if !missing.is_empty() {
+        log(&format!(
+            "FAIL-CLOSED [sync autosave]: {} not in place (the lines above say why): the game autosaves on its own timer",
+            missing.join(", ")
+        ));
+        return;
+    }
+    let planned = |r: &&crate::autosave::Row| {
+        plan.steps.iter().any(|s| matches!(s, Step::Detour { rva, .. } if *rva == r.autosave.rva))
+    };
+    let row = crate::autosave::ROWS.iter().find(planned);
+    let Some(row) = row else {
+        return log("FAIL-CLOSED [sync autosave]: the planned detour is not a verified row's: the game autosaves on its own timer");
+    };
+    crate::autosave::STATE.arm(base + row.settings as usize);
+    log(&format!(
+        "sync autosave: ready (CGameUI::AutoSave and the per-frame update detoured; {}=0 off): the game's own timer is held off only while the mod's session hold stands",
+        crate::autosave::SYNC_VAR
+    ));
 }
 
 /// Fail loud (`failsafe.rs`): a determinism patch the switches ask for (each is on unless its variable says 0, and must match on every
@@ -2066,6 +2310,11 @@ mod tests {
             pace: pace_hook as *const () as usize,
             free_order: free_order_hook as *const () as usize,
             preview_owner: preview_owner_hook as *const () as usize,
+            start: start_game_sim_hook as *const () as usize,
+            replicate: replicate_hook as *const () as usize,
+            sync_front: sync_front_hook as *const () as usize,
+            autosave: autosave_hook as *const () as usize,
+            gameui_step: gameui_step_hook as *const () as usize,
         }
     }
 

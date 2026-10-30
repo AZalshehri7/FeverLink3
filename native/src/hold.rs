@@ -281,7 +281,8 @@ impl<H> HoldMachine<H> {
         self.table.iter().filter(|(_, k)| self.kinds.contains(k)).map(|(n, _)| n.clone()).collect()
     }
 
-    fn push_event(&mut self, e: Event) {
+    /// Queues an event of the runtime's own (an answer to a line the runtime took before the machine, `iplayer.rs`).
+    pub fn push_event(&mut self, e: Event) {
         if self.events.len() >= MAX_QUEUED_EVENTS {
             self.events.remove(0);
             self.lost_events += 1;
@@ -411,7 +412,9 @@ impl<H> HoldMachine<H> {
             | CtlMessage::TerrainApply { .. }
             | CtlMessage::TerrainShare { .. }
             | CtlMessage::AssetsApply { .. }
-            | CtlMessage::Pace { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject, terrain.rs, pace.rs)
+            | CtlMessage::Pace { .. }
+            | CtlMessage::InterfacePlayer { .. }
+            | CtlMessage::Autosave { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject, terrain.rs, pace.rs, iplayer.rs, autosave.rs)
         }
     }
 

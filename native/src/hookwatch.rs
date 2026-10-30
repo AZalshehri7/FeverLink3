@@ -77,6 +77,11 @@ pub static PICK_HOOK: Watch = Watch::new("pick_hook");
 pub static FIELD_HOOK: Watch = Watch::new("field_hook");
 pub static PACE_HOOK: Watch = Watch::new("pace_hook");
 pub static FREE_ORDER_HOOK: Watch = Watch::new("free_order_hook");
+pub static START_HOOK: Watch = Watch::new("start_game_sim_hook");
+pub static REPLICATE_HOOK: Watch = Watch::new("replicate_hook");
+pub static SYNC_FRONT_HOOK: Watch = Watch::new("sync_front_hook");
+pub static AUTOSAVE_HOOK: Watch = Watch::new("autosave_hook");
+pub static GAMEUI_STEP_HOOK: Watch = Watch::new("gameui_step_hook");
 pub static GROWTH_CMD_HOOK: Watch = Watch::new("growth_cmd_hook");
 pub static GROWTH_HOOK: Watch = Watch::new("growth_hook");
 pub static IDS_ADD_HOOK: Watch = Watch::new("ids add_hook");
@@ -89,7 +94,7 @@ pub static IDORDER_FILE: Watch = Watch::new("idorder write");
 pub static NATIVE_LOG: Watch = Watch::new("native.log write");
 
 /// Every watch, in dump order.
-pub static ALL: [&Watch; 23] = [
+pub static ALL: [&Watch; 28] = [
     &APPLY_HOOK,
     &ADD_HOOK,
     &CONVERT_HOOK,
@@ -98,6 +103,11 @@ pub static ALL: [&Watch; 23] = [
     &PREVIEW_OWNER_HOOK,
     &PACE_HOOK,
     &FREE_ORDER_HOOK,
+    &START_HOOK,
+    &REPLICATE_HOOK,
+    &SYNC_FRONT_HOOK,
+    &AUTOSAVE_HOOK,
+    &GAMEUI_STEP_HOOK,
     &IDS_ADD_HOOK,
     &IDS_REMOVE_HOOK,
     &IDS_STEP_HOOK,

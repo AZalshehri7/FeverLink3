@@ -15,7 +15,7 @@ This is the short version. Nothing here is a promise: [what is verified and what
 
 Many builds cannot be rebuilt exactly from a description, because the game decides details itself (a depot's entrance over a street, a stop's exact place). So the mod copies the game's own build from the game you clicked in, and every game, yours included, applies that same copy at the same moment. In two tests with a friend over Steam (2026-10-20 and 2026-10-21) this worked for roads, rail, stations, stops, depots, lines and vehicles.
 
-Known limits right now (version 0.2.9):
+Known limits right now (version 0.2.10):
 - Trees, plants, rocks and the vegetation eraser are shared since 0.2.8 (terrain heights and ground paint since 0.2.7). This is new: seen in an automated test with two game windows on one PC, not yet between two PCs; tell us if the trees look different for someone.
 - Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.
 - Two players building at the same spot within about a second: one of the two builds can be refused on both games (the worlds stay equal).

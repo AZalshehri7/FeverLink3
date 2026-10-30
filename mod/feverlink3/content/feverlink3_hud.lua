@@ -310,6 +310,88 @@ function H.readSnapshot(C, seenVersion)
 	return h
 end
 
+-- ------------------------------------------------------------------ the company page (companies.txt, docs/COMPANIES.md 6.1)
+
+H.COMPANIES = "companies.txt"
+
+-- The bridge's company page and its text, or nil when it is missing, half written or the same text as `lastText`.
+function H.readCompanies(C, lastText)
+	local text = C.readFile(C.path(H.COMPANIES))
+	if not text or #text == 0 or text == lastText then return nil end
+	local st = C.parse(text)
+	if type(st) ~= "table" or type(st.companies) ~= "table" then return nil end
+	return st, text
+end
+
+-- What the Companies tab shows, from the page: { intro, mine, refused, handOver, selected, hint, owner, give, targets, rows = { { key,
+-- title, detail, join, leave, remove, pay } } }. W are the words (feverlink3_text.lua T.COMPANY). Join on every company but one's own;
+-- Leave on one's own in shared mode (in company-for-each-player mode everyone belongs to one, OPS.leave); Remove for the host and the
+-- owner, on an empty company in that mode. Pay (`pay` on a row) and Give line (`handOver`: the section with the amount and the line)
+-- only in company-for-each-player mode, to every other company with an account, when one's own company has one too: in one shared
+-- company there is one account and one owner, so nothing moves between companies. Give line offers only the line the player has
+-- selected in the game (the page's `selected`, owner 2026-10-27): `selected` is its line of text, `give` its id when one's own company
+-- owns it (then `targets`, the companies it can go to, { key, title }), `owner` says whose it is otherwise; `hint` without a selection.
+function H.companyView(st, W)
+	local out = { rows = {} }
+	if type(st) ~= "table" then return out end
+	local separate = st.mode == "separate"
+	local myBound = false
+	for _, c in ipairs(st.companies or {}) do
+		if c.you and c.bound then myBound = true end
+	end
+	out.intro = separate and W.modeSeparate or W.modeShared
+	local mineName = nil
+	for _, c in ipairs(st.companies or {}) do
+		local names = {}
+		for _, m in ipairs(c.members or {}) do
+			names[#names + 1] = tostring(m.name) .. (m.you and W.you or (m.online and "" or W.away))
+		end
+		local detail = W.members .. (#names > 0 and table.concat(names, ", ") or W.nobody)
+		if separate and c.balanceText then
+			detail = detail .. ";  " .. W.balance .. c.balanceText
+		elseif (c.spent or 0) > 0 and c.spentText then
+			detail = detail .. ";  " .. W.spent .. c.spentText
+		end
+		if c.you then mineName = c.name end
+		out.rows[#out.rows + 1] = {
+			key = c.key, title = tostring(c.name), detail = detail, color = c.color,
+			join = not c.you and st.identity ~= nil, leave = c.you == true and not separate,
+			remove = c.mayEdit == true and not (separate and (#names > 0 or c.bound == true)),
+			pay = separate and myBound and not c.you and c.bound == true,
+		}
+		if out.rows[#out.rows].pay then out.handOver = true end
+	end
+	if out.handOver then
+		local s = type(st.selected) == "table" and st.selected or nil
+		if s == nil then
+			out.hint = W.selectHint
+		else
+			out.selected = (W.selectedLine:gsub("{(%w+)}", { name = tostring(s.name), vehicles = tostring(s.vehicles or 0), stops = tostring(s.stops or 0) }))
+			if s.mine then
+				out.give, out.targets = s.id, {}
+				for _, r in ipairs(out.rows) do
+					if r.pay then out.targets[#out.targets + 1] = { key = r.key, title = r.title } end
+				end
+			else
+				out.owner = s.companyName and (W.ownedBy:gsub("{company}", function() return tostring(s.companyName) end)) or W.notYours
+			end
+		end
+	end
+	out.mine = mineName and (W.yours .. mineName) or W.noneYours
+	for _, p in ipairs(st.players or {}) do
+		if p.you and p.lastRefusal then out.refused = W.refused .. tostring(p.lastRefusal) end
+	end
+	return out
+end
+
+-- The amount typed for Pay: a whole number above zero ("250,000" and "250 000" are 250000), else nil.
+function H.amountOf(text)
+	if type(text) ~= "string" then return nil end
+	local n = tonumber((text:gsub("[,%s']", "")))
+	if n == nil or n ~= n or n < 1 or n > 1e12 then return nil end
+	return math.floor(n)
+end
+
 -- ------------------------------------------------------------------ outbox hand-off (window -> bridge)
 
 -- The window's writer for ui_out.log. Records are `chat` with {text}; the bridge reads them by position.

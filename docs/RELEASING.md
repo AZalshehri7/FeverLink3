@@ -95,8 +95,8 @@ Right after a release (0.2.1 or later; 0.2.0 was withdrawn) is published on GitH
 PowerShell, in the folder with the files:
 
 ```powershell
-(Get-FileHash FeverLink3-0.3.0.zip -Algorithm SHA256).Hash.ToLower()
-Get-Content FeverLink3-0.3.0.zip.sha256
+(Get-FileHash FeverLink3-0.2.10.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content FeverLink3-0.2.10.zip.sha256
 ```
 
 The two values must be equal, and equal to the SHA-256 in the release notes. The same hash is the `zip_sha256` field of `manifest.json`. Until 1.0.0 there is no signature to check. From then on the signature check is done by the launcher's updater (trusted public keys embedded in the exe), or by hand with `feverlink3_release verify --manifest manifest.json` from a checkout of the tagged source.

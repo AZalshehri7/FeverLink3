@@ -46,6 +46,32 @@ impl Runtime {
         self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and each inject_next order (queued in the mod's order) makes its own script build_proposal (the one that carries the conversion of the mod's own send; without one seen, the text's place or constructions) take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal empties the command: nothing of the build is applied on this game)");
     }
 
+    /// Switches the acting player on (default, `FEVERLINK3_ACTING_PLAYER=0` off, `acting.rs`): at every injection the owners the text gives the
+    /// originator's tool player are given the carrier command's player instead. Listed in `ready` (`acting_player`) only together with
+    /// `inject_next`.
+    pub fn enable_acting_player(&self) {
+        self.acting_player.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.say("acting player: on (FEVERLINK3_ACTING_PLAYER=0 switches it off): an injected build's owners that are its text's context.player (the originator's tool player) become the carrier command's context.player (the mod's acting player); the money already follows the carrier's Context");
+    }
+
+    /// The text as this game's carrier at `dest` must apply it: with the switch on, its tool player's owners are the carrier's player
+    /// (`acting::remap_owners`); a failure is a refusal of the order (the command is the mod's: never applied with a guessed owner).
+    fn acting_text(&self, key: u64, dest: usize, text: String) -> Result<String, String> {
+        if !self.acting_player.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(text);
+        }
+        let to = LiveMem
+            .read(dest + crate::acting::CONTEXT_PLAYER, 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or("acting player: the carrier's context.player cannot be read")?;
+        let (out, r) = crate::acting::remap_owners(&text, to)?;
+        self.say(&format!(
+            "native inject: key {key}: acting player: text player {} -> carrier player {} ({} owners rewritten)",
+            r.from, r.to, r.owners
+        ));
+        Ok(out)
+    }
+
     pub(super) fn inject_dir(&self, dir: &std::path::Path) {
         *super::lock(&self.inject_dir_path) = Some(dir.to_path_buf());
     }
@@ -854,6 +880,7 @@ impl Runtime {
                 }
             })?;
         // from here on the command is the mod's placeholder for this order: a refusal empties it
+        let text = self.acting_text(key, dest, text)?;
         if self.build.layout_name() != portable::LAYOUT_BUILD {
             return Err(format!(
                 "the layout is that of game build {}, this is {}",

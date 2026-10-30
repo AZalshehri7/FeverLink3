@@ -116,6 +116,8 @@ pub struct Runtime {
     /// would refuse the same text, so the mod fails the held command and ships nothing (`inject::text_refusal`).
     refused_text: crate::input::InputOut,
     inject: crate::inject::State,
+    /// `FEVERLINK3_ACTING_PLAYER` (on unless `=0`, `acting.rs`): at an injection the text's owners that are its own player become the carrier's player.
+    acting_player: AtomicBool,
     /// Terrain height edits shared at the stamp (`terrain.rs`): the tools' commands noted at `Add`, the carriers' orders.
     terrain: crate::terrain::State,
     /// Tree, plant and rock ticks shared at the stamp (`assets.rs`): the tools' commands noted at `Add`, the carriers' orders.
@@ -244,6 +246,7 @@ impl Runtime {
             text: crate::input::InputOut::with_prefix("native_text_"),
             refused_text: crate::input::InputOut::with_prefix("native_refused_"),
             inject: Default::default(),
+            acting_player: AtomicBool::new(false),
             terrain: Default::default(),
             assets: Default::default(),
             inject_settings: OnceLock::new(),
@@ -766,12 +769,21 @@ impl Runtime {
             hook_names.push(crate::inject::READY_NAME.to_string()); // and this one, `inject_next`
             hook_names.push("defer".to_string()); // and `defer` + `inject_next {held}`: the deferred completion of a held command
             hook_names.push("fail".to_string()); // and `fail` + `complete_next`: a deferred command never waits for the age limit
+            if self.acting_player.load(Relaxed) {
+                hook_names.push(crate::acting::READY_NAME.to_string()); // an injected build is owned by its carrier's player
+            }
         }
         if self.terrain_ready() {
             hook_names.push(crate::terrain::READY_NAME.to_string()); // `terrain_share` and `terrain_apply`: height edits at the stamp
         }
         if self.assets_ready() {
             hook_names.push(crate::assets::READY_NAME.to_string()); // `assets_apply`: tree, plant and rock ticks at the stamp
+        }
+        if crate::iplayer::STATE.armed() {
+            hook_names.push(crate::iplayer::READY_NAME.to_string()); // `interface_player`: the interface acts as this game's company
+        }
+        if crate::autosave::STATE.armed() {
+            hook_names.push(crate::autosave::READY_NAME.to_string()); // `autosave`: the games autosave together at the host's stamp
         }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
@@ -893,6 +905,15 @@ impl Runtime {
                     self.terrain_share(false); // the session's end (or a resync load): the tools apply as they are again
                     machine.handle(&crate::link::CtlMessage::HoldOff, now)
                 }
+                Ok(crate::link::CtlMessage::InterfacePlayer { entity }) => {
+                    let ev = self.interface_player_order(&crate::iplayer::STATE, entity);
+                    machine.push_event(ev);
+                }
+                Ok(crate::link::CtlMessage::Autosave { hold, now: run }) => {
+                    let ev = self.autosave_order(&crate::autosave::STATE, hold, run);
+                    machine.push_event(ev);
+                    machine.handle(&crate::link::CtlMessage::Autosave { hold, now: run }, now);
+                }
                 Ok(crate::link::CtlMessage::Pace { permille }) => {
                     crate::pace::PACER.set(permille, crate::pace::clock_ms());
                     // the mod speaks: what is held keeps its liveness as with any other line
@@ -915,8 +936,57 @@ impl Runtime {
         }
         if poll.gone {
             self.terrain_share(false);
+            // the session folder was cleaned (the session is over): the interface acts as the savegame's player again
+            if crate::iplayer::STATE.wanted().is_some() {
+                let ev = self.interface_player_order(&crate::iplayer::STATE, None);
+                machine.push_event(ev);
+            }
             machine.ctl_gone(now);
         }
+    }
+
+    /// The mod's `interface_player` order (`iplayer.rs`), and the event that answers it. Refused when the piece is not armed (then the
+    /// mod was never told it may send it: an old mod, or a line of a test).
+    fn interface_player_order(&self, state: &crate::iplayer::State, entity: Option<u32>) -> Event {
+        let what = entity.map_or("clear: back to the savegame's player".to_string(), |e| format!("act as entity {e}"));
+        if !state.armed() {
+            self.say(&format!("interface player: order '{what}' REFUSED: the piece is not installed on this game"));
+            return state.event("the piece is not installed on this game");
+        }
+        let before = state.wanted();
+        state.set(entity);
+        if before != entity {
+            self.say(&format!(
+                "interface player: order '{what}' (savegame player {}): the front state takes it at the next Sync, the tools at the next world load",
+                state.savegame().map_or("not read yet".to_string(), |p| p.to_string())
+            ));
+        }
+        state.event("")
+    }
+
+    /// The mod's `autosave` line (`autosave.rs`), and the event that answers it (with this game's interval, for the host's stamps).
+    /// Refused when the piece is not armed: the game then keeps its own autosave.
+    fn autosave_order(&self, state: &crate::autosave::State, hold: bool, run: bool) -> Event {
+        let clock = crate::pace::clock_ms();
+        if !state.armed() {
+            if run {
+                self.say("sync autosave: 'now' REFUSED: the piece is not installed on this game (its own autosave runs as before)");
+            }
+            return state.event(clock, "the piece is not installed on this game");
+        }
+        let was = state.held(clock);
+        state.order(hold, run, clock);
+        if was != hold {
+            self.say(if hold {
+                "sync autosave: HOLD on: the game's own autosave timer is held off while the session runs"
+            } else {
+                "sync autosave: hold off: the game's own autosave runs as before"
+            });
+        }
+        if run {
+            self.say("sync autosave: 'now' (the host's stamp): the game's own autosave runs at the next frame of the game interface");
+        }
+        state.event(clock, "")
     }
 
     /// For the command hook, which needs a `patch_next` the mod wrote an instant ago and cannot wait for the service thread (nor for
@@ -968,6 +1038,23 @@ impl Runtime {
                 place: "applied".into(),
                 detail: format!("command {id} was released but never seen being applied"),
             });
+        }
+        // the interface player (iplayer.rs): a world start, a new front value or a refusal, said from this thread (never from a hook)
+        let (lines, tell) = crate::iplayer::STATE.news();
+        for line in lines {
+            self.say(&line);
+        }
+        if tell {
+            events.push(crate::iplayer::STATE.event(""));
+        }
+        // the synchronised autosave (autosave.rs): the interval read here, the hooks' counts said from this thread
+        crate::autosave::STATE.read_minutes(&crate::hooks::GameMemory);
+        let (lines, tell) = crate::autosave::STATE.news();
+        for line in lines {
+            self.say(&line);
+        }
+        if tell {
+            events.push(crate::autosave::STATE.event(crate::pace::clock_ms(), ""));
         }
         // smooth pacing (pace.rs): its first stretched batch and a line a minute, from this thread (never from the hook on the main thread)
         let pace_now = crate::pace::clock_ms();
@@ -2339,6 +2426,29 @@ mod tests {
     }
 
     #[test]
+    fn an_interface_player_order_is_answered_and_kept_only_where_the_piece_is_armed() {
+        let dir = TempDir::new("rt-iplayer");
+        let rt = runtime(Some(dir.path()));
+        rt.pump();
+        // the process's piece is not armed in the tests: the order is refused and nothing is kept
+        ctl(dir.path(), "interface_player\t1\t{[\"entity\"]=26044}\n");
+        rt.pump();
+        let ev = events(dir.path());
+        let answer = &ev.last().unwrap();
+        assert_eq!(answer.0, "interface_player");
+        assert!(answer.1.contains("[\"player\"]=-1") && answer.1.contains("not installed"), "{answer:?}");
+        assert!(!ev[0].1.contains("interface_player"), "ready lists it only when armed: {}", ev[0].1);
+        assert_eq!(crate::iplayer::STATE.wanted(), None);
+        // an armed piece keeps the order and says it in the event
+        let armed = crate::iplayer::State::new();
+        armed.arm();
+        let e = rt.interface_player_order(&armed, Some(26044));
+        assert_eq!(e, Event::InterfacePlayer { player: 26044, savegame: -1, front: -1, world: 0, why: String::new() });
+        assert_eq!((armed.wanted(), rt.interface_player_order(&armed, None)), (Some(26044), armed.event("")));
+        assert_eq!(armed.wanted(), None);
+    }
+
+    #[test]
     fn ready_says_what_is_active_and_old_control_lines_are_history() {
         let dir = TempDir::new("rt-ready");
         ctl(dir.path(), HOLD_ON); // left over from an earlier run
@@ -2915,6 +3025,40 @@ mod tests {
         );
         // the held command is failed at once (here it is not in the ring, so the machine says it does not know it)
         assert!(ev.iter().any(|(k, w)| k == "error" && w.contains("no held command 3")), "{ev:?}");
+        inject::TEST_FNS.with(|f| f.set(None));
+    }
+
+    #[test]
+    fn with_the_acting_player_an_order_whose_carrier_names_no_player_is_refused_and_one_with_a_player_goes_on() {
+        let dir = TempDir::new("rt-inject-acting");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
+        rt.enable_acting_player();
+        inject::TEST_FNS.with(|f| {
+            f.set(Some(crate::native_copy::ProposalFns { ctor: p_ctor, dtor: p_dtor, copy: p_copy, assign: p_copy }))
+        });
+        let text = format!(
+            "proposal.addedNodes.#\tn:1\nproposal.addedNodes[0].position\tv3:{:08x},00000000,00000000\ncontext.player\tent:old#64976\n",
+            100f32.to_bits()
+        );
+        let mut sim = [0u8; 8];
+        for (key, player) in [(5u64, u32::MAX), (6, 52855)] {
+            std::fs::write(dir.path().join(crate::inject::inject_file_name(key)), &text).unwrap();
+            ctl(dir.path(), &format!("inject_next\t1\t{{[\"held\"]=3,[\"key\"]={key}}}\n"));
+            let (mut ours, _n) = road_placeholder(100.0);
+            ours.c.payload[crate::acting::CONTEXT_PLAYER..crate::acting::CONTEXT_PLAYER + 4]
+                .copy_from_slice(&player.to_le_bytes());
+            unsafe { rt.on_apply(sim.as_mut_ptr(), ours.c.command.as_mut_ptr()) };
+            assert!(ours.c.payload[..crate::native_copy::PROPOSAL_SIZE].iter().all(|&b| b == 0), "refused: emptied");
+        }
+        rt.pump();
+        let ev = events(dir.path());
+        let refused = |key: u64, why: &str| {
+            ev.iter().any(|(k, w)| k == "inject_refused" && w.contains(&format!("[\"key\"]={key}")) && w.contains(why))
+        };
+        assert!(refused(5, "acting player: the carrier command's context.player is -1"), "{ev:?}");
+        // the remap went through (64976 -> 52855); the refusal is the next check's (this test's layout is not the game's)
+        assert!(refused(6, "the layout is that of game build"), "{ev:?}");
         inject::TEST_FNS.with(|f| f.set(None));
     }
 

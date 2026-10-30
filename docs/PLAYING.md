@@ -43,14 +43,14 @@ Start Transport Fever 3 from **Steam as usual**.
 
 1. Start a game (a new game, or load one) with *FeverLink3 Multiplayer* activated, and click **FeverLink3** in the bottom bar.
 2. Press **Host a game**. The window shows a **join code**. Press **Copy code** (the code is put on your clipboard; the game's text fields cannot copy by themselves) and paste it into a message to your friend with `Ctrl+V` (chat, Discord). Treat it like a password for the session.
-3. When your friend appears under **Players**, press **Start the session**. Your world is sent to the other player, whose game reloads into it; yours keeps running after a short pause, without a loading screen. The games compare a checksum before the session runs, so a difference would stop it instead of going unnoticed. The same happens for a player who joins later.
+3. When your friend appears under **Players**, press **One shared company** to start the session (everyone builds and pays from one account; **Company for each player** is upcoming and shows grayed, see "Companies" below). Your world is sent to the other player, whose game reloads into it; yours keeps running after a short pause, without a loading screen. The games compare a checksum before the session runs, so a difference would stop it instead of going unnoticed. The same happens for a player who joins later.
 4. While you play, **Pause**, **1x**, **2x** and **3x** in the window's **Session** section change the speed in every game, and the chat line under them sends a message to the others. Every player can do both.
 
 **The player who joins:**
 
 1. Start any game with *FeverLink3 Multiplayer* activated (a new game is fine; it is replaced) and click **FeverLink3** in the bottom bar.
 2. Click the field **paste the join code here**, press `Ctrl+V` to paste the host's code, and press **Join**. The window shows what it is doing (`contacting the host`, `finding a route`, `connected`).
-3. Keep the window open. When the host presses **Start the session**, the host's world is sent to you (usually well under a minute), your game reloads into it, and the session runs on both games. Open the window again after the reload (the reload closes it).
+3. Keep the window open. When the host starts the session, the host's world is sent to you (usually well under a minute), your game reloads into it, and the session runs on both games. Open the window again after the reload (the reload closes it).
 
 **Joining through a Steam invite.** When the host invites you through Steam (or you click **Join game** on the host in your friends list), a game that already has a world loaded (with *FeverLink3 Multiplayer* activated) joins by itself, without opening the window. If the invite reaches you in the main menu, it waits: load any world (a new game is fine; it is replaced) and you join automatically. Until then the window shows "<host> invited you. Load any world and you join automatically" with **Join** and **Not now**. Transport Fever 3 has no documented way for a mod to load a save from the main menu, so a world must be loaded first. **A fix for joining by itself is in 0.2.1 and has not yet been tested between two PCs; the join code always works.**
 
@@ -112,7 +112,15 @@ A friend who does not own the game can take part with the small program `feverli
 - Mods that change the world on their own (for example an automatic line namer) cause extra repair syncs. Turn their automatic changes off while playing together. Every player needs the same mods as the host.
 - Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.
 - Two players building at the same spot within about a second: one of the two builds can be refused (the worlds stay equal).
-- All players share one company; separate companies and a dedicated server are planned.
+- A company for each player, with its own money, is upcoming (shown grayed at Start). A dedicated server is planned.
+
+## Companies
+
+The host starts the session with **One shared company**: everyone builds and pays from one account, as before. **Company for each player (upcoming)** shows grayed out: a company for each player, with its own money, is in the works and will be offered once it has been played between two PCs.
+
+The window's **Companies** tab comes with a company for each player (upcoming); with one shared company there is no Companies tab.
+
+Companies are saved with the world; a player is known by the name they play under, so a rejoining player finds their company again. This is new in 0.2.10 and seen only with two game windows on one PC: tell us how it plays.
 
 ## If something goes wrong
 

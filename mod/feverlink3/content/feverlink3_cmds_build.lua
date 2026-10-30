@@ -1042,6 +1042,16 @@ local function newCapture(ctx, opts)
 	function cap.owner(v)
 		if v == nil then return nil end
 		if v == A.player() then return "player" end
+		-- A native tool writes the engine's own local player as owner, whatever api.engine.util.getPlayer is made to say (real game
+		-- 2026-10-27, E6: a road drawn while the windows acted as a second company was owned by the savegame's player; build 40425,
+		-- the street tool's Context is made from its own player member, docs/NATIVE_LINK.md "Acting player"). That entity is the
+		-- acting player of the build too. The game's own getPlayer is the one feverlink3_cmds_company.lua kept; in a shared-company
+		-- session it is A.player() and this changes nothing.
+		local og = package.loaded["feverlink3_orig_player"]
+		if type(og) == "table" and og.getPlayer and og.getPlayer ~= api.engine.util.getPlayer then
+			local okP, native = pcall(og.getPlayer)
+			if okP and v == native then return "player" end
+		end
 		-- another company's entity has no id the other games share; nobody (a town building) is -1
 		if type(v) == "number" and v >= 0 and cap.keyOf then return { __ref = "owner", key = cap.keyOf(v) } end
 		return v

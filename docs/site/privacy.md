@@ -4,7 +4,7 @@ title: FeverLink3 privacy
 
 # Privacy
 
-Last updated 2026-10-22 (version 0.2.1). [Back to the start page](../index.html)
+Last updated 2026-10-30 (version 0.2.10). [Back to the start page](../index.html)
 
 FeverLink3 has no accounts, no analytics, no advertising, and no server of the project that collects anything. This page says what leaves your PC and who sees it. The technical detail is in [What is in winhttp.dll, and how to check it](../SECURITY_FOR_USERS.html).
 
@@ -24,6 +24,7 @@ The **Report a problem** button makes a zip file on your PC. Nothing is sent to 
 
 - The display name you use. It starts as your Windows user name; the window has a name field, so change it before hosting or joining if you prefer another.
 - Your game actions, world checksums and chat lines.
+- Since 0.2.10, once a session uses companies: your display name and your company. They are saved in the world (the savegame), so whoever gets a copy of that save sees them; that is how a rejoining player finds their company again.
 - If you host: your world, as a savegame, when a player joins or you press "Sync everyone to my world".
 - If you use the Steam connection test: the Steam ID you paste or share. A Steam ID identifies your Steam account. Share it only with the person you are testing with.
 

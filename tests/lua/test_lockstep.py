@@ -268,7 +268,11 @@ function MAKE_API()
       -- Engine.Revision of an entity ({ num = { a, b, c } }, tf3-docs api/engine getRevision); an entity that is gone raises
       getRevision = function(e) if WORLD[e] == nil then error("no entity " .. tostring(e)) end return { num = { 1000 + e, 0, 0 } } end,
       util = { getWorld = function() return 1 end, getPlayer = function() return 7 end },
-      forEachEntityWithComponent = function(fn, t) for _, e in ipairs(idsWith(NAMEOF[t])) do fn(e) end end,
+      -- the game cannot loop over the player components (two-window lab 2026-10-27): a new player entity is known only from its command's answer
+      forEachEntityWithComponent = function(fn, t)
+        if NAMEOF[t] == "PLAYER" or NAMEOF[t] == "ACCOUNT" then error("Cannot loop over this component type") end
+        for _, e in ipairs(idsWith(NAMEOF[t])) do fn(e) end
+      end,
       system = { lineSystem = { getLines = function() return idsWith("LINE") end } },
     },
   }

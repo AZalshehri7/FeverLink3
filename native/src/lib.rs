@@ -16,7 +16,9 @@
 
 #![cfg_attr(not(test), deny(unsafe_op_in_unsafe_fn))]
 
+pub mod acting;
 pub mod assets;
+pub mod autosave;
 pub mod build_table;
 pub mod cmd_patch;
 pub mod counters;
@@ -31,6 +33,7 @@ pub mod idorder;
 pub mod ids;
 pub mod inject;
 pub mod input;
+pub mod iplayer;
 pub mod link;
 pub mod native_copy;
 pub mod pace;

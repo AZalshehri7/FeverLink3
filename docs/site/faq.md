@@ -4,7 +4,7 @@ title: FeverLink3 FAQ
 
 # Frequently asked questions
 
-Last updated 2026-10-27, for version 0.2.9. [Back to the start page](../index.html)
+Last updated 2026-10-30, for version 0.2.10. [Back to the start page](../index.html)
 
 ## The project
 
@@ -61,8 +61,11 @@ Terrain heights and ground paint are, since 0.2.7: raise, lower, flatten, smooth
 **What happens when the game updates?**
 Every player in a session needs the same game version. On a game build FeverLink3 does not know yet, it switches its hooks off instead of risking your game, and the FeverLink3 window says that an update of FeverLink3 is needed; hosting is refused, and a host refuses such a player with the reason. Since 0.2.7 FeverLink3 searches a new game build for the places it needs at every start, so it often keeps working after a game update; only when it cannot prove every place does it stay off until an update of FeverLink3 (builds 40420, 40423 and 40425 are confirmed). If the game does not start at all after an update, delete `winhttp.dll` from the game folder.
 
-**Separate companies? A dedicated server?**
-Not yet. All players share one company for now. See the [roadmap](../ROADMAP.html).
+**Can each player have their own money?**
+Not yet: it is upcoming. Since 0.2.10 the host starts a session with **One shared company** (everyone builds and pays from one account, as before), and **Company for each player (upcoming)** shows grayed out until it has been played between two PCs. More in the [playing guide](../PLAYING.html#companies).
+
+**A dedicated server?**
+Not yet. See the [roadmap](../ROADMAP.html).
 
 ## Updates
 

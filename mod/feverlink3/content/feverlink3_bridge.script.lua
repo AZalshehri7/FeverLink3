@@ -254,6 +254,38 @@ local function entitiesWith(compName)
 	return ids
 end
 
+-- entitiesWith for the watch of a command that creates an entity. The engine cannot loop over some components ("Cannot loop over this
+-- component type": PLAYER, ACCOUNT, NAME, COLOR; two-window lab 2026-10-27: the watch of makeGameAddPlayerCmd found nothing, so a company
+-- never got its player entity), and a command's answer cannot be had in the simulation update (callbacks are refused there). Those are
+-- found by asking every entity id: at least up to the highest id of what can be looped over, then up to a run of 5000 ids that do not
+-- exist. About 0.2 s for 80 000 ids, on every game at the same step, only when a company gets its player entity.
+local function entitiesScan(compName)
+	local ids = {}
+	local okL = pcall(api.engine.forEachEntityWithComponent, function(e) ids[#ids + 1] = e end, api.type.ComponentType[compName])
+	if okL then
+		table.sort(ids)
+		return ids
+	end
+	ids = {}
+	local hint = 0
+	for _, c in ipairs({ "BASE_NODE", "BASE_EDGE", "CONSTRUCTION", "TRANSPORT_VEHICLE" }) do
+		local l = entitiesWith(c)
+		if l[#l] and l[#l] > hint then hint = l[#l] end
+	end
+	local ct, miss, e = api.type.ComponentType[compName], 0, 0
+	while e < hint or miss < 5000 do
+		e = e + 1
+		if api.engine.entityExists(e) then
+			miss = 0
+			local okC, c = pcall(api.engine.getComponent, e, ct)
+			if okC and c ~= nil then ids[#ids + 1] = e end
+		else
+			miss = miss + 1
+		end
+	end
+	return ids
+end
+
 local engine = {
 	-- the entity ids of the world's edges, constructions and town buildings (sorted): the `ids` checksum lane. Every game hands out ids
 	-- from the same free-id FIFO, so they are equal while every build is applied at the same step everywhere; a build applied at
@@ -286,6 +318,7 @@ local engine = {
 		return out
 	end,
 	entitiesWith = entitiesWith,
+	entitiesScan = entitiesScan,
 
 	-- Books `amount` as a journal entry of the given type (OTHER, LOAN...) on the player's account: how a game's
 	-- balance is brought to the host's value (finding from MPFever (MIT): JournalEntry with time -1 and category OTHER
@@ -967,7 +1000,7 @@ local function simState(state)
 	st.bind = st.bind or {}
 	st.watches = st.watches or {}
 	st.binders = st.binders or {}
-	if Co and st.co == nil then st.co = Co.new() end
+	if Co and st.co == nil then st.co = Co.new() elseif Co then Co.upgrade(st.co) end   -- a save of an older registry: its membership goes
 	return st
 end
 
@@ -978,7 +1011,8 @@ end
 -- The context an action is decoded and applied in: the player entity its `player` arguments become (this game's own; in a
 -- company session the acting player's company, see Co.actor), the sender, the stamp, the action key and the registry.
 function actionCtx(it, co, resolve)
-	local ctx = { player = engine.canonicalPlayer and engine.canonicalPlayer() or engine.player(), resolve = resolve, co = co }
+	-- ownerOf: the owner of an entity on this game, for a player handing over their company's own line (makeEntitySetPlayerCmd)
+	local ctx = { player = engine.canonicalPlayer and engine.canonicalPlayer() or engine.player(), resolve = resolve, co = co, ownerOf = engine.ownerOf }
 	if it then ctx.from, ctx.at, ctx.key = it.from, it.at, it.key end
 	if Co then pcall(Co.actor, ctx) end
 	return ctx
@@ -2338,7 +2372,7 @@ local function simApplyAction(st, it, now)
 		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
 		return
 	end
-	local before = spec.creates and engine.entitiesWith(spec.creates) or nil
+	local before = spec.creates and engine.entitiesScan(spec.creates) or nil
 	local bindComps = L.bindsComp(spec, it.body)
 	local bindBefore = nil
 	if bindComps then
@@ -2447,7 +2481,7 @@ local function simApplyAction(st, it, now)
 	-- (the watch then falls back to the order of the commands) and for this game's own held build (released by the interface half).
 	local sentW, sentB = nil, nil
 	if not held then
-		if spec.creates and before then sentW = L.newEntities(before, engine.entitiesWith(spec.creates)) end
+		if spec.creates and before then sentW = L.newEntities(before, engine.entitiesScan(spec.creates)) end
 		if bindComps then
 			sentB = {}
 			for _, comp in ipairs(bindComps) do sentB[comp] = L.newEntities(bindBefore[comp] or {}, engine.entitiesWith(comp)) end
@@ -2535,7 +2569,7 @@ local function simAdvanceWatches(st, now)
 			if sentBy[e] ~= nil and sentBy[e] ~= w.key then return true end
 			return L.isTakenAt(owners[e], w.at)
 		end
-		local after = engine.entitiesWith(w.comp)
+		local after = engine.entitiesScan(w.comp)
 		local created = L.claimOwn(w.sent, after, taken) or L.claimEntity(w.before, after, taken)
 		if created then
 			owners[created] = { key = w.key, at = now }
@@ -2845,7 +2879,32 @@ end
 -- postUpdate took it) runs that step itself, at that step's time, and then runs its own step too, until a postUpdate shows up again.
 -- The stamps follow update's time either way, so the order of the applies is the same on every game; the caught-up step itself lands one
 -- engine step late in world time. Logged once per session, and counted in a line every game minute (`postUpdate missing`).
+-- Company for each player (Co.scriptCompanies): in each simulation Lua state (update, postUpdate and handleEvent may run in different
+-- ones, see SIM), at each of this script's entries: the companies the game's loan and subsidy scripts serve now (X.simOthers), and the
+-- wrapping of those scripts once they are in this state (a loaded world: every game at the same entry).
+function X.companyScripts(state)
+	local okS, st = pcall(function() return state:get() end)
+	X.simOthers = okS and X.companyEntitiesOf(st) or {}
+	if not (Co and Co.scriptCompanies) or X.scriptsWrapped then return end
+	-- FEVERLINK3_COMPANY_SCRIPTS=0: the game's scripts serve the savegame's player only, as before 0.3.0; loans or subsidies: only that one is wrapped
+	-- (the A/B of the lab soaks, tools/gametest/loan_soak.ps1). Must match on every game.
+	local okE, off = pcall(function() return C.env("FEVERLINK3_COMPANY_SCRIPTS") == "0" end)
+	if okE and off then X.scriptsWrapped = true; logSim("company: FEVERLINK3_COMPANY_SCRIPTS=0: loans and subsidies stay the savegame's player's"); return end
+	local okO, only = pcall(function() return C.env("FEVERLINK3_COMPANY_SCRIPTS") end)
+	local ok, done = pcall(Co.scriptCompanies, { loaded = package.loaded, util = api.engine.util, others = X.otherCompanyEntities, only = okO and only or nil,
+		log = function(s) logSim("company: " .. s) end })
+	if not ok then
+		X.scriptsWrapped = true
+		logSim("company: the game's loan and subsidy scripts could not be wrapped: " .. tostring(done))
+		return
+	end
+	if #done > 0 then logSim("company: the game's scripts now run for every company: " .. table.concat(done, ", ")) end
+	local loanS, subS = package.loaded[Co.LOAN_SCRIPT], package.loaded[Co.SUBSIDY_SCRIPT]
+	X.scriptsWrapped = (only == "subsidies" or (type(loanS) == "table" and loanS.fl3wrapped == true)) and (only == "loans" or (type(subS) == "table" and subS.fl3wrapped == true))
+end
+
 function update(userParams, state, dt)
+	pcall(X.companyScripts, state)
 	local at = nil
 	pcall(function() at = engine.gameTime() end)
 	if SIM.upAt ~= nil then
@@ -2880,6 +2939,7 @@ function X.fallbackStep(state, at, missedAt)
 end
 
 function X.postUpdate(userParams, state, dt, res)
+	pcall(X.companyScripts, state)
 	SIM.noPost, SIM.noPostSince = false, nil
 	-- no step pending: this step was applied in update (the fallback, or `done` in its result), never twice
 	if SIM.upAt == nil or (type(res) == "table" and res.done) then return end
@@ -3061,6 +3121,7 @@ end
 
 -- Messages from the interface half (makeScriptingSendEventCmd with id "feverlink3").
 function handleEvent(userParams, state, src, id, name, param)
+	pcall(X.companyScripts, state)
 	-- the base scripts subscribe in handleEvent when the game's own init events arrive (gamescript reference above): an event that
 	-- reaches this script before its first postUpdate subscribes it at once
 	X.subscribeSim(state, "handleEvent")
@@ -3339,6 +3400,26 @@ function X.seqCarry()
 		if player and sid == (C.SESSION or "") and tonumber(player) == C.PLAYER_ID then t.sid, t.player, t.seq = C.SESSION, C.PLAYER_ID, tonumber(seq) end
 	end
 	return t
+end
+
+-- True the first time in a session that notice `key` is asked for, false after: a notice that says what is new or experimental is
+-- given once a session, not once a load. A resync load gives fresh Lua states (see X.seqCarry), so a flag in G came back empty and
+-- the friend session of 2026-10-30 showed each of these notices again after every load (3 to 5 times a player in one evening). Kept
+-- in a file of this player's live folder (C.TOLD), named by the session; without a live folder only this Lua state remembers.
+function X.tellOnce(key)
+	G.toldOnce = G.toldOnce or {}
+	if G.toldOnce[key] then return false end
+	G.toldOnce[key] = true
+	if not C.DIR then return true end
+	local sid = C.SESSION or ""
+	local text = C.readFile(C.path(C.TOLD)) or ""
+	local fileSid, rest = text:match("^([^\n]*)\n?(.*)$")
+	if fileSid ~= sid then rest = "" end
+	for k in (rest or ""):gmatch("[^\n]+") do
+		if k == key then return false end
+	end
+	C.writeFile(C.path(C.TOLD), sid .. "\n" .. (rest or "") .. key .. "\n")
+	return true
 end
 
 -- an action number went out (every ship of an action line passes here, before or after its own send)
@@ -4342,6 +4423,7 @@ function X.pauseStamped(it)
 end
 
 function route(it)
+	if it.kind == "action" and it.body and it.body.fn == "autosave" then return X.autosaveArrived(it) end
 	local now = engine.gameTime()
 	-- a checksum round at a pause is stamped where the furthest game stands still: a game behind runs on to it (pauseRun). An item at or
 	-- before the time this game stands at, at a pause, is applied from here in arrival order (a checksum, or the barrier breached)
@@ -5145,11 +5227,65 @@ end
 --      it exactly, and then the waiting numbers follow (stamped at least Q, after the build, in their order). The originator does not apply
 --      it again (its own native record is never queued here). The resume waits too: the hold holds a running game as well.
 -- One rule for every tool and site: only "no record before the engine applies it" decides.
+-- Companies in separate mode (docs/COMPANIES.md): the mode of the registry this half mirrors.
+function X.separateCompanies()
+	return G.co ~= nil and G.co.mode == "separate"
+end
+
+-- Company for each player: the player entities of the companies that are not the savegame's player, sorted (the game's loan and
+-- subsidy scripts run for each of them, Co.scriptCompanies). Empty in shared mode. World state only, the same on every game: the
+-- simulation state's registry and bindings, read by this script's own update (X.simOthers; a game-script state cannot be read from
+-- inside another script's call, see SIMO), so the scripts see the companies as of this script's last update.
+function X.companyEntitiesOf(st)
+	local out = {}
+	local co = type(st) == "table" and st.co or nil
+	if not (type(co) == "table" and co.mode == "separate") then return out end
+	local own = engine.player()
+	for _, c in pairs(co.companies or {}) do
+		local e = c.entity and L.resolveKey(st.bind or {}, c.entity) or nil
+		if type(e) == "number" and e ~= own then out[#out + 1] = e end
+	end
+	table.sort(out)
+	return out
+end
+
+function X.otherCompanyEntities()
+	return X.simOthers or {}
+end
+
+-- Separate mode: the name of another company that owns a construction this build removes or replaces (a station upgraded, a depot
+-- rebuilt), else nil. A tool writes the savegame's player as the owner of the construction it adds, and the savegame's player is also
+-- the host's company: the native rewrite (`acting_player`) would hand the rebuilt construction to the builder. Street segments need no
+-- refusal: the rewrite keeps the owner of every piece of a split segment (native acting.rs, kept_pieces; two-window lab 2026-10-27: a
+-- guest's road across the host company's highway). Nobody's constructions (stations given to nobody) stay open to everyone.
+function X.foreignRemoval(text)
+	local mine = X.myCompanyEntity()
+	if mine == nil or type(text) ~= "string" then return nil end
+	local function other(owner)
+		owner = tonumber(owner)
+		if owner == nil or owner < 0 or owner == mine then return nil end
+		for _, c in pairs(G.co.companies) do
+			if c.entity and L.resolveKey(G.bind, c.entity) == owner then return c.name end
+		end
+		return "another company"
+	end
+	for e in text:gmatch("\ntoRemove%[%d+%]\tent:old#(%d+)") do
+		local okO, owner = pcall(engine.ownerOf, tonumber(e))
+		local name = okO and other(owner) or nil
+		if name then return name end
+	end
+	return nil
+end
+
 function X.slotWanted()
 	return pausedNow() and G.writer ~= nil
 end
 
 function X.slotHold(h, why)
+	-- separate companies: its release would apply the tool's own command, as the savegame's player (see natDecideUnsafe)
+	if X.separateCompanies() then
+		return X.natRefuseHeld(h, tostring(why) .. "; made during a pause, it would be released as the tool made it, as the savegame's player (separate companies)")
+	end
 	local seq = G.seq + 1
 	local key = L.itemKey(C.PLAYER_ID, seq)
 	local at = G.session.pauseAt
@@ -5368,7 +5504,7 @@ local function natDecideUnsafe(h, cap)
 		G.vetoChatted = G.vetoChatted or {}
 		if not G.vetoChatted["info:constructions"] then
 			G.vetoChatted["info:constructions"] = true
-			pcall(X.noticeLocal, "constructions_experimental")
+			if X.tellOnce("constructions_experimental") then pcall(X.noticeLocal, "constructions_experimental") end
 		end
 	end
 	-- never ship, and never apply, what this game could not rebuild itself
@@ -5423,6 +5559,23 @@ local function natDecideUnsafe(h, cap)
 	local deferFlow = NATIVE_INJECT and STRICT_CANCEL ~= "off" and N.ready and N.ready.inject and N.ready.defer
 		and type(body.nativeText) == "string" and body.nativeText ~= ""
 	if deferFlow then cancelFlow = true end
+	-- Companies, separate mode: a tool writes the engine's own player (the savegame's) into its command as payer and owner (build 40425,
+	-- docs/NATIVE_LINK.md section 12; real game 2026-10-27, E6), so the tool's own command is never applied as it is. Every game, this one
+	-- too, applies the build as the mod's carrier with the acting company in its Context: injected (the module rewrites the text's owners,
+	-- `acting_player`) or replayed from the record. A build that would go hold-and-release (released at the stamp as the tool made it) is
+	-- refused before it is shipped, on every tool alike.
+	if X.separateCompanies() then
+		if not (N.ready and N.ready.acting) then
+			return refuse("separate companies: the native module cannot build as your company (its ready lists no acting_player)")
+		end
+		if not cancelFlow or (FIRE_DONE and not h.done and not deferFlow) then
+			return refuse("separate companies: this build would be applied as the tool made it, as the savegame's player (hold-and-release)")
+		end
+		local owner = X.foreignRemoval(body.nativeText)
+		if owner then
+			return refuse("separate companies: this build changes a construction " .. owner .. " owns", "build_other_company")
+		end
+	end
 	if cancelFlow and not deferFlow and FIRE_DONE and not h.done then
 		natSay("held " .. id .. " (site " .. natSite(h) .. "): the native module cannot fire this tool's callback: hold-and-release instead of cancel")
 		cancelFlow = false
@@ -5690,6 +5843,83 @@ function natDecide(h, cap)
 	if N and not N.awaiting[h.id] and not h.refused and not h.slotted then pcall(X.natRefuseHeld, h, "a fault in the verdict (" .. tostring(err) .. ")") end
 end
 end -- section: strict mode: the native link and the verdict
+
+-- ---- the games autosave together (native autosave.rs, FEVERLINK3_SYNC_AUTOSAVE). Friend session 2026-10-30: each game's own autosave
+-- stopped its simulation ~3.3 s, the guest's every 2 minutes, the host's every 10, and the other game waited at the input barrier each
+-- time. While the session runs every game's own autosave timer is held off (`autosave {hold}`, refreshed); at the host's own interval
+-- (the module reads its setting; none when the host's autosave is off) the host stamps an `autosave` action, not at a pause or during a
+-- resync load, and every game asks its module to run the game's own autosave when it reaches the stamp (one stop for everyone, each
+-- player's own autosave files). A game whose module lacks `sync_autosave` keeps its own autosave, nothing else changes.
+X.AUTOSAVE_REFRESH_S = 10.0   -- the module drops a hold not refreshed for 30 s (the game's own timer runs again)
+
+function X.autosaveEvent(N, p)
+	if type(p) ~= "table" then return end
+	local m = tonumber(p.minutes)
+	if m ~= N.autosaveMin then
+		N.autosaveMin = m
+		logGui("autosave: this game's autosave interval is " .. ((m == nil or m < 0) and "not known" or (m == 0 and "off" or (m .. " min"))))
+	end
+	if p.why and p.why ~= "" then natSay("autosave refused by the native module: " .. tostring(p.why)) end
+end
+
+-- Every frame: the hold, the host's stamp, the stamps reached.
+function X.autosaveTick(now, clock)
+	local N = G.nat
+	if not (N and N.ready and N.ready.autosave) then return end
+	local A = G.autosave or { at = {} }
+	G.autosave = A
+	-- held through a resync load too: the game's own timer must not fire while it loads
+	local on = natSessionOn()
+	if on and (not A.hold or clock - (A.sentAt or -100) >= X.AUTOSAVE_REFRESH_S) then
+		if natSend("autosave", { hold = true }) then A.hold, A.sentAt = true, clock end
+	elseif not on and A.hold then
+		if natSend("autosave", { hold = false }) then A.hold = false end
+		A.next, A.at = nil, {}
+	end
+	if not on then return end
+	local m = N.autosaveMin
+	if C.PLAYER_ID == 0 and type(m) == "number" and m > 0 and not pausedNow() and not G.loading then
+		A.next = A.next or (clock + m * 60)
+		if clock >= A.next then
+			A.next = clock + m * 60
+			G.seq = G.seq + 1
+			local at = stampAfterFastest(now)
+			local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = { fn = "autosave" }, key = L.itemKey(C.PLAYER_ID, G.seq) }
+			send("action", { stamp = at, seq = G.seq, body = C.serialize(it.body), category = "other" })
+			logGui("autosave " .. it.key .. " stamped " .. C.integerText(at) .. " (now " .. C.integerText(now) .. ", every " .. m .. " min)")
+			X.routeOwn(it)
+		end
+	end
+	for i = #A.at, 1, -1 do
+		local s = A.at[i]
+		if now >= s.at then
+			table.remove(A.at, i)
+			-- a player who turned the game's autosave off keeps it off: the hold stays, no save (owner's design 2026-10-30, "everyone
+			-- still gets an autosave file" meant everyone whose autosave is on). An interval the module could not read saves as before.
+			if N.autosaveMin == 0 then
+				if natSend("autosave", { hold = true }) then A.sentAt = clock end
+				logGui("autosave " .. s.key .. " reached at t=" .. C.integerText(now) .. ": this game's autosave is off, nothing is saved here")
+			else
+				if natSend("autosave", { hold = true, now = true }) then A.sentAt = clock end
+				logGui("autosave " .. s.key .. " reached at t=" .. C.integerText(now) .. " (stamp " .. C.integerText(s.at) .. "): the game's own autosave runs now")
+			end
+		end
+	end
+end
+
+-- route(): the `autosave` action of the host, on every game (its own included). Not queued for the simulation: nothing is applied.
+function X.autosaveArrived(it)
+	local N = G.nat
+	if not (N and N.ready and N.ready.autosave) then
+		logGui("autosave " .. tostring(it.key) .. ": this game's native module cannot run it (no sync_autosave): its own autosave runs as before")
+		return
+	end
+	G.autosave = G.autosave or { at = {} }
+	table.insert(G.autosave.at, { at = it.at, key = it.key })
+	local now = engine.gameTime()
+	L.addMark(G.marks, nil, now)
+	if it.at > now then G.marks[#G.marks + 1] = it.at end   -- a landing mark: every game reaches the stamp exactly (L.pace)
+end
 
 -- used outside this section:
 local natSettle, commitPump, natCapture, natTick
@@ -6250,7 +6480,16 @@ local function natEvent(N, rec, p, history)
 			if h == "batch_pace" then N.ready.pace = true end   -- native pace.rs: `pace` lines stretch the batch interval
 			if h == "terrain_apply" then N.ready.terrain = true end   -- native terrain.rs: `terrain_share` and `terrain_apply`
 			if h == "assets_apply" then N.ready.assets = true end   -- native assets.rs: tree, plant and rock ticks (follow `terrain_share`)
+			-- companies: the game's own build tools build and pay as the player's company (not yet in any module: real game 2026-10-27,
+			-- docs/COMPANIES.md section 8). Only then can the host pick "Company for each player".
+			if h == "acting_player" then N.ready.acting = true end
+			-- native iplayer.rs: `interface_player` makes the game's interface act as this game's company (its tools after a load)
+			if h == "interface_player" then N.ready.iplayer = true end
+			-- native autosave.rs: `autosave {hold, now}` holds the game's own autosave timer off and runs its autosave at the host's stamp
+			if h == "sync_autosave" then N.ready.autosave = true end
 		end
+		-- a (new) module link: what an earlier one said about the interface player is not this one's
+		N.ip, N.ipSent, N.ipRefused, engine.savegamePlayer = nil, nil, nil, nil
 		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject, terrain = N.ready.terrain, assets = N.ready.assets, wall0 = X.WALL0 })
 		N.hookOk = false
 		for _, h in ipairs(hooks) do
@@ -6298,6 +6537,10 @@ local function natEvent(N, rec, p, history)
 		end
 	elseif kind == "fault" then
 		X.natFaultEvent(p, history)
+	elseif kind == "interface_player" then
+		X.interfacePlayerEvent(N, p, history)   -- the module's state, history too: a resync load keeps it
+	elseif kind == "autosave" then
+		X.autosaveEvent(N, p)   -- the interval, history too (the module answers every line; a reloaded script reads its last)
 	elseif history then
 		return   -- held / released / dropped / audit of an earlier run of this script: not news
 	elseif kind == "held" then
@@ -6630,7 +6873,9 @@ end
 -- differ, and the next resync erased it (friend test 2026-10-16, the line edits). Only what no game replicates (category
 -- "local": an event nobody registered) goes to the engine untouched; another mod's own event (L.markForeignEvent) is shipped.
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): the command factories and sendCommand are replaced (no
--- documented command hook), and api.cmd gets the mod's own factories for its virtual actions (feverlink3Company).
+-- documented command hook). The mod's own factories for its virtual actions (feverlink3Company) live in VCMD, not in api.cmd: the
+-- game's api.cmd refuses new members ("no writable member", build 40425, two-window lab 2026-10-27), so every company action failed.
+local VCMD = {}
 function installWrap()
 	local orig = originals()
 	if not orig.sendCommand then
@@ -6669,13 +6914,13 @@ function installWrap()
 	-- anew: after a savegame reload the old closure would hold the previous run's tags.
 	for name, spec in pairs(L.COMMANDS) do
 		if spec.virtual then
-			pcall(function()
-				api.cmd[name] = function(...)
-					local cmd = {}
-					G.tags[cmd] = { name = name, args = { n = select("#", ...), ... } }
-					return cmd
-				end
-			end)
+			VCMD[name] = function(...)
+				local cmd = {}
+				G.tags[cmd] = { name = name, args = { n = select("#", ...), ... } }
+				return cmd
+			end
+			-- also offered as api.cmd.<name> where api.cmd takes new members (the tests' mocked engine); the game refuses it
+			pcall(function() api.cmd[name] = VCMD[name] end)
 		end
 	end
 	local oks = pcall(function()
@@ -7283,12 +7528,172 @@ end
 -- only live lines). Whatever else makes one read slow, a line whose single read took more than X.CO_READ_SLOW_S is not read again
 -- while its key stays bound to that entity (it keeps the result it had; logged once): at most one such frame per line and binding.
 X.CO_PAGE_EVERY_S, X.CO_PAGE_BUDGET_S, X.CO_READ_SLOW_S = 5, 0.002, 0.05
+
+-- companies: the native module's acting_player capability (natEvent `ready`): the game's own tools act as the player's company
+function X.actingPlayer()
+	return G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.acting == true
+end
+
+-- The roster as { {id, name} } in id order: the players the host's "Company for each player" seats and gives a company each
+function X.rosterPlayers()
+	local ids = {}
+	for id in pairs(G.hud.roster) do if type(id) == "number" then ids[#ids + 1] = id end end
+	table.sort(ids)
+	local out = {}
+	for i, id in ipairs(ids) do out[i] = { id = id, name = tostring(G.hud.roster[id].name) } end
+	return out
+end
+
+-- companies: what this game does for the registry by itself, once the mirror holds the registry the save loaded:
+--   me     tells every game who sits on this game's session id (its stable identity, the player's name: docs/COMPANIES.md 3.2),
+--          once the world uses companies (someone is in the registry, or a company for each player) and the registry does not say
+--          so yet; again after X.CO_ME_RETRY_S if it did not arrive (an action refused because this game was not in the session's
+--          world yet, before a sync load). A world nobody used companies in gets no such action.
+--   bind   the host, in company-for-each-player mode: every company without a player entity gets one, the host's own company the
+--          savegame's player (op bind), every other a new player entity (makeGameAddPlayerCmd, bound by name: Co.addPlayer);
+--          one try per company every X.CO_BIND_RETRY_GAME_MS of GAME time: a try waits out a pause and is not sent again meanwhile
+--          (two-window lab 2026-10-27: a 30 s wall-clock retry during a pause founded a second company of the same name)
+--   reload the host, with the native interface player (X.syncInterfacePlayer): a company whose player entity is made in this session gets
+--		  one resync round X.CO_RELOAD_DELAY_S later (one for all made meanwhile), so its player's build tools are made anew acting as it;
+--		  a world loaded with the company already bound needs none (the companies this Lua state first saw bound)
+X.CO_ME_RETRY_S, X.CO_BIND_RETRY_GAME_MS, X.CO_RELOAD_DELAY_S = 10, 30000, 5
+function X.companyChores()
+	if not (Co and G.co and G.coReady and G.wrapped and C.ACTIVE) then return end
+	Co.upgrade(G.co)
+	local now = C.clock()
+	local who = Co.identityOf(C.PLAYER_NAME)
+	local p = who and G.co.people[who]
+	local used = next(G.co.people) ~= nil or G.co.mode == "separate"
+	if used and who and not (G.co.seats[C.PLAYER_ID] == who and p and p.name == C.PLAYER_NAME) and (X.coMeAt == nil or now - X.coMeAt >= X.CO_ME_RETRY_S) then
+		X.coMeAt = now
+		logGui("company: this game says who it is: player " .. tostring(C.PLAYER_ID) .. " is " .. tostring(C.PLAYER_NAME))
+		api.cmd.sendCommand(VCMD.feverlink3Company({ op = "me", name = C.PLAYER_NAME }))
+	end
+	if C.PLAYER_ID ~= 0 or G.co.mode ~= "separate" then return end
+	X.coBindAt = X.coBindAt or {}
+	local hostKey = L.keyFor(G.rev, engine.canonicalPlayer and engine.canonicalPlayer() or engine.player())
+	local hostTaken = false
+	for _, c in pairs(G.co.companies) do if c.entity == hostKey then hostTaken = true end end
+	local own = Co.companyOf(G.co, 0)
+	local keys = {}
+	for key in pairs(G.co.companies) do keys[#keys + 1] = key end
+	table.sort(keys)
+	for _, key in ipairs(keys) do
+		local c = G.co.companies[key]
+		local gameNow = engine.gameTime()
+		if c.entity == nil and (X.coBindAt[key] == nil or gameNow - X.coBindAt[key] >= X.CO_BIND_RETRY_GAME_MS) then
+			X.coBindAt[key] = gameNow
+			if key == own and hostKey and not hostTaken then
+				logGui("company: binding the host's company " .. key .. " (" .. c.name .. ") to the savegame's player " .. hostKey)
+				api.cmd.sendCommand(VCMD.feverlink3Company({ op = "bind", company = key, entity = hostKey }))
+			else
+				logGui("company: adding a player entity for company " .. key .. " (" .. c.name .. ")")
+				local col = c.color or { 0.5, 0.5, 0.5 }
+				api.cmd.sendCommand(api.cmd.makeGameAddPlayerCmd(c.name, api.type.Vec3f.new(col[1], col[2], col[3])))
+			end
+		end
+	end
+	if not (G.nat and G.nat.ready and G.nat.ready.iplayer) then return end
+	X.coBound = X.coBound or {}
+	for _, key in ipairs(keys) do
+		local has = G.co.companies[key].entity ~= nil
+		if X.coBound[key] == false and has and key ~= own then
+			X.coReloadAt = X.coReloadAt or (now + X.CO_RELOAD_DELAY_S)
+			logGui("company: " .. key .. " got its player entity in this session: one resync in " .. X.CO_RELOAD_DELAY_S .. " s, so every game's build tools act as their company")
+		end
+		X.coBound[key] = has
+	end
+	if X.coReloadAt and now >= X.coReloadAt then
+		X.coReloadAt = nil
+		X.askResync("a company's player entity was made in this session (the game interface gives the build tools their player at a load)")
+	end
+end
+
+-- separate mode: the player entity of this game's player's company on this game (nil in shared mode, outside a company, unbound)
+function X.myCompanyEntity()
+	if not (Co and G.co and G.co.mode == "separate") then return nil end
+	local c = G.co.companies[Co.companyOf(G.co, C.PLAYER_ID) or ""]
+	return c and c.entity and L.resolveKey(G.bind, c.entity) or nil
+end
+
+-- Give to company (the window's `give` record { line, company }, separate mode): the line, its vehicles and the stations it uses go to
+-- that company, as the base game's own recipe moves them (Co.transferPlan). Each move is one makeEntitySetPlayerCmd, sent through
+-- the wrapped sendCommand like any command of the player, so every game applies it at its stamp and checks there that this game's
+-- company still owns the entity (OPS-level rule: makeEntitySetPlayerCmd's apply).
+function X.giveLine(p)
+	local mine = X.myCompanyEntity()
+	local line = tonumber(p.line)
+	local c = type(p.company) == "string" and G.co.companies[p.company] or nil
+	local target = c and c.entity and L.resolveKey(G.bind, c.entity) or nil
+	local why = (mine == nil and "this game plays no company of its own")
+		or ((c == nil or target == nil) and "that company has no player entity here")
+		or (target == mine and "that is your own company")
+		or ((line == nil or engine.ownerOf(line) ~= mine) and "your company does not own that line")
+	if why then
+		logGui("company: give line " .. tostring(p.line) .. " to " .. tostring(p.company) .. " not sent: " .. why)
+		noticeLocal("company_give_refused", { why = why })
+		return
+	end
+	local steps = Co.transferPlan(line, mine, target, engine)
+	local counts = { [target] = 0, [-1] = 0 }
+	for _, s in ipairs(steps) do
+		api.cmd.sendCommand(api.cmd.makeEntitySetPlayerCmd(s.entity, s.to))
+		counts[s.to] = counts[s.to] + 1
+	end
+	logGui(string.format("company: give line %d to %s (%s): %d move(s) to entity %d, %d to nobody (stations other lines of yours use)",
+		line, c.key, c.name, counts[target], target, counts[-1]))
+end
+
+-- The line the player has selected in the game, for Give line (Companies tab, owner 2026-10-27: the tab shows only that line). The
+-- game says what the player picked through GUI script events (api.gui.fireGuiScriptEvent, "meant to be handled by game scripts
+-- (guiHandleEvent)", api/gui.d.tl:50-57) and through the events of its windows' components, which reach guiHandleEvent with the
+-- component's id (lab logs: `menu.construction...tab/idAdded`, `visibilityChange`, `destroy`; the 0.2.9 session saw
+-- `temp.view.entity.content.crossing`). What gives a selection, every one handled:
+--   * `mainView` / `select` with the entity: a click in the world on a vehicle, a line or anything else (gui.zip!gui/main/
+--     selector_react_util.tl:106-110, gui/layers/layer_terrain.tl:196-197);
+--   * the entity window `temp.view.entity_<entity>` (gui.zip!gui/entity_window/view_manager.tl:62-64, the Window's id at :324): it
+--     opens for a clicked vehicle or line, for a vehicle picked in a list (gui/line_vehicle_mgmt/vehicle_react_util.tl:68), and for the
+--     line manager's "Open Line Window" (gui/line_vehicle_mgmt/manager_window.tl:2154-2162). Its `destroy` (or `visibilityChange` to
+--     false) ends the selection it made.
+-- A pick in the line manager's list alone fires nothing a script receives (manager_window.tl:2614-2652: react state only).
+-- A vehicle gives its line (TRANSPORT_VEHICLE.line, Co.extendEngine lineOf); anything that is not a line or on one leaves the selection.
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2): the event names and window ids are the base game's own; the docs list none.
+X.ENTITY_WINDOW = "^temp%.view%.entity_(%d+)$"
+
+-- (entity, closed) for an event that names an entity the player picked or whose window closed; nil for any other event
+function X.selectionEvent(id, name, param)
+	if id == "mainView" and name == "select" and type(param) == "number" then return param, false end
+	local e = type(id) == "string" and tonumber(id:match(X.ENTITY_WINDOW)) or nil
+	if e == nil then return nil end
+	return e, name == "destroy" or (name == "visibilityChange" and param == false)
+end
+
+function X.noteSelection(id, name, param)
+	if not (Co and engine.lineOf) then return end
+	local e, closed = X.selectionEvent(id, name, param)
+	if e == nil then return end
+	local S = G.selected
+	if closed then
+		if S and S.from == e then
+			G.selected = nil
+			logGui(string.format("company: selected line %d cleared (%s/%s)", S.line, tostring(id), tostring(name)))
+		end
+		return
+	end
+	local line = engine.lineOf(e)
+	if line == nil then return end
+	if S and S.line == line then S.from = e; return end
+	G.selected = { line = line, from = e }
+	local okN, nm = pcall(engine.nameOf, line)
+	logGui(string.format("company: selected line %d (%s) from %s/%s, entity %d", line, okN and tostring(nm) or "?", tostring(id), tostring(name), e))
+end
+
 local function writeCompanies()
 	if not (Co and G.co) then return end
 	local P = X.coPage or { cache = {}, pass = 0, slow = {} }
 	X.coPage = P
 	local clock = C.clock()
-	local seen = tostring(G.co.rev) .. ":" .. tostring(G.hud.version)
+	local seen = tostring(G.co.rev) .. ":" .. tostring(G.hud.version) .. ":" .. tostring(X.actingPlayer())
 	if P.keys == nil and (P.nextAt == nil or clock >= P.nextAt or P.seen ~= seen) then
 		-- the keys first, the pass only once they are read (a registry that cannot be read fails here, the same way every call: coGuard
 		-- logs it once)
@@ -7321,7 +7726,29 @@ local function writeCompanies()
 			P.cache, P.keys, P.fresh, P.pass, P.nextAt = P.fresh, nil, nil, P.pass + 1, clock + X.CO_PAGE_EVERY_S
 		end
 	end
-	local stamp = seen .. ":" .. tostring(P.pass)
+	-- the line the player selected in the game (X.noteSelection), for Give line (`selected`): read when the selection changes and every
+	-- X.CO_PAGE_EVERY_S (its vehicles and stops change, it may be gone or have changed hands)
+	local selFor = G.selected and G.selected.line or false
+	if P.selAt == nil or clock - P.selAt >= X.CO_PAGE_EVERY_S or P.selFor ~= selFor or P.selSeen ~= seen then
+		P.selAt, P.selFor, P.selSeen, P.sel, P.selSig = clock, selFor, seen, nil, ""
+		local line = selFor and engine.lineOf(selFor) or nil
+		if line ~= nil then
+			local okN, name = pcall(engine.nameOf, line)
+			local okV, vs = pcall(engine.lineVehicles, line)
+			local nv = 0
+			for _ in ipairs(okV and type(vs) == "table" and vs or {}) do nv = nv + 1 end
+			local okS, ns = pcall(engine.lineStops, line)
+			local owner, mine = engine.ownerOf(line), X.myCompanyEntity()
+			local ownerKey, ownerName = nil, nil
+			for key, c in pairs(G.co.companies) do
+				if c.entity and owner ~= nil and L.resolveKey(G.bind, c.entity) == owner then ownerKey, ownerName = key, c.name end
+			end
+			P.sel = { id = line, name = okN and type(name) == "string" and name or ("line " .. tostring(line)), vehicles = nv,
+				stops = okS and ns or 0, mine = mine ~= nil and owner == mine, company = ownerKey, companyName = ownerName }
+			P.selSig = C.serialize(P.sel)
+		end
+	end
+	local stamp = seen .. ":" .. tostring(P.pass) .. ":" .. tostring(G.localCompany) .. ":" .. P.selSig
 	if G.coWritten == stamp then return end
 	local names = {}
 	for id, p in pairs(G.hud.roster) do names[id] = p.name end
@@ -7329,11 +7756,30 @@ local function writeCompanies()
 	local earned = Co.earned(G.co, function(key) return P.cache[key] end)
 	local okY, year = pcall(engine.yearLength)
 	local okM, month = pcall(engine.monthLength)
+	-- the account of each company with a player entity (company for each player); shared mode has the one account of the game bar
+	local balances = {}
+	if G.co.mode == "separate" and engine.balanceOf then
+		for key, c in pairs(G.co.companies) do
+			local e = c.entity and L.resolveKey(G.bind, c.entity)
+			local okB, b = false, nil
+			if e ~= nil then okB, b = pcall(engine.balanceOf, e) end
+			if okB and type(b) == "number" then balances[key] = b end
+		end
+	end
 	local view = {
 		self = C.PLAYER_ID, names = names, now = now, earned = earned, yearLength = okY and year or nil, monthLength = okM and month or nil, perms = G.perms,
 		hostEntityKey = L.keyFor(G.rev, engine.canonicalPlayer and engine.canonicalPlayer() or engine.player()),
+		acting = X.actingPlayer(), balances = balances,
 	}
-	local okS, text = pcall(function() return C.serialize(Co.status(G.co, view)) end)
+	-- `localEntity`: the company entity this game's windows act as (syncLocalCompany). The game's own windows (bar, finance, vehicle store)
+	-- run in the window script's Lua state, not this one, so the window script sets its getPlayer from it (two-window lab 2026-10-27: set
+	-- here only, the guest's bar showed the host company's money)
+	local okS, text = pcall(function()
+		local st = Co.status(G.co, view)
+		st.localEntity = G.localCompany
+		st.selected = P.sel
+		return C.serialize(st)
+	end)
 	if okS and C.writeFile(C.path("companies.txt"), text) then G.coWritten = stamp end
 end
 
@@ -7398,12 +7844,19 @@ function serviceWindow()
 			-- an operation typed in the company page (Co.windowCommand), sent like any command the player issues
 			coGuard("window record", function()
 				local p = C.parse(rec.payload)
-				local cmd = type(p) == "table" and Co.windowCommand(p, api) or nil
-				if cmd and G.wrapped then
-					api.cmd.sendCommand(cmd)
-				elseif cmd then
+				-- the gameplay type the host picked: what this game's native module can do, and the players who get a company of their own
+				if type(p) == "table" and p.op == "mode" then p.acting, p.players = X.actingPlayer(), X.rosterPlayers() end
+				-- every record says who sends it (its stable identity, OPS.me): the registry seats the sender with it
+				if type(p) == "table" then p.as = C.PLAYER_NAME end
+				if not G.wrapped then
+					-- (and the mod-level factory VCMD.feverlink3Company is made only by the wrap)
 					logGui("company action not sent: sendCommand is not wrapped, it would apply on this game alone")
+					return
 				end
+				-- Give to company: engine commands (makeEntitySetPlayerCmd), not a registry operation
+				if type(p) == "table" and p.op == "give" then X.giveLine(p); return end
+				local cmd = type(p) == "table" and Co.windowCommand(p, { cmd = VCMD }) or nil
+				if cmd then api.cmd.sendCommand(cmd) end
 			end)
 		end
 	end
@@ -7411,6 +7864,7 @@ function serviceWindow()
 	if ignored > 0 then logGui("window: " .. ignored .. " record(s) of ui_out.log belong to an earlier session: ignored") end
 	pcall(Hud.setNativeHolds, G.hud, G.nat and G.nat.holdSent and not G.nat.dead)
 	Hud.writeSnapshot(C, G.hud, G.hudWritten)
+	coGuard("chores", X.companyChores)
 	local okC0, c0 = pcall(C.clock)
 	coGuard("page", writeCompanies)
 	local okC1, c1 = pcall(C.clock)
@@ -7434,7 +7888,7 @@ function syncLocalCompany()
 	if not (Co and G.co and engine.setLocalCompany) then return end
 	local want = nil
 	if G.co.mode == "separate" then
-		local c = G.co.companies[G.co.members[C.PLAYER_ID]]
+		local c = G.co.companies[Co.companyOf(G.co, C.PLAYER_ID) or ""]
 		if c and c.entity then want = L.resolveKey(G.bind, c.entity) end
 	end
 	if want ~= G.localCompany then
@@ -7442,6 +7896,65 @@ function syncLocalCompany()
 		local ok = engine.setLocalCompany(want)
 		logGui("local company: " .. (want and ("entity " .. tostring(want)) or "the game's own player") .. (ok and "" or " (could not be set)"))
 	end
+end
+
+-- The interface player (native iplayer.rs, FEVERLINK3_INTERFACE_PLAYER): in separate mode the native module makes the game's interface
+-- act as this game's company, not as the savegame's player. Why (two-window labs 2026-10-28/30): the getPlayer override above reaches the
+-- windows but not the engine's own interface code: the guest's bulldozer could not remove its own company's roads (no command at all) and
+-- findBestDepotForLine answered -1 for its own line. The module writes the company into the state the interface reads and keeps the
+-- savegame's player in every simulation state and savegame. The build tools take it when the game interface is made, at a world load:
+-- the host reloads every game once when a company's player entity is made in the session (X.companyChores). The order is sent as soon as
+-- the entity is known, so it is in the module before that load (the module keeps it across loads). Nothing is sent before the registry
+-- is read (a reloaded game keeps what the module has), never when the module does not list `interface_player`.
+function X.syncInterfacePlayer()
+	local N = G.nat
+	if not (N and N.ready and N.ready.iplayer) or N.ipRefused then return end
+	if not (Co and G.co and G.coReady) then return end
+	local want = (G.co.mode == "separate" and G.localCompany) or false
+	local have = N.ipSent
+	if have == nil then have = N.ip and N.ip.player or false end
+	if want == have then return end
+	local ok = natSend("interface_player", want and { entity = want } or { clear = true })
+	if not ok then return end
+	N.ipSent = want
+	logGui("interface player: asking the native module to act as " .. (want and ("entity " .. tostring(want) .. " (this game's company; the build tools follow at the next world load)") or "the savegame's player again"))
+end
+
+-- The module's state (`interface_player` event): its order, the savegame's player of the loaded world (this game's canonical player while
+-- the interface acts as a company: Co.extendEngine engine.savegamePlayer), what it wrote into the interface's state, the world's number.
+function X.interfacePlayerEvent(N, p, history)
+	local function entity(v)
+		v = tonumber(v)
+		return (v and v >= 0) and v or nil
+	end
+	local why = type(p.why) == "string" and p.why ~= "" and p.why or nil
+	N.ip = { player = entity(p.player) or false, savegame = entity(p.savegame), front = entity(p.front), world = tonumber(p.world), why = why }
+	if N.ip.savegame ~= nil then engine.savegamePlayer = N.ip.savegame end
+	if why and not history then N.ipRefused = true end
+	if not history then
+		logGui(string.format("interface player: the native module acts as %s (savegame player %s, interface state %s, world %s)%s",
+			N.ip.player and ("entity " .. tostring(N.ip.player)) or "the savegame's player", tostring(N.ip.savegame), tostring(N.ip.front),
+			tostring(N.ip.world), why and (": REFUSED " .. why) or ""))
+	end
+end
+
+-- The session is over: the interface acts as the savegame's player again (the module also clears it when the session folder goes).
+function X.interfacePlayerClear(N, why)
+	if not (N and N.ready and N.ready.iplayer) then return end
+	if not (N.ipSent or (N.ip and N.ip.player)) then return end
+	if natSend("interface_player", { clear = true }) then
+		N.ipSent = false
+		logGui("interface player: back to the savegame's player (" .. why .. ")")
+	end
+end
+
+-- One resync round, asked of this game's session controller the way the window's "Sync everyone to my world" asks it (ctl_cmd.log,
+-- `resync`; the controller acts on it only on the host).
+function X.askResync(why)
+	logGui("asking the session controller for a resync: " .. why)
+	X.ctlCmd = X.ctlCmd or C.newWriter(C.path("ctl_cmd.log"), 0)
+	local ok, err = C.writerSend(X.ctlCmd, "resync", {})
+	if not ok then logGui("the resync request could not be written: " .. tostring(err)) end
 end
 
 -- The presence lock: world.lock in the session folder, opened once by this interface script and never closed, so the handle lives exactly as
@@ -7534,6 +8047,7 @@ function X.sessionOff(why, state)
 		for _ in pairs(N.deferred) do n.deferred = n.deferred + 1 end
 		local okS, errS = pcall(natStop, why)
 		if not okS then logGui("session over: switching strict mode off failed: " .. tostring(errS)) end
+		pcall(X.interfacePlayerClear, N, "the session is over")
 	end
 	G.nat = nil   -- the next session starts strict mode afresh (natNew)
 	local pending = G.pending
@@ -7563,6 +8077,8 @@ function X.sessionOff(why, state)
 	pcall(X.paceEnd, "the session ended")   -- the engine's own batch interval again (smooth pacing)
 	G.ls, X.lagWait, X.actHop, X.frameAt = nil, nil, nil, nil   -- the latency logs start afresh with the next session
 	X.coPage, X.clockSentAt = nil, nil   -- the company page's line results (keys of this session) and the clock keepalive
+	G.selected = nil                     -- the line the player selected (X.noteSelection): this game's entity ids, of this session
+	X.coMeAt, X.coBindAt = nil, nil   -- companies: the next session says again who this game is (X.companyChores)
 	X.pauseRunWant = nil                 -- a run-on of the pause order waiting for the rest of its flush
 	X.guiParked, X.guiMaking = nil, nil  -- actions waiting for an engine answer (their callbacks failed with the pending ones above)
 	G.authPending, G.accountAt, G.authLast, G.pendingSave, G.pendingLoad = {}, {}, nil, nil, nil
@@ -7798,6 +8314,7 @@ local function guiUpdate(userParams, state, guiState)
 		if not okP then logGui("pause slot pump failed: " .. tostring(errP)) end
 		pcall(X.frameMark, "nat")
 		coGuard("local company", syncLocalCompany)
+		coGuard("interface player", X.syncInterfacePlayer)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed, G.session.lead)
 		local sp = L.pace(G.session, G.peers, now, ahead, G.marks)
@@ -7813,6 +8330,11 @@ local function guiUpdate(userParams, state, guiState)
 		if not okPc and not X.paceFault then
 			X.paceFault = true
 			logGui("smooth pacing failed (the factor stays where it is; the native module goes back to 1 after 3 s): " .. tostring(errPc))
+		end
+		local okAs, errAs = pcall(X.autosaveTick, now, C.clock())
+		if not okAs and not X.autosaveFault then
+			X.autosaveFault = true
+			logGui("autosave tick failed (the module drops its hold after 30 s: the game autosaves on its own again): " .. tostring(errAs))
 		end
 		-- where this game really stands at a pause, for the host's stamps of the pause's actions (said at once when it changes)
 		X.curStop = X.stopAt(now, sp)
@@ -7901,7 +8423,7 @@ function X.terrainGate(id)
 	logGui("terrain tools: " .. id .. " switched off for this session (terrain and vegetation edits are not copied to the other games yet)")
 	if not G.terrainTold then
 		G.terrainTold = true
-		X.noticeLocal("terrain_off")
+		if X.tellOnce("terrain_off") then X.noticeLocal("terrain_off") end
 	end
 end
 
@@ -7919,11 +8441,11 @@ function X.terrainShareOn(N)
 	natSay("terrain: height edits are shared (raise, lower, flatten, smooth, roughen)" .. (G.assetsShared and "; tree, plant and rock ticks too" or ""))
 	if not G.terrainSharedTold then
 		G.terrainSharedTold = true
-		pcall(X.noticeLocal, "terrain_shared")
+		if X.tellOnce("terrain_shared") then pcall(X.noticeLocal, "terrain_shared") end
 	end
 	if G.assetsShared and not G.assetsSharedTold then
 		G.assetsSharedTold = true
-		pcall(X.noticeLocal, "assets_shared")
+		if X.tellOnce("assets_shared") then pcall(X.noticeLocal, "assets_shared") end
 	end
 end
 
@@ -8046,6 +8568,8 @@ end
 local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	if not C.ACTIVE or type(name) ~= "string" then return end
 	if not name:find("^builder%.") then
+		local okS, errS = pcall(X.noteSelection, id, name, param)
+		if not okS then logGui("company: reading the selection failed: " .. tostring(errS)) end
 		local okT, errT = pcall(X.terrainGate, id)
 		if not okT then logGui("terrain tools: switching off failed: " .. tostring(errT)) end
 		-- A tool whose events are not "builder.*" is invisible to everything below. Each such event that smells of a tool is named once

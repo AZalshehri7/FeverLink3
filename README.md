@@ -19,6 +19,7 @@
 - **Built into the game, no separate launcher.** Start Transport Fever 3 from Steam as usual: hosting, joining, chat, syncing and updates all live in the game's bottom bar and window. There is no extra program to run.
 - **Build together.** Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
 - **Your other mods work together too.** Mods that change your world by themselves, such as Auto Line Namer, Auto Color Lines or Auto Assign Terminals, stay in sync: the host's copy makes the change and every game applies it at the same moment, and what you set in such a mod's own window reaches every game (new in 0.2.4; seen with two games on one PC).
+- **Companies.** The host starts the session with one shared company: everyone builds and pays from one account, as before. A company for each player, with its own money, is upcoming: it shows as a grayed button until it has been played between two PCs.
 - **The full game.** Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 - **Easy to join.** Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
 - **Steam invites.** Invite friends from Steam's own invite dialog; with a world loaded they join by themselves (played between two PCs over the internet).
@@ -52,7 +53,7 @@ Measured with two games on one PC (internet numbers follow):
 ## Coming next
 
 - Coming back after a short drop without a reload
-- Separate companies for each player
+- A company for each player, with its own money
 
 FeverLink3 is in beta: keep backups of the saves you play with.
 
@@ -63,7 +64,7 @@ FeverLink3 is in beta: keep backups of the saves you play with.
 3. Drag `winhttp.dll` and the `mods` folder into that folder (merge the folders when Windows asks).
 4. Start the game, and turn on **FeverLink3 Multiplayer** in the mod list when you start or load a game.
 
-**Host:** click the FeverLink3 icon in the bottom bar → **Host a game** → **Copy code** and send it to your friend → **Start the session** when they appear.
+**Host:** click the FeverLink3 icon in the bottom bar → **Host a game** → **Copy code** and send it to your friend → when they appear, start the session with **One shared company**.
 
 **Join:** open the FeverLink3 window, paste the code (`Ctrl+V`) and press **Join**. Only join people you trust.
 

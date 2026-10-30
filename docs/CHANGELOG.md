@@ -6,6 +6,27 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.10 (2026-10-30)
+
+Fixes for problems found while playing between two PCs, and the start of companies: one shared company. "Company for each player" is in the code but not offered yet: it shows as a grayed "(upcoming)" button until it has been played between two PCs. Everything marked "seen" was seen with two game windows on one PC unless it says otherwise.
+
+### Added
+- Companies with one shared company: the host starts the session with "One shared company" (everyone builds and pays from one account, as before); "Company for each player (upcoming)" shows grayed out. The window's Companies tab comes with a company for each player.
+- The FeverLink3 window shows the version you run in its title ("FeverLink3 Multiplayer 0.2.10"). Seen.
+
+### Fixed
+- A bus stop on a road made by another mod (for example the Bus And Truck Bay mod's bay roads) was cancelled with "Your build could not be shared with the other players"; you had to remove the bay first. Seen fixed: a stop on a truck bay road (guest) and on a bus bay road that already had a stop (host), built on both games.
+- A street that splits roads you had just built could show as failed and then "Your build was built after all": the game had moved one of its points by a few metres. Such a build is now recognised by the road pieces it replaces. Not yet seen in a session between two PCs.
+- The games now autosave together: during a session each game's own autosave timer is held off, and at the host's autosave interval every game runs the game's own autosave at the same moment, so there is one short stop for everyone instead of each game stopping the others (before, a game stood still about 3-4 s at each of its own autosaves and the others waited; with a 2-minute autosave that was a stop every 2 minutes). A player whose autosave is off does not save. Seen with two game windows on one PC (three autosaves at the same step on both games); not yet between two PCs.
+- A Steam invite now joins by itself when your game is hosting a session nobody else is in: that session ends and you join the friend who invited you. Before, you had to press Join in the FeverLink3 window after accepting the invite in Steam. Accepting the invite in Steam is still needed (Steam asks every player). Not yet seen between two PCs.
+- The notices about new or experimental tools (terrain, trees, stations) came back after every sync; now each shows once a session. Seen.
+- A world saved while paused: the gameplay type the host chose at Start now applies right at the start. The session runs on a few steps to it and pauses there again, the same step on every game (seen: 6 steps); before, it waited until someone resumed the game.
+- A world started paused could get a second company of the same name for one player. Seen fixed: one company per player in three runs.
+
+### Known issues
+- Bulldozing two pieces of the same road within a second of each other once made the game report an error on both PCs and sync everyone (seen once in 0.2.9 between two PCs); nothing was lost. Not reproduced in the lab yet.
+- In our tests since 2026-10-28 the game crashed when the lab picked the tree brush in the landscaping menu; 0.2.9 crashes the same way, so it is not caused by this version (the cause is not known; two mod.io mods updated that day). Tell us if it happens to you.
+
 ## 0.2.9 (2026-10-27)
 
 ### Fixed

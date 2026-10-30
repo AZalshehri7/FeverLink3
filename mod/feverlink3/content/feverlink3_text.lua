@@ -16,6 +16,9 @@ T.MSG = {
 	-- a build refused on its own game before anything was built anywhere (a failed check, nothing recorded, a pause order not sent)
 	build_cancelled = { "warn",
 		"{whose} build could not be shared with the other players and was cancelled. Nothing was built. Try again." },
+	-- company for each player: the build would change what another company owns (X.foreignRemoval)
+	build_other_company = { "warn",
+		"Your build was cancelled: it changes a station or building of another company." },
 	-- a build whose record is over the size one message may have
 	build_too_big = { "warn",
 		"{whose} build is too big to be shared with the other players and was cancelled. Try building it in smaller parts." },
@@ -60,6 +63,8 @@ T.MSG = {
 	-- a window command or tool action that cannot travel: refused here too (never applied on one game alone)
 	action_not_shared = { "warn",
 		"Your {thing} could not be shared with the other players, so it was not applied. Try again." },
+	-- Give to company (Companies tab) could not start: {why} in plain words (X.giveLine)
+	company_give_refused = { "warn", "The line was not given away: {why}." },
 	-- stations and depots: they travel, but are still experimental
 	constructions_experimental = { "info",
 		"Stations and depots are still experimental in a session: one you build may not appear for the other players." },
@@ -199,5 +204,51 @@ function T.updateLine(u)
 	if u.restart then text = text .. " " .. T.UPDATE.restart end
 	return text, (u.state == "failed" or u.state == "behind" or u.restart) and "warn" or "info"
 end
+
+-- The gameplay type the host picks when starting the session, and the window's Companies tab (feverlink3_ui.script.lua,
+-- docs/COMPANIES.md section 6). "Company for each player" shows disabled on a game whose native module cannot make the game's
+-- own tools act as the player's company (no acting_player capability).
+T.COMPANY = {
+	tab = "Companies",
+	pick = "How do you want to play?",
+	shared = "One shared company",
+	sharedNote = "Everyone builds and pays from one account.",
+	separate = "Company for each player",
+	separateNote = "Every player gets a company with its own money.",
+	separateLocked = "Company for each player (not available on this game)",
+	separateUpcoming = "Company for each player (upcoming)",
+	starting = "Starting the session...",
+	modeShared = "One shared company: everyone pays from the same account. A company here groups who built and spent what.",
+	modeSeparate = "Company for each player: every company has its own money.",
+	none = "No companies yet.",
+	notYet = "Companies open once the session runs in this game.",
+	members = "Players: ",
+	nobody = "nobody",
+	you = " (you)",
+	away = " (away)",
+	spent = "spent ",
+	balance = "money ",
+	join = "Join",
+	leave = "Leave",
+	remove = "Delete",
+	create = "Create company",
+	namePlaceholder = "company name",
+	yours = "Your company: ",
+	noneYours = "You are not in a company.",
+	refused = "Not done: ",
+	-- Pay and Give to company (separate mode only: in one shared company there is one account and one owner)
+	pay = "Pay",
+	give = "Give",
+	handOver = "Pay or give to another company",
+	amountPlaceholder = "amount to pay",
+	amountNote = "Type an amount, then Pay on a company's row.",
+	-- Give line: only the line selected in the game (the line manager's line window, or a vehicle of the line clicked)
+	selectedLine = "Selected line: {name} ({vehicles} vehicles, {stops} stops)",
+	selectHint = "Open a line in the line manager or click one of its vehicles",
+	giveTo = "Give to:",
+	ownedBy = "This line belongs to {company}: only its own company can give it away.",
+	notYours = "This line is not your company's: only its own company can give it away.",
+	giveNote = "Give line hands over the line, its vehicles and its stations. A station another line of yours still uses goes to nobody, so both companies can use it.",
+}
 
 return T

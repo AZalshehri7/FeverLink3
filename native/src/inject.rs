@@ -1421,7 +1421,9 @@ impl Identity {
     ///   the order closed as `no_command`, and the player was told "could not be built" of a road built on every game. So the engine
     ///   rewrites some position between `scripting::Convert` and the apply (which one is not logged before this change: the miss now says
     ///   it, see the `Err`). A town's own command applied meanwhile still fails: it would have to lay EVERY point of the script build
-    ///   within the tolerance, besides removing every world entity it removes;
+    ///   within the tolerance, besides removing every world entity it removes. A build that removes or configures existing entities may
+    ///   have a minority of points moved further, each paired with a command point of its own (friend session 2026-10-30: 2.24 m and
+    ///   15.44 m on both games; see the code);
     /// - every existing world entity the conversion removes or configures is one the command removes or configures (exact ids). The
     ///   proposal's placeholders of its own new entities (`new#N`, stored as -N) are names inside one proposal, not world entities, and
     ///   are not compared: the engine is free to number them again when it makes the command (not proven to happen; it would give the
@@ -1457,20 +1459,51 @@ impl Identity {
             }
         }
         let dist = |p: &[f32; 3], q: &[f32; 3]| (0..3).map(|j| (p[j] - q[j]) * (p[j] - q[j])).sum::<f32>().sqrt();
+        let nearest = |p: &[f32; 3], left: &[[f32; 3]]| {
+            left.iter().enumerate().map(|(i, q)| (i, dist(p, q))).min_by(|a, b| a.1.total_cmp(&b.1))
+        };
         let mut largest = 0.0f32;
+        let mut far = Vec::new();
         for p in &rest {
-            let nearest = left.iter().enumerate().map(|(i, q)| (i, dist(p, q))).min_by(|a, b| a.1.total_cmp(&b.1));
-            match nearest {
+            match nearest(p, &left) {
                 Some((i, d)) if d <= PLACE_TOLERANCE_M => {
                     largest = largest.max(d);
                     left.swap_remove(i);
                 }
-                Some((_, d)) => {
-                    return Err(format!(
-                        "the conversion's point {p:?} is {d:.4} m from the nearest point of the command left (more than {PLACE_TOLERANCE_M} m)"
-                    ))
-                }
+                Some((_, d)) => far.push((*p, d)),
                 None => return Err(format!("the conversion's point {p:?} has no point of the command left")),
+            }
+        }
+        // A point the engine moved further than the tolerance (friend session 2026-10-30, builds 0:1298 and 0:1302, street builds that
+        // split the roads the build before had laid, on host AND guest alike: conversion and command of the same counts (0:1302: 20
+        // points, 10 removed), every removed entity the same, one point 15.44 m / 2.24 m off; the native text was not injected, the build
+        // applied as converted on every game, and the originator's tool was told it failed, then "built after all"). Which point the
+        // engine moves, and why, is not proven: the miss names only the first, the match now names all. Where a build removes or
+        // configures existing world entities, those exact ids are its identity, stronger than a position the engine may rewrite when it splits them again. Such a
+        // point still counts when it pairs with a point of the command of its own (the command lays as many points: a town's command
+        // that only replaces a removed segment lays fewer) and the moved points are fewer than the matched ones. A build that removes
+        // nothing existing keeps the tolerance: its points are all that tell it from a town's road.
+        let existing = self.place.removed.iter().filter(world).count();
+        let matched = self.place.points.len() - far.len();
+        let mut moved = 0.0f32;
+        if !far.is_empty() {
+            let (p, d) = far[0];
+            if existing == 0 || far.len() >= matched {
+                return Err(format!(
+                    "the conversion's point {p:?} is {d:.4} m from the nearest point of the command left (more than {PLACE_TOLERANCE_M} m); {} point(s) of {} that far, {existing} existing entit(ies) removed or configured",
+                    far.len(),
+                    self.place.points.len()
+                ));
+            }
+            for (p, _) in &far {
+                let Some((i, d)) = nearest(p, &left) else {
+                    return Err(format!(
+                        "the conversion's point {p:?} is more than {PLACE_TOLERANCE_M} m from every point of the command, and no point of the command is left to be its moved one ({} far)",
+                        far.len()
+                    ));
+                };
+                moved = moved.max(d);
+                left.swap_remove(i);
             }
         }
         let mut cons: Vec<&Construction> = have.constructions.iter().collect();
@@ -1485,10 +1518,19 @@ impl Identity {
             }
         }
         let n = self.place.points.len();
+        let far_text = if far.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} moved further (largest {moved:.4} m: {:?}), every one of its {existing} existing entit(ies) removed or configured by the command",
+                far.len(),
+                far.iter().map(|(p, _)| *p).collect::<Vec<_>>()
+            )
+        };
         Ok(format!(
-            "{} of {n} point(s) bit-equal, {} within {PLACE_TOLERANCE_M} m (largest {largest:.4} m)",
+            "{} of {n} point(s) bit-equal, {} within {PLACE_TOLERANCE_M} m (largest {largest:.4} m){far_text}",
             n - rest.len(),
-            rest.len()
+            rest.len() - far.len()
         ))
     }
 }
@@ -2371,6 +2413,22 @@ toAdd[0].transf	m4:{t}
         assert!(off([180.0, 20.0, 5.0], &[new1, 54]).within(&off([180.0, 20.0, 5.0], &[new2, 54])));
         let why = off([180.0, 20.0, 5.0], &[54]).compare(&off([180.0, 20.0, 5.0], &[55])).unwrap_err();
         assert!(why.contains("entity 54"), "{why}");
+        // friend session 2026-10-30 build 0:1302: a street that splits existing roads, one point 2.24 m off on every game. The removed
+        // world entities carry the identity: the moved point pairs with the command's own; a town's command that only replaces the
+        // removed segment (fewer points), or a build that removes nothing existing, is not taken
+        let at = |points: &[[f32; 3]], removed: &[u32]| Identity {
+            place: Place { points: points.to_vec(), removed: removed.iter().copied().collect() },
+            constructions: Vec::new(),
+        };
+        let (e0, e1, split) = ([0.0f32, 0.0, 1.0], [40.0f32, 0.0, 1.0], [20.0f32, 0.0, 1.0]);
+        let moved = [20.0f32, 2.24, 1.0];
+        let street = at(&[e0, e1, split, e0, split, split, e1], &[54, new1]);
+        let how = street.compare(&at(&[e0, e1, moved, e0, moved, moved, e1], &[54, new2, 77])).unwrap();
+        assert!(how.contains("3 moved further (largest 2.2400 m"), "{how}");
+        let why = street.compare(&at(&[e0, e1, e0, e1], &[54])).unwrap_err();
+        assert!(why.contains("has no point of the command left"), "{why}");
+        let why = at(&[e0, e1, split], &[new1]).compare(&at(&[e0, e1, moved], &[new2])).unwrap_err();
+        assert!(why.contains("2.2400 m from the nearest point") && why.contains("0 existing"), "{why}");
         // a text that names no place at all identifies no command: unknown, never taken for the mod's (and so never emptied)
         let why = same_build(&arena, town, "toAdd.#\tn:0\n").unwrap_err();
         assert!(why.starts_with(UNKNOWN) && keeps_waiting(&why), "{why}");

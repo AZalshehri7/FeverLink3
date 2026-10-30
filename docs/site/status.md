@@ -4,7 +4,7 @@ title: FeverLink3 status
 
 # Status
 
-Last updated 2026-10-26, version 0.2.8 (beta). [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
+Last updated 2026-10-30, version 0.2.10. [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
 
 This page keeps three things apart: what has been seen working in the real game, what has only been tested automatically, and the known gaps.
 
@@ -40,6 +40,9 @@ These are covered by the automatic tests (about 1,600 on every change) or by two
 - Configuring a station right after a sync (0.2.3; not yet seen in the game).
 - Putting the previous version back when an update does not start.
 - The switch that turns automatic updates off.
+- A build from another mod's tool or window (bus bay upgrade, crossing window) applied at the same moment on every game, and big builds sent in parts: 620 KB and 1.23 MB builds stood on both games (two game windows on one PC, 0.2.9; over Steam between two PCs not seen yet).
+- Companies with one shared company (0.2.10, two game windows on one PC): the session starts with one shared company; companies are kept through save, load and rejoin. "One shared company" passed the full automated test with it.
+- A bus stop on a road made by another mod (a truck bay road and a bus bay road) built on both games (two game windows on one PC, 0.2.10).
 
 ## Known gaps
 
@@ -48,7 +51,8 @@ These are covered by the automatic tests (about 1,600 on every change) or by two
 - Some extra repair syncs: the game sometimes orders its internal object ids differently on two PCs. FeverLink3 finds this within seconds and repairs it automatically; the cause is being traced.
 - Mods that change the world on their own with a kind of change FeverLink3 cannot share yet still cause extra repair syncs; FeverLink3 names such a mod in a warning.
 - Two players building at the same spot within about a second: one of the two builds can be refused (the worlds stay equal).
-- All players share one company; separate companies are planned.
+- Autosave: the games now autosave together at the host's interval (one short stop for everyone instead of each game stopping the others); seen with two game windows on one PC, not yet between two PCs.
+- All players share one company's money; a company for each player, with its own money, is upcoming (shown grayed at Start).
 - Releases are not code-signed until 1.0.0. Updates come only from the official GitHub releases over HTTPS, with every file's checksum checked.
 
 Each item moves to "seen working" only after it has been seen in the real game.

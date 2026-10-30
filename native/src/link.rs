@@ -123,6 +123,14 @@ pub enum CtlMessage {
     /// Smooth pacing (`pace.rs`): scale the engine's batch interval by `permille` / 1000 (500 to 2000, held to that range). The mod
     /// sends it when the factor changes and every second while it is not 1; one not refreshed for `pace::STALE_MS` goes back to 1.
     Pace { permille: u32 },
+    /// `iplayer.rs`: the game's interface acts as `entity` (this game's own company in a company-for-each-player session), or, `None`
+    /// (`clear = true`), as the savegame's player again. Answered with an `interface_player` event. The tools take it at the next
+    /// world load (the game interface copies the player into them when it is made); the module keeps it across loads.
+    InterfacePlayer { entity: Option<u32> },
+    /// `autosave.rs`: `hold` true while this game is in a running session (refreshed every 10 s; one not refreshed for 30 s is over):
+    /// the game's own autosave timer is held off. `now` (optional): run the game's own autosave now (the host's stamp). Answered with
+    /// an `autosave` event.
+    Autosave { hold: bool, now: bool },
 }
 
 /// Why a control line could not be turned into a [`CtlMessage`].
@@ -370,6 +378,27 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             };
             Ok(CtlMessage::Ping { n, paused })
         }
+        "interface_player" => {
+            if p.get("clear").and_then(Value::as_bool) == Some(true) {
+                return Ok(CtlMessage::InterfacePlayer { entity: None });
+            }
+            let e = required(&p, "entity", "interface_player needs an entity or clear = true")?;
+            let e = u32::try_from(e)
+                .ok()
+                .filter(|&e| e <= i32::MAX as u32)
+                .ok_or(CtlError::BadPayload("entity is not an entity id"))?;
+            Ok(CtlMessage::InterfacePlayer { entity: Some(e) })
+        }
+        "autosave" => Ok(CtlMessage::Autosave {
+            hold: p
+                .get("hold")
+                .and_then(Value::as_bool)
+                .ok_or(CtlError::BadPayload("autosave needs hold = true or false"))?,
+            now: match p.get("now") {
+                None => false,
+                Some(v) => v.as_bool().ok_or(CtlError::BadPayload("now must be true or false"))?,
+            },
+        }),
         "pace" => {
             let p = required(&p, "permille", "pace needs a factor in thousandths")?;
             let permille = crate::pace::accept_permille(p)
@@ -1037,6 +1066,24 @@ pub enum Event {
     Pong {
         n: i64,
     },
+    /// `iplayer.rs`, after an `interface_player` order and whenever a world starts or the front gets a new value: `player` the order
+    /// (-1: none), `savegame` the world's own player read at its start (-1: none), `front` what this module last wrote into the front
+    /// state (-1: nothing in this world), `world` the number of the world (StartGameSim calls), `why` a refusal ("" when there is none).
+    InterfacePlayer {
+        player: i64,
+        savegame: i64,
+        front: i64,
+        world: u64,
+        why: String,
+    },
+    /// `autosave.rs`, after every `autosave` line, a new interval, a run or a refusal: `minutes` this game's `autosaveIntervalMinutes`
+    /// (-1: not readable), `hold` whether its own timer is held off, `runs` the module's runs so far, `why` a refusal ("" when none).
+    Autosave {
+        minutes: i64,
+        hold: bool,
+        runs: u64,
+        why: String,
+    },
     Error {
         place: String,
         detail: String,
@@ -1073,6 +1120,8 @@ impl Event {
             Event::Audit { .. } => "audit",
             Event::Holding { .. } => "holding",
             Event::Pong { .. } => "pong",
+            Event::InterfacePlayer { .. } => "interface_player",
+            Event::Autosave { .. } => "autosave",
             Event::Error { .. } => "error",
             Event::Fault { .. } => "fault",
         }
@@ -1138,7 +1187,12 @@ impl Event {
                 format!("event patch_skipped: {reason} (kind {kind:?}, call site rva {site:x?})")
             }
             Event::Timing { what, id, detail } => format!("timing {what} {id}: {detail}"),
-            Event::Audit { .. } | Event::Pong { .. } => return None,
+            Event::InterfacePlayer { player, savegame, front, world, why } => format!(
+                "event interface_player: order {player}, savegame player {savegame}, front {front}, world {world}{}",
+                if why.is_empty() { String::new() } else { format!(", REFUSED: {why}") }
+            ),
+            // (autosave.rs says its changes in native.log itself; the event answers every refresh of the hold)
+            Event::Audit { .. } | Event::Pong { .. } | Event::Autosave { .. } => return None,
         })
     }
 
@@ -1226,6 +1280,19 @@ impl Event {
                 ("reason", Lua::str(*reason)),
             ]),
             Event::Pong { n } => Lua::map([("n", Lua::Int(*n))]),
+            Event::InterfacePlayer { player, savegame, front, world, why } => Lua::map([
+                ("front", Lua::Int(*front)),
+                ("player", Lua::Int(*player)),
+                ("savegame", Lua::Int(*savegame)),
+                ("why", Lua::str(why)),
+                ("world", Lua::uint(*world)),
+            ]),
+            Event::Autosave { minutes, hold, runs, why } => Lua::map([
+                ("hold", Lua::Bool(*hold)),
+                ("minutes", Lua::Int(*minutes)),
+                ("runs", Lua::uint(*runs)),
+                ("why", Lua::str(why)),
+            ]),
             Event::Patched { frozen, adds, allocated } => Lua::map([
                 ("adds", Lua::uint(u64::from(*adds))),
                 ("allocated", Lua::Bool(*allocated)),
@@ -1287,6 +1354,9 @@ pub struct EventWriter {
     out: gamelink::GenWriter,
     /// The latest `ready` line and the `timing clock` line written after it.
     header: String,
+    /// The latest `interface_player` line (`iplayer.rs`): the module's state, at the end of the header, so a mod reloaded after a
+    /// rotation still finds the savegame's player it must take as canonical.
+    iplayer: String,
 }
 
 impl EventWriter {
@@ -1295,7 +1365,7 @@ impl EventWriter {
         let base = dir.join(EVENTS_FILE);
         let out =
             gamelink::GenWriter::open(base, EVENTS_FROM)?.with_limits(EVENTS_ROTATE_BYTES, gamelink::KEEP_GENERATIONS);
-        Ok(EventWriter { out, header: String::new() })
+        Ok(EventWriter { out, header: String::new(), iplayer: String::new() })
     }
 
     /// The same writer with another generation size (tests).
@@ -1330,10 +1400,12 @@ impl EventWriter {
         }
         let mut text = String::new();
         let mut header = None::<String>;
+        let mut iplayer = None::<String>;
         for e in events {
             let line = EventWriter::line(e);
             match e {
                 Event::Ready { .. } => header = Some(line.clone()),
+                Event::InterfacePlayer { .. } => iplayer = Some(line.clone()),
                 // a stop fault is the module's state for the rest of the run, like `ready`: a reloaded mod finds it in the header
                 Event::Timing { what: "clock", .. } | Event::Fault { action: "stop", .. } => {
                     let h = header.get_or_insert_with(|| self.header.clone());
@@ -1346,9 +1418,15 @@ impl EventWriter {
             text.push_str(&line);
         }
         let written = self.out.append(&text);
+        let changed = header.is_some() || iplayer.is_some();
         if let Some(h) = header {
             self.header = h;
-            self.out.set_header(self.header.clone());
+        }
+        if let Some(l) = iplayer {
+            self.iplayer = l;
+        }
+        if changed && !self.header.is_empty() {
+            self.out.set_header(format!("{}{}", self.header, self.iplayer));
         }
         written
     }
@@ -1498,6 +1576,13 @@ mod tests {
         assert_eq!(parse("ping", r#"{["n"]=5,["paused"]=true}"#), Ok(CtlMessage::Ping { n: 5, paused: true }));
         assert!(matches!(parse("ping", r#"{["n"]=5,["paused"]=1}"#), Err(CtlError::BadPayload(_))));
         assert_eq!(parse("pace", r#"{["permille"]=1500}"#), Ok(CtlMessage::Pace { permille: 1500 }));
+        assert_eq!(
+            parse("interface_player", r#"{["entity"]=26044}"#),
+            Ok(CtlMessage::InterfacePlayer { entity: Some(26044) })
+        );
+        assert_eq!(parse("interface_player", r#"{["clear"]=true}"#), Ok(CtlMessage::InterfacePlayer { entity: None }));
+        assert!(matches!(parse("interface_player", "{}"), Err(CtlError::BadPayload(_))));
+        assert!(matches!(parse("interface_player", r#"{["entity"]=4294967295}"#), Err(CtlError::BadPayload(_))));
         assert_eq!(parse("pace", r#"{["permille"]=1000}"#), Ok(CtlMessage::Pace { permille: 1000 }));
         assert_eq!(
             parse("pace", r#"{["permille"]=2400}"#),
@@ -2029,6 +2114,7 @@ mod tests {
             },
             Event::Holding { on: true, kinds: vec!["build_proposal".into()], reason: "hold_on" },
             Event::Pong { n: 9 },
+            Event::InterfacePlayer { player: 42, savegame: 7, front: -1, world: 2, why: String::new() },
             Event::Error { place: "release".into(), detail: "unknown id 9 \"x\"\n".into() },
         ];
         for ev in events {
@@ -2204,6 +2290,10 @@ mod tests {
         };
         w.append(std::slice::from_ref(&ready)).unwrap();
         w.append(&[Event::Timing { what: "clock", id: 0, detail: "wall=1 clock=2".into() }]).unwrap();
+        // the interface player's state (iplayer.rs): only the latest one goes to the top
+        let ip = |world| Event::InterfacePlayer { player: 42, savegame: 7, front: 42, world, why: String::new() };
+        w.append(&[ip(1)]).unwrap();
+        w.append(&[ip(2)]).unwrap();
         // a reader that follows from the first byte, polled now and then while the writer goes through generations
         let mut follower = CtlReader::new(dir.path().join(EVENTS_FILE));
         let mut got = Vec::new();
@@ -2238,6 +2328,7 @@ mod tests {
         let lines = fresh.poll().lines;
         assert_eq!(lines[0].kind, "ready");
         assert_eq!(lines[1].kind, "timing");
-        assert!(lines[2..].iter().all(|l| l.kind == "pong"));
+        assert_eq!((lines[2].kind.as_str(), lines[2].payload.as_str()), ("interface_player", ip(2).payload().as_str()));
+        assert!(lines[3..].iter().all(|l| l.kind == "pong"));
     }
 }

@@ -37,7 +37,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 [*]Trees, plants and rocks are shared since 0.2.8, new and seen only with two game windows on one PC so far: tell us if the trees look different for someone. Terrain heights and ground paint are shared since 0.2.7.
 [*]Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.
 [*]Mods that change the world on their own (for example an automatic line namer) cause extra syncs. FeverLink3 names them in a warning; turn their automatic changes off while playing together.
-[*]Coming back after a short drop without a reload, and separate companies for each player, are planned.
+[*]Everyone builds and pays from one shared company. A company for each player, with its own money, is upcoming. Coming back after a short drop without a reload is planned.
 [/list]
 
 [b]Keep backups of the saves you play with.[/b]
@@ -62,7 +62,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 [*]Start the game from Steam and activate [b]FeverLink3 Multiplayer[/b] in the mod list when you start or load a game.
 [/list]
 
-[b]Host:[/b] click the FeverLink3 icon in the bottom bar > [b]Host a game[/b] > [b]Copy code[/b], send the code to your friend, and press [b]Start the session[/b] when they appear.
+[b]Host:[/b] click the FeverLink3 icon in the bottom bar > [b]Host a game[/b] > [b]Copy code[/b], send the code to your friend, and start the session with [b]One shared company[/b] when they appear.
 [b]Join:[/b] open the FeverLink3 window, paste the code (Ctrl+V) and press [b]Join[/b]. Only join people you trust.
 
 [b]Uninstall:[/b] close the game and delete [b]winhttp.dll[/b] and the folder [b]mods\release\feverlink3[/b] from the game folder.

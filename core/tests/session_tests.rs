@@ -848,6 +848,27 @@ fn start_speed_and_pause_are_broadcast_and_speed_requests_obeyed() {
     assert!(h.host.state().pause_at.is_some());
     assert_eq!(sessions + 1, h.p(a).count(MessageKind::Session));
     assert_eq!(0, h.host.state().pause_at.unwrap() % Lockstep::STEP);
+
+    // a world saved paused, with an action made before the start (the host's gameplay type at Start, stamped a lead later): every game
+    // runs on to one step past it at the slowest speed and pauses there; the first round waits for the pause
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let clock = ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None };
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(18600)));
+    h.host_game(MessageKind::Clock, &json(&clock));
+    h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(18600)));
+    h.player_game(a, MessageKind::Clock, &json(&clock));
+    h.host_game(MessageKind::Action, &json(&ActionMessage::new(18600 + 4 * Lockstep::STEP, 1, "{mode}")));
+    h.host_call(HostSession::start);
+    assert_eq!((1, Some(18600 + 5 * Lockstep::STEP)), (h.host.state().speed, h.host.state().pause_at));
+    assert_eq!(Some(18600 + 5 * Lockstep::STEP), h.p(a).session.session().unwrap().pause_at);
+    assert!(h.host_log.iter().any(|l| l.contains("runs on to 19600 (5 step(s)) and pauses there")));
+    assert_eq!(0, h.p(a).count(MessageKind::ChecksumRequest));
+    let stopped = ClockMessage { t: 19600, pause: true, stop: Some(19600), ..clock };
+    h.host_game(MessageKind::Clock, &json(&stopped));
+    h.player_game(a, MessageKind::Clock, &json(&stopped));
+    assert_eq!(1, h.p(a).count(MessageKind::ChecksumRequest));
+    assert_eq!(19600, h.p(a).last::<ChecksumRequestMessage>(MessageKind::ChecksumRequest).at);
 }
 
 #[test]

@@ -882,6 +882,13 @@ impl Controller {
         matches!(self.state, State::Idle | State::Failed(_))
     }
 
+    /// Hosting a session nobody else is in (no player connected, no slot held for one who dropped): leaving it loses nothing,
+    /// so an invite may end it by itself. Friend session 2026-10-30: the guest's game hosted a session of its own when the
+    /// host's Steam invite came, and the guest had to press the window's Join.
+    fn hosting_alone(&self) -> bool {
+        matches!(&self.state, State::Hosting(h) if h.handle.status().roster.iter().all(|e| e.id == 0))
+    }
+
     fn host(&mut self, params: &Value) {
         if !self.idle_or_failed() {
             return;
@@ -1238,7 +1245,10 @@ impl Controller {
         // load a save from there, so the invite waits for the player to load any world (UNPROVEN in a two-PC Steam run).
         // The window of the world just loaded sends its mod list a moment later (a Lua state of its own): the join waits
         // for it up to MODS_WAIT, so the host can compare the mods.
-        if self.invite.is_some() && self.idle_or_failed() && lock_is_held(&self.dir.join(WORLD_LOCK_FILE)) == Some(true)
+        // A session this game hosts alone counts as free: the join ends it first (hosting_alone).
+        if self.invite.is_some()
+            && (self.idle_or_failed() || self.hosting_alone())
+            && lock_is_held(&self.dir.join(WORLD_LOCK_FILE)) == Some(true)
         {
             let now = Instant::now();
             let since = *self.mods_wait.get_or_insert(now);
@@ -1253,6 +1263,10 @@ impl Controller {
                 self.mods_wait = None;
                 if self.mod_params.is_null() {
                     self.append_session_log("invites: the window sent no mod list; joining without it");
+                }
+                if !self.idle_or_failed() {
+                    self.append_session_log("invites: this game hosted a session alone; it ends for the invite");
+                    self.leave();
                 }
                 self.join_invite(invite);
             }
@@ -3204,6 +3218,32 @@ mod tests {
         assert!(friend.pc.window.status()["invite"].is_null(), "{}", friend.pc.window.status());
         let log = fs::read_to_string(friend.pc.dir.join(SESSION_LOG_FILE)).unwrap();
         assert!(log.contains("the pending invite was cancelled"), "{log}");
+    }
+
+    /// Friend session 2026-10-30: the guest's game hosted a session of its own when the invite came and the guest had to press
+    /// Join. A session hosted alone ends by itself for the invite; one with a player in it keeps waiting for the window's Join.
+    #[cfg(windows)]
+    #[test]
+    fn an_invite_ends_a_session_hosted_alone_and_joins() {
+        let root = tempfile::tempdir().unwrap();
+        let mut host = invite_pc(root.path(), "host", "TransportFever3.exe");
+        host.pc.window.send("host", "{}");
+        assert!(steps(&mut [&mut host], Duration::from_secs(10), |p| p[0].friends.presence("connect").is_some()));
+        host.pc.window.send("invite", "{}");
+        assert!(steps(&mut [&mut host], Duration::from_secs(5), |p| p[0].friends.dialogs().len() == 1));
+        let invite = host.friends.dialogs()[0].clone();
+        let mut friend = invite_pc(root.path(), "friend", "TransportFever3.exe");
+        friend.lock_world();
+        friend.world();
+        friend.pc.window.send("host", "{}");
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(10), |p| p[1].pc.window.status()["state"]
+            == "hosting"));
+        friend.friends.deliver_join(None, &invite);
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(20), |p| {
+            p[1].pc.window.status()["state"] == "joined"
+        }));
+        let log = fs::read_to_string(friend.pc.dir.join(SESSION_LOG_FILE)).unwrap();
+        assert!(log.contains("hosted a session alone; it ends for the invite"), "{log}");
     }
 
     fn report_zip(dir: &Path) -> Option<PathBuf> {

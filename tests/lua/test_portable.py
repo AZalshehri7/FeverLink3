@@ -108,6 +108,15 @@ class PortableTest(unittest.TestCase):
         self.assertIsNone(t.toAdd[1]["~0x40"])
         self.assertEqual(self.M.countsText(self.M.counts(t)), "cons=1 rem=2 nodes=2 segs=1 rmNodes=0 rmSegs=0 objs=0 rmObjs=0 ncfg=1 rmNcfg=0 frozen=1",
                          "the counts of the build record")
+        # a mod's resource: the path is the member's value, the mod its `.first` (lab v030bay1 2026-10-30, a stop on a bay street), in
+        # either order; the edge object after it is read
+        bay = "proposal.addedSegments[0].roadTemplate\tres:\"infrastructure/street/town/town_new_small_truck_bay.street_template\""
+        mod = "proposal.addedSegments[0].roadTemplate.first\tres:\"deadeye_tpf3_bus_bay\""
+        obj = "proposal.edgeObjectsToAdd.#\tn:1\nproposal.edgeObjectsToAdd[0].modelName\tstr:\"stations/street/small_stops/small_new.con\""
+        for lines in ((bay, mod), (mod, bay)):
+            t = self.parse("\n".join(lines) + "\n" + obj)
+            self.assertEqual(t.proposal.addedSegments[1].roadTemplate, "deadeye_tpf3_bus_bay::/infrastructure/street/town/town_new_small_truck_bay.street_template")
+            self.assertEqual(t.proposal.edgeObjectsToAdd[1].modelName, "stations/street/small_stops/small_new.con")
         for bad in ("", "no tab here", "a	u32:zz"):
             t, why = self.M.parse(bad)
             self.assertTrue(t is None and why, "a text that cannot be read is refused whole: %r" % bad)

@@ -1,5 +1,5 @@
 -- FeverLink3 in-game interface: the game bar icon, its pop-up, and the window (start screen; in a session the tabs Players,
--- Chat and Host).
+-- Chat, Companies and Host).
 --
 -- ENGINE-BOUND. Everything with a rule in it (roster, history, status line, icon colour, notices, the snapshot and outbox files)
 -- is in feverlink3_hud.lua and is tested; this file draws that model with the game's react toolkit. The lobby talks to the
@@ -9,7 +9,7 @@
 -- Documented calls only (owner, 2026-10-21; tf3-docs reference/base): builtin widgets (scripts/builtin: Window, BoxLayout,
 -- Component, TextView, ImageView, Button, TextInputField, TabWidget, TabWidgetChild, ProgressBar), react hooks
 -- (scripts/react: RegisterRecipe, RegisterWrapperRecipe, RegisterPluginRecipe, useState, useSelfRef, onStep, onStepTimer,
--- Meta fields class / tooltip / styleSheet, ReactNodeRef getPosition), styleutil.makeStyle (gui/main/styleutil: color, size),
+-- Meta fields class / tooltip / styleSheet / enabled, ReactNodeRef getPosition), styleutil.makeStyle (gui/main/styleutil: color, size),
 -- game_react_globals.getDefaultWindowApi (gui/main/game_react_globals), WindowAPI addSingletonWindow / addWindow /
 -- removeAllWindows, popover_react_util.PopoverWindow (gui/main/popover_react_util), GameBarInfoDisplayExtension
 -- (gui/game_bar/game_bar_widgets). Style class names are the base game's (gui/main/default.css.lua: primary, secondary,
@@ -59,7 +59,59 @@ end
 
 -- defined below (it needs withMods and command); declared here so the refresh's closure sees the local, not a global nil
 -- (two windows 2026-10-23: the refresh called a global nil, no `mods` command was ever sent)
-local shareMods
+local shareMods, startPending
+
+-- the bridge's company page (companies.txt, docs/COMPANIES.md 6.1): true when it changed
+local function pollCompanies()
+	local st, text = Hud.readCompanies(C, U.companiesText)
+	if not st then return false end
+	U.companies, U.companiesText = st, text
+	return true
+end
+
+-- Company for each player: the game's own windows (bar, finance, vehicle store) read api.engine.util.getPlayer in THIS Lua state, so the
+-- company the bridge picked (companies.txt `localEntity`) is set here (E6, docs/COMPANIES.md section 8; two-window lab 2026-10-27).
+-- The game's own function is kept in package.loaded: a savegame reload runs this file again in the same Lua state.
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2): replacing api.engine.util.getPlayer, as Co.extendEngine does in the bridge's state.
+-- The loan window reads the loan script's state itself (game_mechanics/finance/finances_loan_gui.tl, getLoanTableFromEngine): with
+-- a company of its own, the window is shown that company's table, which the game's loan script keeps for it in the same state
+-- (`fl3["p<player entity>"]`, Co.scriptCompanies). UNDOCUMENTED API (docs/ARCHITECTURE.md section 2): replacing api.engine.getComponent
+-- in this state, for that one component of that one entity.
+local LOAN_GS = "::/game_mechanics/finance/loan.gs"
+local function companyLoans(store)
+	if store.getComponent then return end
+	store.getComponent = api.engine.getComponent
+	local loanEntity = nil
+	api.engine.getComponent = function(e, t)
+		local c = store.getComponent(e, t)
+		local mine = store.mine and store.mine() or nil
+		if mine == nil or c == nil or t ~= api.type.ComponentType.GAME_SCRIPT then return c end
+		if loanEntity == nil then pcall(function() loanEntity = api.engine.system.gameScriptSystem.getEntityForGameScript(LOAN_GS) end) end
+		if e ~= loanEntity or mine == store.get() then return c end
+		local okS, st = pcall(function() return c.state end)
+		local own = okS and type(st) == "table" and type(st.fl3) == "table" and st.fl3["p" .. tostring(mine)] or nil
+		return { state = own or { availableLoans = {}, obtainedLoans = {}, freeId = 0 } }
+	end
+end
+
+local function syncLocalCompany()
+	local store = package.loaded["feverlink3_orig_player_ui"]
+	if type(store) ~= "table" then
+		store = { get = api.engine.util.getPlayer }
+		package.loaded["feverlink3_orig_player_ui"] = store
+	end
+	-- this run's U (a savegame reload makes a new one; the replaced getComponent stays)
+	store.mine = function() return U.localEntity end
+	local want = U.companies and tonumber(U.companies.localEntity) or nil
+	-- only once this game acts as a company of its own: with one shared company the game's getComponent stays untouched
+	if want then pcall(companyLoans, store) end
+	if want == U.localEntity then return end
+	local ok = pcall(function()
+		if want then api.engine.util.getPlayer = function() return want end else api.engine.util.getPlayer = store.get end
+	end)
+	U.localEntity = want
+	C.logger("ui")("local company (windows): " .. (want and ("entity " .. want) or "the game's own player") .. (ok and "" or " (could not be set)"))
+end
 
 -- One throttled refresh for every recipe (bar, pop-up, window). The step timer is not guaranteed to fire while the game is
 -- paused, so the window also drives it from onStep (every interface frame); Hud.newTicker keeps it to once per 0.5 s.
@@ -67,8 +119,11 @@ U.refresh = Hud.newTicker(0.5, C.clock, function()
 	if Hook then Hook.devPoll() end
 	local a = poll()
 	local b = pollCtl()
+	local okP, c = pcall(pollCompanies)
+	pcall(syncLocalCompany)
 	pcall(shareMods)
-	if a or b then U.rev = U.rev + 1 end
+	pcall(startPending)
+	if a or b or (okP and c) then U.rev = U.rev + 1 end
 end)
 
 -- `host` / `join` carry this game's mods and build for the join's comparison (docs/PROTOCOL.md, "Mod list"); read at
@@ -112,6 +167,40 @@ end
 
 local function send(text)
 	return Hud.sendChat(C, outbox(), text)
+end
+
+-- a company operation (docs/COMPANIES.md 6.2): the bridge sends it like any command the player issues
+local function company(op)
+	local ok = C.writerSend(outbox(), "company", op)
+	if not ok then log("company operation " .. tostring(op.op) .. " could not be written") end
+	return ok
+end
+
+-- The host's Start: the gameplay type first (the `mode` operation, so that it is in the host's world before a sync at the start
+-- copies that world to everyone), the start once the page shows the mode, or after START_WAIT_S at the latest.
+local START_WAIT_S = 3
+-- "Company for each player" can be picked at the Start when SEPARATE_OFFERED and the native module reports acting_player; otherwise it
+-- shows as a disabled button. Not offered in 0.2.10 (owner 2026-10-30: the release carries the companies code with one shared company;
+-- a company for each player stays "(upcoming)" until it has been played between two PCs).
+local SEPARATE_OFFERED = false
+local function startWith(mode)
+	if U.starting then return end
+	if not company({ op = "mode", mode = mode }) then command("start", {}); return end
+	log("start: gameplay type " .. mode)
+	U.starting = { mode = mode, at = C.clock() }
+	U.rev = U.rev + 1
+end
+
+startPending = function()
+	local s = U.starting
+	if not s then return end
+	local shown = U.companies and U.companies.mode == s.mode
+	if shown or C.clock() - s.at >= START_WAIT_S then
+		U.starting = nil
+		if not shown then log("start: the page does not show the gameplay type " .. s.mode .. " after " .. START_WAIT_S .. " s; starting anyway") end
+		command("start", {})
+		U.rev = U.rev + 1
+	end
 end
 
 local function nowTime()
@@ -206,6 +295,14 @@ local function setup(react, builtin, X)
 	local function button(label, onClick, kind)
 		local class = kind == "negative" and "error-tape" or (kind or "secondary")
 		return builtin.Button{ meta = { class = class }, content = text(label), onClick = onClick }
+	end
+	-- a button that cannot be clicked: the same Button, with Meta `enabled = false` ("False disables the node", tf3-docs reference
+	-- base/scripts/react, Meta) and no onClick, the way the base game greys its own (gui/debug_panel/make_entity_debug_panel.tl:392-424,
+	-- gui/game_bar/game_bar.tl:634; builtin.css.lua `Button:disabled` dims its text). The label is dimmed by us as well, in case the
+	-- disabled look does not take on this game build (UNPROVEN in the real game).
+	local function disabledButton(label, kind)
+		local class = kind == "negative" and "error-tape" or (kind or "secondary")
+		return builtin.Button{ meta = { class = class, enabled = false }, content = text(label, "info", 0.5) }
 	end
 	local function field(placeholder, value, onTyping, displayOnly)
 		return builtin.TextInputField{
@@ -391,6 +488,9 @@ local function setup(react, builtin, X)
 		local modeIn = react.useState("reliable")
 		local showTest = react.useState(false)
 		local tab = react.useState("players")
+		local companyIn = react.useState("")
+		local amountIn = react.useState("")   -- Pay: the amount typed
+		local giveIn = react.useState("")     -- Give line: the company picked to get the selected line (its key, "" = none)
 		local ctl = U.ctl
 		local m = U.model
 		local rows = {}
@@ -461,7 +561,26 @@ local function setup(react, builtin, X)
 			if host and ctl.result and ctl.result.kind == "kick" and ctl.result.message then list[#list + 1] = text(tostring(ctl.result.message)) end
 			list[#list + 1] = gap()
 			if host and not ctl.started then
-				list[#list + 1] = button("Start the session", function() command("start", {}) end, "primary")
+				-- the gameplay type starts the session (owner, 2026-10-27): one shared company is the normal choice; a company for each
+				-- player only when SEPARATE_OFFERED and the native module makes the game's own tools act as the player's company
+				-- (acting_player); otherwise a disabled button
+				local T = texts()
+				local W = T and T.COMPANY
+				if U.starting then
+					list[#list + 1] = text(W and W.starting or "Starting the session...")
+				elseif W then
+					list[#list + 1] = text(W.pick, nil, nil, "font-scale-title-3")
+					list[#list + 1] = button(W.shared, function() startWith("shared") end, "primary")
+					list[#list + 1] = text(W.sharedNote)
+					if SEPARATE_OFFERED and U.companies and U.companies.acting then
+						list[#list + 1] = button(W.separate, function() startWith("separate") end)
+						list[#list + 1] = text(W.separateNote)
+					else
+						list[#list + 1] = disabledButton(SEPARATE_OFFERED and W.separateLocked or W.separateUpcoming)
+					end
+				else
+					list[#list + 1] = button("Start the session", function() command("start", {}) end, "primary")
+				end
 			elseif not host then
 				list[#list + 1] = button("Leave the session", function() command("leave", {}) end, "negative")
 			end
@@ -486,6 +605,87 @@ local function setup(react, builtin, X)
 				list[#list + 1] = text("Events", nil, nil, "font-scale-title-3")
 				for i = math.max(1, #notices - 9), #notices do list[#list + 1] = text(notices[i].text, notices[i].level) end
 			end
+			return column(list)
+		end
+
+		-- every player: the companies with their players and money, Join / Leave, Create company (docs/COMPANIES.md section 6)
+		local function companiesTab()
+			local list = {}
+			local function put(node) list[#list + 1] = node end
+			local T = texts()
+			local W = T and T.COMPANY
+			local st = U.companies
+			if not (W and st and m and C.ACTIVE) then
+				put(text(W and W.notYet or "Companies open once the session runs in this game."))
+				return column(list)
+			end
+			local v = Hud.companyView(st, W)
+			put(text(v.intro))
+			put(text(v.mine, nil, nil, "font-scale-title-3"))
+			if v.refused then put(text(v.refused, "warn")) end
+			put(gap())
+			if #v.rows == 0 then put(text(W.none)) end
+			-- Pay and Give line (company for each player only, Hud.companyView): Pay on the row of the company that gets the amount; Give
+			-- below, for the line selected in the game, to the company picked there. A button with nothing to send yet is drawn disabled.
+			local amount = Hud.amountOf(amountIn:old())
+			local picked = nil
+			for _, t in ipairs(v.targets or {}) do
+				if t.key == giveIn:old() then picked = t.key end
+			end
+			for _, r in ipairs(v.rows) do
+				local key = r.key
+				local tools = { text(r.title, nil, nil, "font-scale-title-3") }
+				if r.join then tools[#tools + 1] = text("  "); tools[#tools + 1] = button(W.join, function() company({ op = "join", company = key }) end) end
+				if r.leave then tools[#tools + 1] = text("  "); tools[#tools + 1] = button(W.leave, function() company({ op = "leave" }) end, "negative") end
+				if r.remove then tools[#tools + 1] = text("  "); tools[#tools + 1] = button(W.remove, function() company({ op = "remove", company = key }) end, "negative") end
+				put(box(H, tools))
+				put(text("   " .. r.detail))
+				if r.pay then
+					put(box(H, {
+						text("   "),
+						amount and button(W.pay, function()
+							if company({ op = "pay", toCompany = key, amount = amount }) then amountIn:set("") end
+						end) or disabledButton(W.pay),
+					}))
+				end
+			end
+			if v.handOver then
+				put(gap())
+				put(text(W.handOver, nil, nil, "font-scale-title-3"))
+				put(field(W.amountPlaceholder, amountIn:old(), function(x) amountIn:set(x) end))
+				put(text(W.amountNote))
+				put(gap())
+				if v.selected == nil then
+					put(text(v.hint))
+				else
+					put(text(v.selected))
+					if v.owner then put(text(v.owner, "warn")) end
+					if v.give then
+						-- the company picker: one toggle per company that can get the line, then Give
+						local line = v.give
+						local tools = { text(W.giveTo), text("  ") }
+						for _, t in ipairs(v.targets) do
+							local key, chosen = t.key, t.key == picked
+							tools[#tools + 1] = button((chosen and "[ " or "") .. tostring(t.title) .. (chosen and " ]" or ""), function() giveIn:set(chosen and "" or key) end)
+							tools[#tools + 1] = text("  ")
+						end
+						tools[#tools + 1] = picked and button(W.give, function()
+							if company({ op = "give", company = picked, line = line }) then giveIn:set("") end
+						end) or disabledButton(W.give)
+						put(box(H, tools))
+						put(text(W.giveNote))
+					end
+				end
+			end
+			put(gap())
+			put(box(H, {
+				field(W.namePlaceholder, companyIn:old(), function(v) companyIn:set(v) end),
+				text("  "),
+				button(W.create, function()
+					local name = Hud.cleanText(companyIn:old())
+					if name and company({ op = "found", name = name }) then companyIn:set("") end
+				end),
+			}))
 			return column(list)
 		end
 
@@ -582,11 +782,17 @@ local function setup(react, builtin, X)
 				builtin.TabWidgetChild{ localKey = "players", value = "players", indicator = text("Players"), item = playersTab(host) },
 				builtin.TabWidgetChild{ localKey = "chat", value = "chat", indicator = text("Chat"), item = chatTab() },
 			}
+			-- the Companies tab only with a company for each player: with one shared company everyone pays from one account, and companies
+			-- made there grouped nothing a player could use (owner's test of 0.2.10, 2026-10-30)
+			local withCompanies = U.companies and U.companies.mode == "separate"
+			if withCompanies then
+				tabs[#tabs + 1] = builtin.TabWidgetChild{ localKey = "companies", value = "companies", indicator = text((texts() and texts().COMPANY.tab) or "Companies"), item = companiesTab() }
+			end
 			if host then
 				tabs[#tabs + 1] = builtin.TabWidgetChild{ localKey = "host", value = "host", indicator = text("Host"), item = hostTab() }
 			end
 			local current = tab:old()
-			if current == "host" and not host then current = "players" end
+			if (current == "host" and not host) or (current == "companies" and not withCompanies) then current = "players" end
 			add(builtin.TabWidget{ tabs = tabs, value = current, onValueChange = function(v) if v then tab:set(v) end end })
 		end
 		-- the mods: only when something differs from the host's game (a refused join, or the session's warnings)
@@ -616,8 +822,11 @@ local function setup(react, builtin, X)
 		if Hook and Hook.dev then
 			table.insert(rows, 1, button("DEV run", function() Hook.devClick() end))
 		end
+		-- the version this game runs, from the native module's own (ctl_status.txt `update.current`, launcher/src/autoupdate.rs:
+		-- CARGO_PKG_VERSION of the module in memory); none before the module has answered
+		local version = ctl and type(ctl.update) == "table" and type(ctl.update.current) == "string" and ctl.update.current ~= "" and ctl.update.current or nil
 		return builtin.Window{
-			title = "FeverLink3 Multiplayer",
+			title = "FeverLink3 Multiplayer" .. (version and (" " .. version) or ""),
 			id = "window.feverlink3",
 			initialX = 0.3,
 			initialY = 0.22,

@@ -1,6 +1,6 @@
-# Nexus Mods and mod.io listing material (0.2.9)
+# Nexus Mods and mod.io listing material (0.2.10)
 
-Maintainer notes for publishing FeverLink3 0.2.9 on Nexus Mods and mod.io. Rewritten on 2026-10-22 for the release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.9 (it replaces the stale 2026-10-10 connection-test text). **Nothing here has been published or sent to anyone.** This folder is excluded from the project site on purpose.
+Maintainer notes for publishing FeverLink3 0.2.10 on Nexus Mods and mod.io. Rewritten on 2026-10-22 for the release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.10 (it replaces the stale 2026-10-10 connection-test text). **Nothing here has been published or sent to anyone.** This folder is excluded from the project site on purpose.
 
 | File | What it is |
 |---|---|
@@ -47,7 +47,7 @@ Maintainer notes for publishing FeverLink3 0.2.9 on Nexus Mods and mod.io. Rewri
 1. nexusmods.com → **Upload** (Add a mod) → game **Transport Fever 3**.
 2. Paste name, summary, version, category, language from `fields.md`. Tick the AI tag. Adult content: no.
 3. Description: paste `description.bbcode.txt`, open the preview. If a tag shows as text, remove that tag.
-4. **Files tab:** upload `FeverLink3-0.2.9.zip` **unchanged**, exactly as downloaded from the GitHub release (its SHA-256 must match the release's `.sha256`). Category: Main files. Version 0.2.9. File description from `fields.md`. Do not upload `manifest.json` or the `.sha256`.
+4. **Files tab:** upload `FeverLink3-0.2.10.zip` **unchanged**, exactly as downloaded from the GitHub release (its SHA-256 must match the release's `.sha256`). Category: Main files. Version 0.2.10. File description from `fields.md`. Do not upload `manifest.json` or the `.sha256`.
 5. **Images tab** (first image = thumbnail):
    1. `docs/nexus/media/cover-1920x1080.png` (the in-game window and bar icon; 0.4 MB)
    2. `docs/nexus/media/demo-build-480.gif` (the build demo, 480 px wide, 1.6 MB; if Nexus refuses a GIF, use `demo-build-still-1920x1080.png`)

@@ -173,13 +173,17 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                     }
                     CtlMessage::Pace { permille } => assert!((1000..=2000).contains(&permille), "{line:?}"),
                     CtlMessage::SendDone { key, held } => assert!(key != 0 || held != 0, "{line:?}"),
+                    CtlMessage::InterfacePlayer { entity } => {
+                        assert!(entity.is_none_or(|e| e <= i32::MAX as u32), "{line:?}")
+                    }
                     CtlMessage::HoldOff
                     | CtlMessage::TerrainShare { .. }
                     | CtlMessage::Ping { .. }
                     | CtlMessage::PatchNext { .. }
                     | CtlMessage::InjectNext { .. }
                     | CtlMessage::CompleteNext { .. }
-                    | CtlMessage::OwnNext => {}
+                    | CtlMessage::OwnNext
+                    | CtlMessage::Autosave { .. } => {}
                 }
             }
             Err(e) => {
@@ -756,6 +760,8 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 inject_convert: r.gen(),
                 smooth_pace: r.gen(),
                 free_order: r.gen(),
+                interface_player: r.gen(),
+                sync_autosave: r.gen(),
             };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());
