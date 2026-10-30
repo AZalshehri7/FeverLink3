@@ -229,7 +229,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "feverlink3_core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "feverlink3_launcher"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "ed25519-dalek",
  "feverlink3_core",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "feverlink3_native"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "feverlink3_core",
  "feverlink3_launcher",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "feverlink3_release"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "ed25519-dalek",
  "feverlink3_launcher",

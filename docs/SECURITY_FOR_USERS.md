@@ -1,6 +1,6 @@
 # What is in winhttp.dll, and how to check it
 
-For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-10-30 (version 0.2.10). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
+For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-10-30 (version 0.2.11). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
 
 ## The short version
 
@@ -150,8 +150,8 @@ Each release has these files: `FeverLink3-<version>.zip`, `FeverLink3-<version>.
 In PowerShell, in the folder with the downloaded files:
 
 ```powershell
-(Get-FileHash .\FeverLink3-0.2.10.zip -Algorithm SHA256).Hash.ToLower()
-Get-Content .\FeverLink3-0.2.10.zip.sha256
+(Get-FileHash .\FeverLink3-0.2.11.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content .\FeverLink3-0.2.11.zip.sha256
 
 # the DLL you installed against the manifest (your game folder: Steam, right-click Transport Fever 3, Manage, Browse local files)
 $m = Get-Content .\manifest.json -Raw | ConvertFrom-Json

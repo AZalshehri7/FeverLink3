@@ -6,6 +6,14 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.11 (2026-10-30)
+
+### In short
+- The junction lane tool works again in a session.
+
+### Fixed
+- The junction lane tool works again in a session: in 0.2.10 its changes to a junction's lanes were dropped on every game, without a notice. Seen fixed with two game windows on one PC (the lane changes applied on both games, the worlds stayed equal).
+
 ## 0.2.10 (2026-10-30)
 
 Fixes for problems found while playing between two PCs, and the start of companies: one shared company. "Company for each player" is in the code but not offered yet: it shows as a grayed "(upcoming)" button until it has been played between two PCs. Everything marked "seen" was seen with two game windows on one PC unless it says otherwise.

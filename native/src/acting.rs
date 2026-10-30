@@ -186,10 +186,15 @@ fn kept_pieces(text: &str, from: u32) -> (std::collections::HashSet<usize>, std:
 
 /// The text with every owner that is the text's own `context.player` (and `context.player` itself) set to `to`, the carrier command's
 /// player, except the pieces of a segment the text's player owns and the edge objects on them ([`kept_pieces`]). Unchanged (`owners`
-/// 0) when they are the same entity. Refused when the text names no player or `to` is not an existing entity (a carrier without a
-/// player: the build would belong to nobody and cost nobody, never guessed).
+/// 0) when they are the same entity, and when the text names no `context.player` at all: there is no tool player to map, the text
+/// is applied as the originator's engine made it (as before the switch). Owner's real game 2026-10-30, 0.2.10: the junction lane
+/// tool's node-configuration builds name no player; they were refused here and every game applied the script's weaker copy, so
+/// the tool "did not work". Refused when `to` is not an existing entity (a carrier without a player: the build would belong to
+/// nobody and cost nobody, never guessed).
 pub fn remap_owners(text: &str, to: u32) -> Result<(String, Remap), String> {
-    let from = text_player(text).ok_or("acting player: the text names no context.player")?;
+    let Some(from) = text_player(text) else {
+        return Ok((text.to_string(), Remap { from: to, to, owners: 0 }));
+    };
     if to >= 0x8000_0000 {
         return Err(format!("acting player: the carrier command's context.player is {} (no player)", to as i32));
     }
@@ -284,10 +289,13 @@ mod tests {
     }
 
     #[test]
-    fn the_same_player_leaves_the_text_byte_for_byte_and_a_missing_player_is_refused() {
+    fn the_same_player_and_a_text_without_a_player_leave_the_text_byte_for_byte() {
         let (out, r) = remap_owners(TEXT, 64976).unwrap();
         assert_eq!((out.as_str(), r.owners), (TEXT, 0), "a shared-company session: nothing changes");
-        assert!(remap_owners("toAdd[0].playerEntity\tent:old#1\n", 2).unwrap_err().contains("no context.player"));
+        // the junction lane tool's node configurations name no player (owner's game 2026-10-30): applied as made, not refused
+        let nodecfg = "proposal.nodeConfigsToAdd.#\tn:1\nproposal.nodeConfigsToAdd[0].entity\tent:old#39106\n";
+        let (out, r) = remap_owners(nodecfg, 2).unwrap();
+        assert_eq!((out.as_str(), r.owners), (nodecfg, 0));
         assert!(
             remap_owners(TEXT, u32::MAX).unwrap_err().contains("-1"),
             "a carrier without a player is never guessed"

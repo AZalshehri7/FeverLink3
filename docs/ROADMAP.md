@@ -29,6 +29,8 @@ Not yet seen in the real game at that time: joining from a Steam invite by itsel
 
 **0.2.9 (2026-10-27): other mods' tools and big builds.** A build another mod's tool or window sends (the bus bay upgrade, the crossing window) is applied at the same moment on every game; big builds such as 3-track stations travel in parts, up to 3 MB (before, anything over about 480 KB was refused; one Steam message carries at most 512 KB); the update check runs when a host with a newer FeverLink3 refuses you. Seen with two games on one PC (builds of 620 KB and 1.23 MB); big builds in parts over Steam between two PCs not seen yet.
 
+**0.2.11 (2026-10-30): the junction lane tool works again in a session.**
+
 **0.2.10 (2026-10-30): one shared company and fixes from play between two PCs.** The host starts with "One shared company"; "Company for each player" shows as upcoming. A bus stop on another mod's road (bus and truck bay roads) is shared; the window title shows the version. Seen with two games on one PC, not yet between two PCs.
 
 ## Next

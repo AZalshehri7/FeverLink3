@@ -4,7 +4,7 @@ title: FeverLink3 status
 
 # Status
 
-Last updated 2026-10-30, version 0.2.10. [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
+Last updated 2026-10-30, version 0.2.11. [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
 
 This page keeps three things apart: what has been seen working in the real game, what has only been tested automatically, and the known gaps.
 

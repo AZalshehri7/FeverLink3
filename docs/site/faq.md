@@ -4,7 +4,7 @@ title: FeverLink3 FAQ
 
 # Frequently asked questions
 
-Last updated 2026-10-30, for version 0.2.10. [Back to the start page](../index.html)
+Last updated 2026-10-30, for version 0.2.11. [Back to the start page](../index.html)
 
 ## The project
 

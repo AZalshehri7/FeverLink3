@@ -1,6 +1,6 @@
-# Nexus Mods page: the form fields (0.2.10)
+# Nexus Mods page: the form fields (0.2.11)
 
-Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-30, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.10.
+Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-30, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.11.
 
 ## Name
 
@@ -21,7 +21,7 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 ## Version
 
 ```
-0.2.10
+0.2.11
 ```
 
 ## Category, tags, flags
@@ -33,13 +33,13 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 
 ## Main file
 
-- Upload: `FeverLink3-0.2.10.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.10.zip.sha256` on the release page.
-- Name on Nexus: `FeverLink3 0.2.10`
-- Category: Main files. Version: 0.2.10.
+- Upload: `FeverLink3-0.2.11.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.11.zip.sha256` on the release page.
+- Name on Nexus: `FeverLink3 0.2.11`
+- Category: Main files. Version: 0.2.11.
 - File description (under 255 characters):
 
 ```
-Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.10. Updates itself (can be turned off).
+Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.11. Updates itself (can be turned off).
 ```
 
 (200 characters.)
@@ -88,7 +88,7 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Changelog tab
 
 ```
-0.2.10
+0.2.11
 - New: the games autosave together (one short stop for everyone). The host starts with "One shared company" (everyone pays from one account, as before); "Company for each player" (own money) is upcoming and shows grayed.
 - Bus stops on roads from other mods (bus and truck bay roads) are shared.
 - A street that splits roads you just built no longer shows as failed and then "built after all".
@@ -151,7 +151,7 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Pinned post (known issues and how to report)
 
 ```
-Known issues in 0.2.10
+Known issues in 0.2.11
 - Between two PCs a game stood still for about 3-4 s at each autosave and the other game waited. Until this is fixed, set the autosave to 10 minutes or more.
 - Trees, plants and rocks are shared since 0.2.8, new and seen only with two game windows on one PC so far: tell us if the trees look different for someone.
 - Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.
