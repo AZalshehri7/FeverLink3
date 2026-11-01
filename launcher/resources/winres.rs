@@ -1,5 +1,5 @@
-//! The Win32 resources of `feverlink3.exe`: icon, version information and application manifest, written as a
-//! `.res` file in pure Rust.
+//! The Win32 resources of `feverlink3.exe` (icon, version information and application manifest) and of the native
+//! module `winhttp.dll` (version information only), written as a `.res` file in pure Rust.
 //!
 //! Why not `rc.exe`: it belongs to the Windows SDK, and a release must build from nothing but Rust and the MSVC
 //! tools. `link.exe` takes a `.res` file as it is and turns it into an object with `cvtres.exe`, which ships with the
@@ -7,8 +7,8 @@
 //! record, then one record per resource (sizes, a type and a name that are ordinals here, language, data), every
 //! record padded to a multiple of four bytes.
 //!
-//! This file is shared: `build.rs` includes it to write the resources, and `main.rs` includes it in test builds so
-//! that its tests run under `cargo test`. Each user needs only part of it, hence the `allow`.
+//! This file is shared: `build.rs` (and `native/build.rs`) include it to write the resources, and `main.rs` includes
+//! it in test builds so that its tests run under `cargo test`. Each user needs only part of it, hence the `allow`.
 
 #![allow(dead_code)]
 
@@ -28,6 +28,8 @@ pub struct VersionInfo {
     pub version: [u16; 4],
     /// A pre-release carries the `VS_FF_PRERELEASE` flag, which the file properties show.
     pub prerelease: bool,
+    /// A DLL (`VFT_DLL`) rather than a program (`VFT_APP`).
+    pub dll: bool,
     /// The string table: `(name, text)`, for example `("ProductName", "FeverLink3")`.
     pub strings: Vec<(String, String)>,
 }
@@ -193,7 +195,7 @@ fn version_data(info: &VersionInfo) -> Result<Vec<u8>, String> {
     put32(&mut fixed, 0x3F); // flags mask
     put32(&mut fixed, if info.prerelease { 0x2 } else { 0 }); // VS_FF_PRERELEASE
     put32(&mut fixed, 0x0004_0004); // VOS_NT_WINDOWS32
-    put32(&mut fixed, 1); // VFT_APP
+    put32(&mut fixed, if info.dll { 2 } else { 1 }); // VFT_DLL / VFT_APP
     put32(&mut fixed, 0); // subtype
     put32(&mut fixed, 0); // date
     put32(&mut fixed, 0);
@@ -217,6 +219,14 @@ pub fn resource_file(ico: Option<&[u8]>, version: &VersionInfo, manifest: &str) 
     }
     record(&mut out, RT_VERSION, 1, &version_data(version)?)?;
     record(&mut out, RT_MANIFEST, MANIFEST_ID, manifest.as_bytes())?;
+    Ok(out)
+}
+
+/// A `.res` file with the version information alone: the native module, a DLL, has no icon, and a manifest under id 1
+/// is a program's (a DLL's would go under id 2; it needs none).
+pub fn version_file(version: &VersionInfo) -> Result<Vec<u8>, String> {
+    let mut out = empty_record();
+    record(&mut out, RT_VERSION, 1, &version_data(version)?)?;
     Ok(out)
 }
 
@@ -306,6 +316,7 @@ mod tests {
         VersionInfo {
             version: [1, 2, 3, 0],
             prerelease: false,
+            dll: false,
             strings: vec![
                 ("ProductName".into(), "FeverLink3".into()),
                 ("FileDescription".into(), "FeverLink3 launcher".into()),
@@ -439,6 +450,15 @@ mod tests {
         let records = read_records(&resource_file(None, &pre, "m").unwrap());
         let (root, _) = read_node(&records[0].data, 0);
         assert_eq!(u32_at(&root.value, 28), Some(0x2));
+    }
+
+    #[test]
+    fn a_dll_gets_the_version_information_alone_with_its_file_type() {
+        let dll = VersionInfo { dll: true, ..info() };
+        let records = read_records(&version_file(&dll).unwrap());
+        assert_eq!(records.iter().map(|r| (r.kind, r.name)).collect::<Vec<_>>(), [(RT_VERSION, 1)]);
+        let (root, _) = read_node(&records[0].data, 0);
+        assert_eq!(u32_at(&root.value, 36), Some(2), "VFT_DLL");
     }
 
     #[test]

@@ -60,6 +60,15 @@ pub fn is_report_file(name: &str) -> bool {
         || generation("native_events")
         || ["session.log", crate::live::STATUS_FILE, WORLD_MODS_FILE].contains(&name)
         || (name.starts_with("detail_s") && name.ends_with(".txt"))
+        || is_proving_text(name)
+}
+
+/// The text of a held command whose engine proof was running when the game stopped (`native_proving_<id>.txt`, native
+/// runtime/inject.rs): the native module removes it when the proof returns, so one that is left names the build that crashed.
+fn is_proving_text(name: &str) -> bool {
+    name.strip_prefix("native_proving_")
+        .and_then(|r| r.strip_suffix(".txt"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Where one game's logs are: its live folder (`%LOCALAPPDATA%\FeverLink3\<live>`; `native.log` and the id-order trace are in
@@ -165,6 +174,13 @@ fn take_live(files: &mut Vec<Entry>, notes: &mut Vec<String>, dir: &Path, prefix
     for path in details.iter().take(DETAIL_FILES) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         take(files, notes, format!("{prefix}{name}"), path, DETAIL_TAIL);
+    }
+    // a build text whose engine proof the game did not survive (there is at most one: the proof runs one hold at a time)
+    for path in fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if path.is_file() && is_proving_text(&name) && (!fresh || recent(&path, now)) {
+            take(files, notes, format!("{prefix}{name}"), &path, DETAIL_TAIL);
+        }
     }
 }
 
@@ -776,6 +792,8 @@ mod tests {
         fs::write(live.join("session.log"), "checksum 4 differs in lane:towns\n").unwrap();
         fs::write(live.join("world_mods.txt"), "mods active in this world (save 'w'): 1: feverlink3\n").unwrap();
         fs::write(live.join("detail_s3_100_1.txt"), "names\tstations|x\n").unwrap();
+        fs::write(live.join("native_proving_80.txt"), "=== portable v1 ===\n").unwrap();
+        fs::write(live.join("native_proving_x.txt"), "not a hold's text\n").unwrap();
         fs::write(local.join("native.log"), "native\n").unwrap();
         fs::write(local.join("idorder_live2.log"), "x".repeat(100)).unwrap();
         fs::write(local.join("idorder_live1.log"), "another game's trace").unwrap();
@@ -797,6 +815,7 @@ mod tests {
                 "session.log",
                 "world_mods.txt",
                 "detail_s3_100_1.txt",
+                "native_proving_80.txt",
                 "native.log",
                 "idorder_live2.log",
                 "crash_dump-error.json",
@@ -819,7 +838,7 @@ mod tests {
         assert_eq!(r#"{"userId": "%STEAMACCOUNT%", "message": "boom"}"#, got["crash_dump-error.json"]);
         assert_eq!(tag, got[SELF_TAG_FILE]);
         assert!(got[REPORT_FILE].starts_with("role: player\n  #2 %PLAYER2% (Connected"), "{}", got[REPORT_FILE]);
-        assert_eq!(10, contents.len());
+        assert_eq!(11, contents.len());
         assert!(!got.keys().any(|n| n.ends_with(".dmp") || n.ends_with(".sav")));
     }
 

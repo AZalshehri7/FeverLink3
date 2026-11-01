@@ -77,6 +77,9 @@ pub const OFFICIAL_BUILD: bool = match option_env!("FEVERLINK3_OFFICIAL_BUILD") 
 
 /// The only address asked for a release.
 pub const API_LATEST: &str = "https://api.github.com/repos/AZalshehri7/FeverLink3/releases/latest";
+/// The newest releases, pre-releases included: asked instead of [`API_LATEST`] when the player turned pre-release
+/// updates on (the window's second switch); the same checks apply to what it brings.
+pub const API_RELEASES: &str = "https://api.github.com/repos/AZalshehri7/FeverLink3/releases?per_page=20";
 
 /// Every file of a release must come from below this address followed by the release's tag.
 pub const DOWNLOAD_PREFIX: &str = "https://github.com/AZalshehri7/FeverLink3/releases/download/";
@@ -365,6 +368,8 @@ fn refused(plain: &str, detail: impl std::fmt::Display) -> Refused {
 /// real version (file names), the keys and the clock.
 pub struct Check<'a> {
     pub compare_with: &'a str,
+    /// Pre-releases count too (the player's setting): the newest release of [`API_RELEASES`] that is newer.
+    pub pre: bool,
     pub running: &'a str,
     pub keys: &'a [TrustedKey],
     pub now_unix: i64,
@@ -373,22 +378,25 @@ pub struct Check<'a> {
 /// Asks GitHub for the newest full release; when it is newer, downloads, checks (the trust model of this module's
 /// documentation), stages it in `feverlink3_update\<version>\` and puts the new DLL in place. `downloading` is called
 /// with the version once the download starts; `may_touch_files` is asked right before the DLL is swapped (false while
-/// a session runs: the swap waits). Returns the staged version, `None` when there is nothing newer.
+/// a session runs: the swap waits, and `waiting` is called once with the version, so the window no longer says
+/// "Downloading" for a download that is done; 0.2.12 two-PC test). Returns the staged version, `None` when there is
+/// nothing newer.
 pub fn stage_update(
     paths: &Paths,
     fetch: &dyn Fetch,
     check: &Check,
     downloading: &mut dyn FnMut(&str),
+    waiting: &mut dyn FnMut(&str),
     may_touch_files: &dyn Fn() -> bool,
 ) -> Result<Option<String>, Refused> {
     const NET: &str = "GitHub could not be reached";
     // short: the window's line is "Update to <version> failed: <this>. You keep <current>."
     const BAD: &str = "the download did not match the release";
-    let json = fetch.get(API_LATEST, MAX_JSON).map_err(|e| refused(NET, e))?;
+    let json = fetch.get(if check.pre { API_RELEASES } else { API_LATEST }, MAX_JSON).map_err(|e| refused(NET, e))?;
     let json = String::from_utf8(json).map_err(|e| refused(NET, e))?;
-    let release = match update::check_update(check.compare_with, &json, false) {
-        Ok(Decision::UpToDate) => return Ok(None),
-        Ok(Decision::Available(r)) => *r,
+    let release = match newest_release(check.compare_with, &json, check.pre) {
+        Ok(None) => return Ok(None),
+        Ok(Some(r)) => r,
         Err(e) => return Err(refused("the newest release could not be read", e)),
     };
     let to = version_text(&release);
@@ -433,6 +441,9 @@ pub fn stage_update(
     })?;
 
     // the files are checked and staged; the DLL is swapped only outside a session
+    if !may_touch_files() {
+        waiting(&to);
+    }
     while !may_touch_files() {
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -471,6 +482,29 @@ fn swap_dll(paths: &Paths, running: &str, staged_dll: &Path) -> Result<(), Strin
 }
 
 /// The version as the manifest and the folder names write it: the tag without its `v`.
+/// The release to install from GitHub's answer: [`API_LATEST`]'s one release, or with `pre` the newest of
+/// [`API_RELEASES`]' list that is newer (a full release or a pre-release; a draft never). A list entry the updater
+/// cannot read is skipped, so one odd release does not stop the others; `None` when nothing is newer.
+fn newest_release(compare_with: &str, json: &str, pre: bool) -> Result<Option<update::Release>, String> {
+    if !pre {
+        return match update::check_update(compare_with, json, false) {
+            Ok(Decision::UpToDate) => Ok(None),
+            Ok(Decision::Available(r)) => Ok(Some(*r)),
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    let list: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let mut best: Option<update::Release> = None;
+    for obj in &list {
+        if let Ok(Decision::Available(r)) = update::check_update(compare_with, &obj.to_string(), true) {
+            if best.as_ref().is_none_or(|b| r.version > b.version) {
+                best = Some(*r);
+            }
+        }
+    }
+    Ok(best)
+}
+
 fn version_text(release: &update::Release) -> String {
     release.tag.strip_prefix('v').unwrap_or(&release.tag).to_owned()
 }
@@ -479,16 +513,44 @@ fn version_text(release: &update::Release) -> String {
 
 /// Whether the player left automatic updates on (the default). `settings.txt`, one `key=value` per line.
 pub fn read_enabled(settings: &Path) -> bool {
-    let text = fs::read_to_string(settings).unwrap_or_default();
-    !text.lines().any(|l| l.trim().eq_ignore_ascii_case("autoupdate=off"))
+    read_flag(settings, "autoupdate").unwrap_or(true)
 }
 
 /// Writes the setting, keeping the file's other lines.
 pub fn write_enabled(settings: &Path, on: bool) -> Result<(), String> {
+    write_flag(settings, "autoupdate", on)
+}
+
+/// Whether the player turned pre-release updates on (off by default): `prerelease=on` in `settings.txt`.
+pub fn read_prerelease(settings: &Path) -> bool {
+    read_flag(settings, "prerelease").unwrap_or(false)
+}
+
+pub fn write_prerelease(settings: &Path, on: bool) -> Result<(), String> {
+    write_flag(settings, "prerelease", on)
+}
+
+/// `key=on` / `key=off` of `settings.txt` (the last line wins), `None` when the key is absent.
+fn read_flag(settings: &Path, key: &str) -> Option<bool> {
     let text = fs::read_to_string(settings).unwrap_or_default();
-    let mut lines: Vec<&str> =
-        text.lines().filter(|l| !l.trim().to_ascii_lowercase().starts_with("autoupdate=")).collect();
-    lines.push(if on { "autoupdate=on" } else { "autoupdate=off" });
+    let mut found = None;
+    for line in text.lines() {
+        if let Some((k, v)) = line.trim().split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                found = Some(!v.trim().eq_ignore_ascii_case("off"));
+            }
+        }
+    }
+    found
+}
+
+/// Writes `key=on|off`, keeping the file's other lines.
+fn write_flag(settings: &Path, key: &str, on: bool) -> Result<(), String> {
+    let text = fs::read_to_string(settings).unwrap_or_default();
+    let prefix = format!("{key}=");
+    let mut lines: Vec<String> =
+        text.lines().filter(|l| !l.trim().to_ascii_lowercase().starts_with(&prefix)).map(str::to_owned).collect();
+    lines.push(format!("{key}={}", if on { "on" } else { "off" }));
     if let Some(parent) = settings.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -512,7 +574,7 @@ pub fn pretend_version(game: &Path) -> Option<String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Status {
     /// "" (nothing to say), "checking" (asked by [`check_now`]), "behind" (the host is newer and no update comes:
-    /// download it by hand), "downloading", "ready" (restart to finish), "updated" (this start is the new version),
+    /// download it by hand), "downloading", "waiting" (downloaded, put in place when the session ends), "ready" (restart to finish), "updated" (this start is the new version),
     /// "failed".
     pub state: String,
     /// The new version.
@@ -525,6 +587,8 @@ pub struct Status {
     pub restart: bool,
     /// The player's setting.
     pub auto: bool,
+    /// The player's setting: pre-releases count too (off by default).
+    pub pre: bool,
     /// False in a module not built by the release workflow (a developer's): it never updates itself.
     pub official: bool,
 }
@@ -634,16 +698,27 @@ pub fn set_enabled(on: bool) -> Result<String, String> {
     Ok(if on { "automatic updates are on" } else { "automatic updates are off" }.to_owned())
 }
 
+/// The window's second switch: pre-release updates. Read at each check, so it counts from the next check.
+pub fn set_prerelease(on: bool) -> Result<String, String> {
+    let path = SETTINGS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let path = path.ok_or("automatic updates run only inside the game")?;
+    write_prerelease(&path, on)?;
+    set_status(|s| s.pre = on);
+    Ok(if on { "pre-release updates are on" } else { "pre-release updates are off" }.to_owned())
+}
+
 /// The game-side entry: [`at_start`] now (called from `DllMain`), then the check on a thread of its own. `game`: the
 /// folder of `TransportFever3.exe`; `settings`: the [`SETTINGS_FILE`]; `log`: a line for `native.log`.
 pub fn start(game: PathBuf, settings: PathBuf, log: fn(&str)) {
     let paths = Paths::new(&game);
     let enabled = read_enabled(&settings);
+    let pre = read_prerelease(&settings);
     *SETTINGS.lock().unwrap_or_else(|p| p.into_inner()) = Some(settings);
     let begun = at_start(&paths, VERSION);
     log(&format!("update: at start {begun:?} (official build {OFFICIAL_BUILD}, automatic updates {enabled})"));
     set_status(|s| {
         s.auto = enabled;
+        s.pre = pre;
         s.official = OFFICIAL_BUILD;
         s.current = VERSION.into();
         match &begun {
@@ -716,17 +791,27 @@ fn check_once(
     while SESSION_BUSY.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(5));
     }
-    let check = Check { compare_with, running: VERSION, keys: update::TRUSTED_KEYS, now_unix: update::now_unix() };
+    // the pre-release switch is read now: a change in the window counts from the next check
+    let settings = SETTINGS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let pre = settings.as_deref().is_some_and(read_prerelease);
+    let check = Check { compare_with, pre, running: VERSION, keys: update::TRUSTED_KEYS, now_unix: update::now_unix() };
     let fetch = InProcess;
     let mut downloading = |v: &str| {
-        log(&format!("update: downloading {v} (compared with {compare_with})"));
+        log(&format!("update: downloading {v} (compared with {compare_with}, pre-releases {pre})"));
         set_status(|s| {
             s.state = "downloading".into();
             s.version = v.into();
         });
     };
+    let mut waiting = |v: &str| {
+        log(&format!("update: {v} downloaded and checked; it is put in place when the session ends"));
+        set_status(|s| {
+            s.state = "waiting".into();
+            s.version = v.into();
+        });
+    };
     let idle = || !SESSION_BUSY.load(Ordering::Relaxed);
-    let result = stage_update(paths, &fetch, &check, &mut downloading, &idle);
+    let result = stage_update(paths, &fetch, &check, &mut downloading, &mut waiting, &idle);
     let _ = fs::remove_dir_all(paths.downloads());
     paths.remove_dir_if_empty();
     // a check asked by check_now that brings nothing: the window says to download it by hand
@@ -757,7 +842,7 @@ fn check_once(
             log(&format!("update: refused or failed: {} ({})", r.plain, r.detail));
             set_status(|s| {
                 // a failed check before any download says nothing: the player loses nothing
-                if s.state == "downloading" {
+                if s.state == "downloading" || s.state == "waiting" {
                     s.state = "failed".into();
                     s.reason = r.plain;
                 }
@@ -884,10 +969,10 @@ mod tests {
     }
 
     const OLD: &str = "0.2.0";
-    const UNSIGNED: Check = Check { compare_with: OLD, running: OLD, keys: &[], now_unix: 1_792_411_200 };
+    const UNSIGNED: Check = Check { compare_with: OLD, pre: false, running: OLD, keys: &[], now_unix: 1_792_411_200 };
 
     fn stage(p: &Paths, gh: &FakeGitHub, check: &Check) -> Result<Option<String>, Refused> {
-        stage_update(p, gh, check, &mut |_| {}, &|| true)
+        stage_update(p, gh, check, &mut |_| {}, &mut |_| {}, &|| true)
     }
 
     fn untouched(p: &Paths) {
@@ -1111,10 +1196,47 @@ mod tests {
         };
         let gh = github("0.2.1", NEW, None, |_| {});
         let mut seen = String::new();
-        let r = stage_update(&p, &gh, &UNSIGNED, &mut |v| seen = v.to_owned(), &busy_twice);
+        let mut waited = Vec::new();
+        let r = stage_update(
+            &p,
+            &gh,
+            &UNSIGNED,
+            &mut |v| seen = v.to_owned(),
+            &mut |v| waited.push(v.to_owned()),
+            &busy_twice,
+        );
         assert_eq!(r, Ok(Some("0.2.1".into())));
         assert_eq!(seen, "0.2.1");
+        assert_eq!(waited, ["0.2.1"], "the window says the download is done and waits, once");
         assert_eq!(asked.get(), 3);
+    }
+
+    #[test]
+    fn a_pre_release_is_taken_only_when_the_player_asked_for_them() {
+        let (_t, p) = game();
+        let mut gh = github("0.2.1-beta.1", NEW, None, |_| {});
+        let one =
+            String::from_utf8(gh.0[API_LATEST].clone()).unwrap().replace("\"prerelease\":false", "\"prerelease\":true");
+        // GitHub's latest is the newest FULL release; a pre-release only shows in the list
+        gh.0.insert(API_LATEST.into(), one.clone().into_bytes());
+        gh.0.insert(API_RELEASES.into(), format!("[{one}]").into_bytes());
+        assert_eq!(stage(&p, &gh, &UNSIGNED), Ok(None), "off (the default): a pre-release is not installed");
+        let pre = Check { pre: true, ..UNSIGNED };
+        assert_eq!(stage(&p, &gh, &pre), Ok(Some("0.2.1-beta.1".into())));
+    }
+
+    #[test]
+    fn the_pre_release_setting_defaults_to_off_and_keeps_the_other_switch() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("FeverLink3").join(SETTINGS_FILE);
+        assert!(!read_prerelease(&f));
+        write_enabled(&f, false).unwrap();
+        write_prerelease(&f, true).unwrap();
+        assert!(read_prerelease(&f));
+        assert!(!read_enabled(&f), "one switch does not touch the other");
+        write_prerelease(&f, false).unwrap();
+        assert!(!read_prerelease(&f));
+        assert!(!read_enabled(&f));
     }
 
     #[test]

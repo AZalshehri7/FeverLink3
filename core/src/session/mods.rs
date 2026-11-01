@@ -292,6 +292,13 @@ fn update_advice(host: &str, mine: &str) -> &'static str {
     }
 }
 
+/// FeverLink3's own mod in a mod list (its folder `feverlink3`, a Hub copy `feverlink3_<n>`).
+fn is_feverlink3_mod(id: &str) -> bool {
+    let id = id.rsplit(['/', '\\']).next().unwrap_or(id);
+    id == "feverlink3"
+        || id.strip_prefix("feverlink3_").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
 fn shown(s: &str) -> &str {
     if s.is_empty() {
         "unknown"
@@ -321,12 +328,20 @@ pub fn diff(host: &ModFingerprint, mine: &ModFingerprint) -> Vec<ModDifference> 
     if host.searched != mine.searched {
         add(true, super::notices::searched_differ(&host.searched, &mine.searched));
     }
+    // Another FeverLink3 version also means another native module and other files of FeverLink3's own mod: one line, the
+    // version's, with who has to update (0.2.12 two-PC test: a player one version behind read "2 mods differ").
+    let other_version =
+        !host.feverlink3.is_empty() && !mine.feverlink3.is_empty() && host.feverlink3 != mine.feverlink3;
+    let own_mod = |id: &str| other_version && is_feverlink3_mod(id);
     let builds = [
         ("the game", &host.game, &mine.game),
         ("FeverLink3", &host.feverlink3, &mine.feverlink3),
         ("the FeverLink3 module (winhttp.dll)", &host.native, &mine.native),
     ];
     for (what, h, m) in builds {
+        if other_version && what == "the FeverLink3 module (winhttp.dll)" {
+            continue;
+        }
         if !h.is_empty() && !m.is_empty() && h != m {
             // FeverLink3 itself: say who has to update (the module updates itself at the next game start)
             let advice = if what == "FeverLink3" { update_advice(h, m) } else { "" };
@@ -334,7 +349,7 @@ pub fn diff(host: &ModFingerprint, mine: &ModFingerprint) -> Vec<ModDifference> 
         }
     }
     let own: BTreeMap<&str, &ModEntry> = mine.mods.iter().map(|e| (e.id.as_str(), e)).collect();
-    for h in &host.mods {
+    for h in host.mods.iter().filter(|h| !own_mod(&h.id)) {
         let note = if h.cosmetic { " (cosmetic: warning only)" } else { "" };
         match own.get(h.id.as_str()) {
             None => add(!h.cosmetic, format!("missing {} (host has revision {}){note}", h.id, h.revision)),
@@ -356,7 +371,8 @@ pub fn diff(host: &ModFingerprint, mine: &ModFingerprint) -> Vec<ModDifference> 
     }
     // the player's other installed mods, in one line: the host's world does not load them
     let theirs: BTreeMap<&str, ()> = host.mods.iter().map(|e| (e.id.as_str(), ())).collect();
-    let extra: Vec<&str> = mine.mods.iter().map(|m| m.id.as_str()).filter(|id| !theirs.contains_key(id)).collect();
+    let extra: Vec<&str> =
+        mine.mods.iter().map(|m| m.id.as_str()).filter(|id| !theirs.contains_key(id) && !own_mod(id)).collect();
     // (a host that names no mods refused over its builds only)
     if !extra.is_empty() && !host.mods.is_empty() {
         let more = if extra.len() > 5 { format!(" and {} more", extra.len() - 5) } else { String::new() };

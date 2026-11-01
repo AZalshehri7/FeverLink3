@@ -1197,14 +1197,19 @@ fn vectors_sane(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The command the script sent must be a `build_proposal` with sane vectors, carry the text's number of edge objects and at least its
-/// `constructions` constructions (the receiver's own conversion of them; more when the conversion adds the town buildings the build moves).
+/// The command the script sent must be a `build_proposal` with sane vectors and carry at least the text's edge objects and its
+/// `constructions` constructions (the receiver's own conversion of them; more when the conversion adds what the engine adds around the
+/// build: the town buildings it moves, the objects of a level crossing).
 pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_objects: u64) -> Result<(), String> {
     let bytes = is_proposal(mem, dest)?;
     let tri = |off: usize| (u64_at(&bytes, off), u64_at(&bytes, off + 8), u64_at(&bytes, off + 16));
     let to_add = tri(TO_ADD);
     let objects = tri(EDGE_OBJECTS_TO_ADD);
-    // the edge objects are the receiver's own conversion as well (see DONOR_MEMBERS): the command carries the text's number of them
+    // the edge objects are the receiver's own conversion as well (see DONOR_MEMBERS): the command carries at least the text's. More is
+    // the conversion's own addition (0.2.12 session: a road over two rail tracks, whose conversion adds 2 edge objects the road tool's
+    // command does not have, was refused on every game, "the command has 2 edge object(s), the text has 0"); the proof takes from the
+    // conversion only what the text adds and swaps the whole Proposal in, so the extras are never applied, on any game alike, as the
+    // tool's own command has none (the rule of the town buildings a station moves, `build_proved`)
     let count = |v: (u64, u64, u64), stride: usize| v.1.saturating_sub(v.0) / stride as u64;
     let have_objects = count(objects, EDGE_OBJECT_STRIDE);
     let have = count(to_add, CONSTRUCTION_STRIDE);
@@ -1220,7 +1225,7 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_ob
             count(tri(TO_REMOVE), 4)
         )
     };
-    if have_objects != edge_objects {
+    if have_objects < edge_objects {
         return Err(format!("the command has {have_objects} edge object(s), the text has {edge_objects}{}", shape()));
     }
     // More constructions than the text's do not tell the mod's command from another: the script's conversion adds the town buildings
@@ -2430,7 +2435,8 @@ mod tests {
         dest.bytes_mut()[0x130..0x138].copy_from_slice(&(b + 0x1a0).to_le_bytes());
         dest.bytes_mut()[0x138..0x140].copy_from_slice(&(b + 0x1a0).to_le_bytes());
         assert!(check_destination(&mem, dest.addr(), 0, 1).is_ok());
-        assert!(check_destination(&mem, dest.addr(), 0, 0).unwrap_err().contains("1 edge object(s), the text has 0"));
+        // more than the text's: the conversion's own (a level crossing's objects for a road over rails), not a reason to refuse
+        assert!(check_destination(&mem, dest.addr(), 0, 0).is_ok());
     }
 
     #[test]

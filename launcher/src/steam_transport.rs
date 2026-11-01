@@ -268,7 +268,11 @@ impl Owner for HostShared {
                 self.core.close(handle);
             }
             Some(link) => {
-                if self.tx.send(NetEvent::Opened { conn: link.conn, peer: None }).is_err() {
+                if self
+                    .tx
+                    .send(NetEvent::Opened { conn: link.conn, peer: None, account: remote.filter(|&a| a != 0) })
+                    .is_err()
+                {
                     link.close(&self.core, "session ended");
                 }
             }
@@ -546,7 +550,7 @@ impl Owner for ClientShared {
             return;
         }
         // the session hears about the connection before the caller of connect() does: `Opened` is its first event
-        if self.tx.send(NetEvent::Opened { conn: self.conn, peer: None }).is_err() {
+        if self.tx.send(NetEvent::Opened { conn: self.conn, peer: None, account: None }).is_err() {
             state.phase = Phase::Failed("session ended".into());
             self.core.close(handle);
         } else {
@@ -1099,8 +1103,8 @@ mod tests {
     fn pair() -> (Host, Guest) {
         let host = host();
         let guest = guest_of(&host, 7);
-        assert!(matches!(next(&guest.rx), NetEvent::Opened { conn: 7, peer: None }));
-        assert!(matches!(next(&host.rx), NetEvent::Opened { conn: 1, peer: None }));
+        assert!(matches!(next(&guest.rx), NetEvent::Opened { conn: 7, peer: None, account: None }));
+        assert!(matches!(next(&host.rx), NetEvent::Opened { conn: 1, peer: None, account: Some(_) }));
         (host, guest)
     }
 
@@ -1394,7 +1398,7 @@ mod tests {
         let mut opened = Vec::new();
         for _ in 0..8 {
             match next(&host.rx) {
-                NetEvent::Opened { conn, peer: None } => opened.push(conn),
+                NetEvent::Opened { conn, peer: None, .. } => opened.push(conn),
                 other => panic!("{other:?}"),
             }
         }

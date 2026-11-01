@@ -55,11 +55,32 @@ impl InputOut {
         }
         Ok(())
     }
+
+    /// Removes the file of hold `id`, if there is one.
+    pub fn remove(&self, id: u64) {
+        if let Some(dir) = self.dir.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            let _ = fs::remove_file(dir.join(self.name(id)));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_removed_text_is_gone_and_a_missing_one_is_no_error() {
+        let dir = std::env::temp_dir().join(format!("fl3-input-rm-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let o = InputOut::with_prefix("native_proving_");
+        o.set_dir(&dir);
+        o.write(5, "text").unwrap();
+        assert!(dir.join("native_proving_5.txt").exists());
+        o.remove(5);
+        o.remove(5);
+        assert!(!dir.join("native_proving_5.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_text_is_written_whole_and_old_ones_go() {

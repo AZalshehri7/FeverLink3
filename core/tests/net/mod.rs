@@ -148,6 +148,16 @@ impl Net {
     }
 
     pub fn attach(&mut self, session: PlayerSession) -> ConnectionId {
+        self.attach_from(session, None)
+    }
+
+    /// A fresh player (no resume claim) whose connection the transport authenticated as `account` (`None`: TCP).
+    pub fn connect_from(&mut self, name: &str, account: Option<u64>) -> ConnectionId {
+        let session = PlayerSession::with_clock(self.key.clone(), name, "0.1", Box::new(self.clock()));
+        self.attach_from(session, account)
+    }
+
+    pub fn attach_from(&mut self, session: PlayerSession, account: Option<u64>) -> ConnectionId {
         self.next_connection += 1;
         let c = self.next_connection;
         let peer = Peer {
@@ -161,7 +171,7 @@ impl Net {
         };
         self.peers.insert(c, peer);
         self.reachable.insert(c);
-        let outs = self.host.connection_opened(c);
+        let outs = self.host.connection_opened_from(c, account);
         self.pump_host(outs);
         c
     }

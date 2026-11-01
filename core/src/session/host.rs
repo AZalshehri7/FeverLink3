@@ -14,7 +14,8 @@ use super::messages::{
     codec, ActionMessage, ActionRefusedMessage, BuildCommitMessage, BuildVetoMessage, ChallengeMessage, ChatMessage,
     ChecksumReportMessage, ChecksumRequestMessage, ClockMessage, HelloMessage, Hops, JoinMessage, PeerClockMessage,
     Permissions, PingMessage, PlayerInfo, PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage,
-    ReplayFailedMessage, ResumeClaim, ResumeGrant, SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
+    ReplayFailedMessage, ResumeClaim, ResumeGrant, ResyncSaveMessage, SaveDoneMessage, SessionState,
+    SpeedRequestMessage, WelcomeMessage,
 };
 use super::mods::{ModFingerprint, ModTags};
 use super::names::Names;
@@ -23,7 +24,7 @@ use super::parts::{self, Reassembly};
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
 use super::report::{HostReportEvent, ReportRound};
 use super::resume::{Missed, Outbox};
-use super::resync::ResyncState;
+use super::resync::{ResyncLimits, ResyncState};
 use super::roster::{ConnectionState, RosterEntry};
 use super::verdict::VerdictBook;
 use crate::crypto::{Opener, Sealer, SessionKey};
@@ -233,6 +234,8 @@ struct Connection {
     bytes: RateLimiter,
     /// The message in parts arriving on it (`parts.rs`).
     parts: Reassembly,
+    /// The account the transport authenticated for it (Steam), `None` when it has none (TCP, tests).
+    account: Option<u64>,
 }
 
 /// What the host keeps of a joined player beyond its connection: the secret that lets it come back as itself, and how
@@ -256,6 +259,9 @@ struct Identity {
     log: Outbox,
     /// Its last clock before the drop: where a returner that is caught up stands.
     last_clock: Option<PlayerClock>,
+    /// The authenticated account of its connection (`Connection::account`): a join from the same account that has lost its
+    /// token (its game crashed) gets this slot back.
+    account: Option<u64>,
 }
 
 impl fmt::Debug for Identity {
@@ -336,6 +342,15 @@ pub struct HostSession {
     /// 37 s for it to run up to the host's step at x1, a world the load then threw away.
     outsiders: BTreeSet<u16>,
     dropped_once: HashSet<String>,
+    /// The mods the session's world uses, from the newest save of a round (SaveDone): a later join is compared with them at
+    /// once and refused before any round starts (0.2.12 session: a player without the world's bus bay mod joined three
+    /// times, each join paused, saved and reloaded the host's game before the player was removed). `None` until a save
+    /// named them, or the host's game's save at the session's start (`ask_world_mods`).
+    world_mods: Option<Vec<String>>,
+    /// The host's game was asked to save its world at the session's start for the mods it uses (`ask_world_mods`; once per
+    /// session), and since when it is waited for (`None` once answered or given up).
+    world_save_asked: bool,
+    world_save_since: Option<f64>,
     next_player_id: u16,
     checksum_n: i32,
     last_session_broadcast: f64,
@@ -401,9 +416,13 @@ impl fmt::Debug for HostSession {
 impl HostSession {
     pub const HOST_ID: u16 = 0;
     pub const UNASSIGNED: u16 = 0xFFFF;
+    /// The id of the host's save for the world's mods at the session's start (`ask_world_mods`); rounds count from 1.
+    pub const WORLD_SAVE_ID: i32 = 0;
     /// How far past the start an action made before it may lie for the start to run the session on to it (`start`): 60 steps,
     /// ten seconds at the slowest speed, many leads.
     pub const START_RUN_ON_STEPS: i64 = 60;
+    /// Steps past the furthest stop at which the host stamps the items of a pause (`flush_pause`): a stop can be one step early.
+    pub const PAUSE_STAMP_STEPS: i64 = 2;
     pub const PROTOCOL_VERSION: i32 = FrameHeader::CURRENT_VERSION as i32;
     /// Bytes of the random nonce in a Challenge.
     pub const NONCE_SIZE: usize = 16;
@@ -452,6 +471,9 @@ impl HostSession {
             pending_new_player: None,
             outsiders: BTreeSet::new(),
             dropped_once: HashSet::new(),
+            world_mods: None,
+            world_save_asked: false,
+            world_save_since: None,
             next_player_id: 1,
             checksum_n: 0,
             last_session_broadcast: f64::NEG_INFINITY,
@@ -534,6 +556,12 @@ impl HostSession {
     // ---------------------------------------------------------------- connections
 
     pub fn connection_opened(&mut self, connection: ConnectionId) -> Vec<HostOutput> {
+        self.connection_opened_from(connection, None)
+    }
+
+    /// A connection whose remote account the transport authenticated (Steam). `None` is a connection with no such account (TCP):
+    /// it never matches a held slot by account. The account is never logged (logs go into bug reports).
+    pub fn connection_opened_from(&mut self, connection: ConnectionId, account: Option<u64>) -> Vec<HostOutput> {
         if self.connections.values().filter(|c| c.player.is_none()).count() >= Self::MAX_PENDING {
             self.refuse(connection, "too many connections waiting to join");
             return self.drain();
@@ -561,6 +589,7 @@ impl HostSession {
                 limiter,
                 bytes,
                 parts: Reassembly::default(),
+                account,
             },
         );
         let challenge = ChallengeMessage {
@@ -709,6 +738,9 @@ impl HostSession {
             // the usual outcome after the host was restarted; also what a guessed id gets
             self.log(format!("connection {connection}: no slot #{} to give back; joining as a new player", claim.id));
         }
+        if self.rejoin_by_account(connection, &join) {
+            return;
+        }
         self.admit(connection, &join);
     }
 
@@ -722,8 +754,20 @@ impl HostSession {
             self.reject(connection, "version", Some(detail));
             return false;
         };
-        // the mods are compared when the host's world is saved for this player (check_world_mods): only the builds now
-        let block = own.check_builds(theirs);
+        // the mods are compared when the host's world is saved for this player (check_world_mods); the builds now, and the
+        // world's mods too when an earlier save of this session named them
+        let mut block = own.check_builds(theirs);
+        let mut world_list = None;
+        if block.is_empty() && !own.unread && !theirs.unread {
+            if let Some(ids) = self.world_mods.clone() {
+                let (world, _unknown) = own.world(&ids);
+                let (b, _warn) = world.check(theirs);
+                if !b.is_empty() {
+                    block = b;
+                    world_list = Some(world);
+                }
+            }
+        }
         let who = clip(&join.name, 24);
         if theirs.unread {
             self.mod_warning(format!("{who}: the player's game could not list its mods; they will not be compared"));
@@ -736,16 +780,90 @@ impl HostSession {
             self.mod_warning(super::notices::player_game_unsupported(&who, &clip(&theirs.unsupported, 24)));
         }
         for b in block.iter().take(20) {
-            self.log(format!("{who}: build difference: {b}"));
+            self.log(format!("{who}: {} difference: {b}", if world_list.is_some() { "mod" } else { "build" }));
         }
-        let detail = format!("{} difference(s) in the builds, first: {}", block.len(), clip(&block[0], 120));
+        let what = if world_list.is_some() { "the mods" } else { "the builds" };
+        let detail = format!("{} difference(s) in {what}, first: {}", block.len(), clip(&block[0], 120));
         let mut why = RejectMessage::new("mods", Some(&detail));
-        // the builds only: which mods matter is known once the world is saved
-        why.mods = Some(ModFingerprint { mods: Vec::new(), ..own });
+        // the world's list for its diff when the world's mods decided; else the builds only (which mods matter is known
+        // once the world is saved)
+        why.mods = Some(world_list.unwrap_or(ModFingerprint { mods: Vec::new(), ..own }));
         self.log(format!("connection {connection} rejected: mods {detail}"));
         self.send_unsealed(connection, MessageKind::Reject, codec::encode(&why));
         self.connections.remove(&connection);
         self.out.push(HostOutput::CloseConnection(connection));
+        false
+    }
+
+    /// The session's world names its mods only in a save (`app.getSavegameInfo` reads a save file's `gameModDescs`; no
+    /// documented call lists the running world's mods, nor the name of the save it was loaded from, and the load menu may
+    /// add mods to a save as it loads it, so that file's list need not be the world's). So the host's game saves its world
+    /// once when it first says hello, while no player is in, under the round-0 name (pruned with the resync saves): the
+    /// first join is then compared at once too, and a player without one of the world's mods never makes the host pause,
+    /// save and reload for it. A round's SaveDone replaces the list later. Not asked without a host list to compare, or once
+    /// a player or a round is there (a save then would stop the session's games); unanswered, the joins are compared at the
+    /// first round's save as before.
+    fn ask_world_mods(&mut self) {
+        if self.world_save_asked || self.world_mods.is_some() || self.resync.is_some() {
+            return;
+        }
+        if !self.options.mods.as_ref().is_some_and(|m| !m.unread) {
+            return;
+        }
+        if self.players.keys().any(|&id| id != Self::HOST_ID) {
+            return;
+        }
+        self.world_save_asked = true;
+        self.world_save_since = Some(self.now());
+        let id = Self::WORLD_SAVE_ID;
+        let name = format!("feverlink3-resync-{id}");
+        self.log(format!(
+            "the host's game saves its world as {name} for the mods it uses (a join is compared with them at once)"
+        ));
+        let payload = codec::encode(&ResyncSaveMessage { id, name });
+        self.out.push(HostOutput::DeliverToLocalGame { kind: MessageKind::ResyncSave, payload });
+    }
+
+    /// The host's game's answer to `ask_world_mods` (SaveDone of id 0). A round's list, newer, is never replaced by it.
+    pub(super) fn on_world_save_done(&mut self, m: SaveDoneMessage) {
+        let Some(since) = self.world_save_since.take() else {
+            self.log(format!("SaveDone {} ignored (no save of the world's mods is waited for)", m.id));
+            return;
+        };
+        let took = self.now() - since;
+        match (m.ok, m.world_mods()) {
+            (true, Some(ids)) if self.world_mods.is_none() => {
+                let list = if ids.is_empty() { "none".to_owned() } else { clip(&ids.join(", "), 400) };
+                self.log(format!(
+                    "the host's world uses {} mod(s) (its save at the session's start, {took:.1} s): {list}; a join without one of them is refused at once",
+                    ids.len()
+                ));
+                self.world_mods = Some(ids);
+            }
+            (true, Some(_)) => {
+                self.log("the world's mods from the session's start: a round's save named them already".to_owned())
+            }
+            (ok, _) => {
+                let why = if ok { "its mods could not be read".to_owned() } else { m.detail.unwrap_or_default() };
+                self.log(format!(
+                    "the host's world did not name its mods at the session's start ({}); the first join is compared at its round's save",
+                    clip(&why, 160)
+                ));
+            }
+        }
+        // a round that waited for this save goes on
+        self.resync_step();
+    }
+
+    /// A round's save waits while the host's game is still saving for `ask_world_mods` (one game is never asked for two saves
+    /// at once), at most `ResyncLimits::PAUSE_TIMEOUT` since it was asked. True: wait.
+    pub(super) fn world_save_pending(&mut self) -> bool {
+        let Some(since) = self.world_save_since else { return false };
+        if self.now() - since < ResyncLimits::PAUSE_TIMEOUT {
+            return true;
+        }
+        self.world_save_since = None;
+        self.log("the host's game did not answer the save for the world's mods; the round saves now".to_owned());
         false
     }
 
@@ -862,6 +980,7 @@ impl HostSession {
                 heard: 0,
                 log: Outbox::default(),
                 last_clock: None,
+                account: self.connections.get(&connection).and_then(|c| c.account),
             },
         );
         let info = PlayerInfo { id, name: name.clone(), ready: false };
@@ -892,8 +1011,10 @@ impl HostSession {
             self.remove_player(id, true);
         }
         let plan = self.catch_up_plan(id, claim.last);
+        let account = self.connections.get(&connection).and_then(|c| c.account);
         let Some(identity) = self.identities.get_mut(&id) else { return false };
         identity.epoch += 1;
+        identity.account = account;
         identity.away_since = None;
         identity.caps = join.caps.iter().take(16).map(|c| clip(c, 32)).collect();
         identity.mods = join.mods.clone();
@@ -926,6 +1047,63 @@ impl HostSession {
             }
         };
         self.greet(connection, info, ResumeGrant { token: token.to_vec(), epoch }, true, catch_up);
+        true
+    }
+
+    /// A join with no claim that holds, from the authenticated account of a slot this host keeps: its game crashed and lost the token,
+    /// so it comes back as itself all the same (real session 2026-11-01: a crashed player was "(reconnecting)" and "#2" at once). The
+    /// slot keeps its id and name, gets a fresh token, and its game is reloaded as for a returner that cannot be caught up (the hot-join
+    /// round of a started session). An old connection the host has not noticed as lost is closed, as `resume` does. Only an account
+    /// the transport authenticated matches (`None` never does). True: the player has the slot.
+    fn rejoin_by_account(&mut self, connection: ConnectionId, join: &JoinMessage) -> bool {
+        let Some(account) = self.connections.get(&connection).and_then(|c| c.account) else { return false };
+        let asked = Names::sanitize(&join.name);
+        // a slot still connected is taken over only under its own name: under another one it is more likely a second game of the
+        // same account than a crashed one
+        let Some(id) = self
+            .identities
+            .iter()
+            .find(|(_, i)| {
+                i.account == Some(account) && i.epoch < Sealer::MAX_EPOCH && (i.away_since.is_some() || i.name == asked)
+            })
+            .map(|(id, _)| *id)
+        else {
+            return false;
+        };
+        // game-side code does not panic: with no random source there is no token to give; the join goes on as a new player's,
+        // which is refused for the same reason
+        let mut token = [0u8; 16];
+        if getrandom::getrandom(&mut token).is_err() {
+            return false;
+        }
+        if let Some(old) = self.connection_of(id) {
+            let name = self.name(id);
+            self.log(format!("{name} joins again on connection {connection}; the old connection {old} is closed"));
+            self.connections.remove(&old);
+            self.out.push(HostOutput::CloseConnection(old));
+            self.remove_player(id, true);
+        }
+        // remove_player may have freed the slot (no reconnect window): then this is a plain join
+        let Some(identity) = self.identities.get_mut(&id) else { return false };
+        identity.token = token;
+        identity.epoch += 1;
+        identity.away_since = None;
+        identity.caps = join.caps.iter().take(16).map(|c| clip(c, 32)).collect();
+        identity.mods = join.mods.clone();
+        // nothing is caught up: the game starts from the host's world, and says hello again once it has loaded it
+        identity.log.clear();
+        identity.ready = false;
+        let (name, epoch) = (identity.name.clone(), identity.epoch);
+        let info = PlayerInfo { id, name: name.clone(), ready: false };
+        self.players.insert(id, info.clone());
+        if let Some(c) = self.connections.get_mut(&connection) {
+            c.player = Some(id);
+        }
+        // never the account number itself: logs go into bug reports
+        self.log(format!(
+            "{name} is back (connection {connection}), slot #{id}: a join without a resume claim from the same Steam account; its game gets the host's world"
+        ));
+        self.greet(connection, info, ResumeGrant { token: token.to_vec(), epoch }, true, None);
         true
     }
 
@@ -1123,6 +1301,9 @@ impl HostSession {
                 }
                 // a game that (re)loaded a world makes its promises from it again
                 self.end_stall(from, "it loaded a world");
+                if from == Self::HOST_ID {
+                    self.ask_world_mods();
+                }
                 self.resync_step();
                 if from != Self::HOST_ID {
                     if let Some(connection) = self.connection_of(from) {
@@ -2203,8 +2384,14 @@ impl HostSession {
                 let s = self.future_stamp();
                 self.pause_last.map_or(s, |l| s.max(l.saturating_add(2 * Lockstep::STEP)))
             }
+            // two steps past the furthest stop: a game's stop can be one step early. It says it stands still once its interface sees
+            // the stop's game time, a batch after the simulation ran it, and the run-on of the flush before goes one step a batch, so
+            // one more step may still run (0.2.12 session: the 241st build of one pause, stamped 91859800 one step past both stops of
+            // 91859600, was applied at 91860000 on both games, LATE, and a repair reloaded every game)
             Some(p) => match self.pause_stops(p) {
-                Some(furthest) => Lockstep::round_up_to_step(furthest as f64) + Lockstep::STEP,
+                Some(furthest) => {
+                    Lockstep::round_up_to_step(furthest as f64) + Self::PAUSE_STAMP_STEPS * Lockstep::STEP
+                }
                 None => return,
             },
         };

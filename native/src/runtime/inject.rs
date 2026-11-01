@@ -156,7 +156,16 @@ impl Runtime {
         // anything leaves it: the same rebuild every receiver makes at the stamp, destroyed again (the engine calls are not guarded)
         if let (Ok(p), None) = (&job.encoded, &job.refusal) {
             let t_proof = std::time::Instant::now();
+            // on disk while the engine works on it (the proof's engine calls are not guarded: a crash there ends the game); gone again
+            // as soon as the proof returns, whatever its outcome
+            let kept = self.proving_text.write(id, &p.text).is_ok();
+            if kept {
+                self.say(&format!(
+                    "native inject: hold {id}: own proof starts (native_proving_{id}.txt kept until it returns)"
+                ));
+            }
             let proof = self.inject_own_proof(payload, &p.text, settings);
+            self.proving_text.remove(id);
             job.proof_ms = t_proof.elapsed().as_secs_f64() * 1000.0;
             match proof {
                 Ok(stats) => job.proved = Some(stats),

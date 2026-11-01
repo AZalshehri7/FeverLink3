@@ -145,8 +145,10 @@ impl Throttle {
 /// What the sockets tell the session thread.
 #[derive(Debug)]
 pub enum NetEvent {
-    /// A connection exists (host: accepted; client: connected). `peer` is the remote address when known.
-    Opened { conn: ConnectionId, peer: Option<SocketAddr> },
+    /// A connection exists (host: accepted; client: connected). `peer` is the remote address when known. `account`: the
+    /// remote's account as the transport authenticated it (Steam host), `None` for TCP and the client side; it lets the host
+    /// give a player whose game crashed its old slot back, and is never logged.
+    Opened { conn: ConnectionId, peer: Option<SocketAddr>, account: Option<u64> },
     /// One complete frame arrived.
     Frame { conn: ConnectionId, frame: Frame },
     /// The connection is over; `reason` says why. The last event of a connection.
@@ -643,7 +645,7 @@ fn accept_loop(
                     let mut map = links.lock().unwrap_or_else(|p| p.into_inner());
                     map.insert(conn, Arc::clone(&link));
                 }
-                if tx.send(NetEvent::Opened { conn, peer: Some(peer) }).is_err() {
+                if tx.send(NetEvent::Opened { conn, peer: Some(peer), account: None }).is_err() {
                     return;
                 }
                 if spawn_reader(conn, link, tx.clone(), "host", ReadPolicy::of(&limits)).is_err() {
@@ -689,7 +691,7 @@ impl ClientNet {
             match TcpStream::connect_timeout(&ep, timeout) {
                 Ok(stream) => {
                     let link = Link::new(stream, NetLimits::default().write_timeout)?;
-                    tx.send(NetEvent::Opened { conn, peer: Some(ep) })
+                    tx.send(NetEvent::Opened { conn, peer: Some(ep), account: None })
                         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session ended"))?;
                     spawn_reader(conn, Arc::clone(&link), tx, "client", ReadPolicy::unlimited())?;
                     return Ok(ClientNet { conn, peer: ep, link });
@@ -838,7 +840,7 @@ mod tests {
         let good = ClientNet::connect(&[host.local_addr()], 1, ctx).unwrap();
         let (mut bad_id, mut good_id) = (0, 0);
         for _ in 0..2 {
-            let NetEvent::Opened { conn, peer } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
+            let NetEvent::Opened { conn, peer, .. } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
             if peer.unwrap() == bad.local_addr().unwrap() {
                 bad_id = conn;
             } else {

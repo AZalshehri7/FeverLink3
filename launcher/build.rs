@@ -44,6 +44,7 @@ fn write_resources() -> Result<(), String> {
     let info = winres::VersionInfo {
         version: [part("CARGO_PKG_VERSION_MAJOR"), part("CARGO_PKG_VERSION_MINOR"), part("CARGO_PKG_VERSION_PATCH"), 0],
         prerelease: !env("CARGO_PKG_VERSION_PRE").is_empty(),
+        dll: false,
         strings: vec![
             text("CompanyName", &env("CARGO_PKG_AUTHORS")),
             text("FileDescription", "FeverLink3 launcher"),

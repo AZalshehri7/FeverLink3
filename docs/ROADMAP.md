@@ -29,6 +29,8 @@ Not yet seen in the real game at that time: joining from a Steam invite by itsel
 
 **0.2.9 (2026-10-27): other mods' tools and big builds.** A build another mod's tool or window sends (the bus bay upgrade, the crossing window) is applied at the same moment on every game; big builds such as 3-track stations travel in parts, up to 3 MB (before, anything over about 480 KB was refused; one Steam message carries at most 512 KB); the update check runs when a host with a newer FeverLink3 refuses you. Seen with two games on one PC (builds of 620 KB and 1.23 MB); big builds in parts over Steam between two PCs not seen yet.
 
+**0.2.13 (2026-11-02): roads across railway tracks, joins and the update.** Roads can cross railway tracks again; a player missing one of the world's mods is refused at once, the session's first player too; a player whose game crashed gets his old place back when he joins again; the automatic update says when it only waits for the session to end; testers can turn on pre-release updates. Seen with two games on one PC (the crash rejoin through Steam only in tests).
+
 **0.2.12 (2026-11-01): What's new window, whole-session bug reports and fixes from a full code review.** Bug reports hold the whole session and keep player names and chat private; money differences are repaired by a sync instead of being booked on one game; builds made during a pause, stations and depots over town buildings, and short connection drops are handled safely. Seen with two games on one PC.
 
 **0.2.11 (2026-10-30): the junction lane tool works again in a session.**

@@ -343,6 +343,19 @@ local function setup(react, builtin, X)
 		local class = kind == "negative" and "error-tape" or (kind or "secondary")
 		return builtin.Button{ meta = { class = class, enabled = false }, content = text(label, "info", 0.5) }
 	end
+	-- a choice: its button on the left, what it means on its right (owner, 2026-11-01: the note under the button read as the next
+	-- choice). Two fixed columns, the way fixedColumn sizes (size { w, -1 }); the note wraps at its own column's width.
+	local CHOICE_W = 220
+	local function choice(btn, note)
+		local noteW = WIDTH - CHOICE_W - PAD
+		local lines = Hud.wrapLines(note, math.max(12, math.floor(wrapChars * noteW / WIDTH)))
+		local views = {}
+		for i, line in ipairs(lines) do views[i] = builtin.TextView{ meta = { class = "font-scale-title-4" }, text = line } end
+		local function cell(w, children)
+			return builtin.Component{ meta = { styleSheet = style("s:" .. w .. "x-1", { size = { w, -1 } }) }, layout = box(V, children) }
+		end
+		return box(H, { cell(CHOICE_W, { btn }), spacer(PAD, 1), cell(noteW, views) })
+	end
 	local function field(placeholder, value, onTyping, displayOnly)
 		return builtin.TextInputField{
 			meta = { class = "font-scale-title-4" }, placeholderText = placeholder, value = value, onTyping = onTyping,
@@ -524,12 +537,13 @@ local function setup(react, builtin, X)
 			for _, item in ipairs(type(g.items) == "table" and g.items or {}) do rows[#rows + 1] = text("- " .. tostring(item)) end
 			rows[#rows + 1] = gap()
 		end
-		-- the address on a line of its own and never wrapped: its 55 characters are one word over WINDOW_CHARS, so wrapLines cut
-		-- it mid-word (lab 2026-10-31, "CHANGELOG.htm" / "l"); the window holds 62 a line, so one TextView shows it whole
-		rows[#rows + 1] = text("Everything that changed:")
-		rows[#rows + 1] = builtin.TextView{ meta = { class = "font-scale-title-4" }, text = tostring(WN.url) }
-		rows[#rows + 1] = gap()
-		rows[#rows + 1] = button("Close", function() wp.onClose() end, "primary")
+		-- a button instead of the bare address (owner, 2026-11-01): the native module opens the project's changelog page in the
+		-- browser ("changelog" command; the address is the module's own, launcher live.rs CHANGELOG_URL, never one sent from here)
+		rows[#rows + 1] = box(H, {
+			button("Everything that changed", function() command("changelog", {}) end),
+			spacer(PAD, 1),
+			button("Close", function() wp.onClose() end, "primary"),
+		})
 		return builtin.Window{
 			title = "What's new in FeverLink3 " .. WN.version,
 			id = "window.feverlink3.whatsnew",
@@ -588,6 +602,14 @@ local function setup(react, builtin, X)
 				add(button(on and T.UPDATE.on or T.UPDATE.off, function() command("autoupdate", { on = not on }) end))
 				add(text(u.official == false and T.UPDATE.dev or T.UPDATE.explain))
 				if ctl.result and ctl.result.kind == "autoupdate" and ctl.result.ok == false then add(text(tostring(ctl.result.message), "warn")) end
+				-- the second switch, under the first: pre-releases too (settings.txt `prerelease`, default off; an older module
+				-- has no `pre` and shows it off)
+				if on and T.UPDATE.preOn then
+					local pre = u.pre == true
+					add(button(pre and T.UPDATE.preOn or T.UPDATE.preOff, function() command("prerelease", { on = not pre }) end))
+					add(text(T.UPDATE.preExplain))
+					if ctl.result and ctl.result.kind == "prerelease" and ctl.result.ok == false then add(text(tostring(ctl.result.message), "warn")) end
+				end
 				add(gap())
 			end
 			add(text("Steam connection test", nil, nil, "font-scale-title-3"))
@@ -645,13 +667,13 @@ local function setup(react, builtin, X)
 					list[#list + 1] = text(W and W.starting or "Starting the session...")
 				elseif W then
 					list[#list + 1] = text(W.pick, nil, nil, "font-scale-title-3")
-					list[#list + 1] = button(W.shared, function() startWith("shared") end, "primary")
-					list[#list + 1] = text(W.sharedNote)
+					list[#list + 1] = choice(button(W.shared, function() startWith("shared") end, "primary"), W.sharedNote)
+					list[#list + 1] = gap()
 					if SEPARATE_OFFERED and U.companies and U.companies.acting then
-						list[#list + 1] = button(W.separate, function() startWith("separate") end)
-						list[#list + 1] = text(W.separateNote)
+						list[#list + 1] = choice(button(W.separate, function() startWith("separate") end), W.separateNote)
 					else
-						list[#list + 1] = disabledButton(SEPARATE_OFFERED and W.separateLocked or W.separateUpcoming)
+						list[#list + 1] = choice(disabledButton(W.separate),
+							(SEPARATE_OFFERED and W.separateLockedNote or W.separateUpcomingNote) .. " " .. W.separateNote)
 					end
 				else
 					list[#list + 1] = button("Start the session", function() command("start", {}) end, "primary")

@@ -7481,13 +7481,17 @@ H.resync_save = function(rec, p)
 	local function save()
 		logGui("resync: saving the game as '" .. p.name .. "'")
 		traceGui("resync", string.format("saving as %s id=%s now=%s balance=%s", tostring(p.name), tostring(p.id), tostring(engine.gameTime()), tostring(engine.account())))
-		pcall(X.syncDetail, p, "save")
+		-- id 0 is no sync: the host's save at the session's start, only for the world's mods (core `ask_world_mods`)
+		if tonumber(p.id) ~= 0 then pcall(X.syncDetail, p, "save") end
+		-- the state of any save of this name before this one: its mods are read only from a save written now, never from a file of
+		-- the same name an earlier save (or session) left, which would name another world's mods (nil: unlistable, no guard)
+		local before = Hud.saveStamps(app, p.name)
 		engine.saveGame(p.name, function(ok, err)
 			logGui("resync: save " .. (ok and "done" or ("failed: " .. tostring(err))))
 			-- the mods this world uses, read from the save just made: the host compares them with every player's before
 			-- any of the save is sent (docs/PROTOCOL.md, "Mod list"); nil when they cannot be read (the host then warns)
 			local mods, why = nil, nil
-			if ok then mods, why = X.logWorldMods(p.name, "saved") end
+			if ok then mods, why = X.logWorldMods(p.name, "saved", before) end
 			if why then logGui("resync: MOD WARNING: the world's mods could not be read: " .. tostring(why)) end
 			send("save_done", { id = p.id, name = p.name, ok = ok == true, detail = (not ok) and tostring(err) or nil, mods = mods })
 		end)
@@ -7506,8 +7510,8 @@ end
 -- logged and kept in world_mods.txt for the bug report (launcher report.rs), next to the window's list, which is the INSTALLED mods.
 -- Every join, return, start and repair sync loads a save (H.resync_load) and the host saves one first, so each world the session
 -- plays is named. Issue #3 (2026-10-25) listed only the installed mods, so the world's own were unknown. Returns Hud.worldMods'.
-function X.logWorldMods(name, what)
-	local mods, why = Hud.worldMods(app, name)
+function X.logWorldMods(name, what, before)
+	local mods, why = Hud.worldMods(app, name, before)
 	local line = mods and string.format("mods active in this world (save '%s', %s; read from the save): %d: %s", tostring(name), what, #mods,
 		#mods > 0 and table.concat(mods, ", ") or "none") or string.format("mods active in this world (save '%s', %s): could not be read: %s",
 		tostring(name), what, tostring(why))

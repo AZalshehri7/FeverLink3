@@ -6,6 +6,33 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.13 (2026-11-02)
+
+### In short
+- The automatic update no longer says "Downloading" while it waits for your session to end.
+- New switch for testers: pre-release updates (off by default).
+- A player missing one of the world's mods is refused at once instead of making the host sync first, the session's first player too: the host's game saves the world once when the session starts to learn which mods it uses.
+- Roads can cross railway tracks again in a session.
+- FeverLink3's game file (`winhttp.dll`) now says what it is in its file properties, which helps virus scanners recognise it.
+- A player whose game crashed and who joins again gets his old place back instead of a second one ("Name#2").
+
+### Added
+- Pre-release updates: a second switch under "Automatic updates" (Troubleshooting, off by default) also installs test versions before they are released for everyone, for players who test with the maintainer.
+
+### Changed
+- The native module (`winhttp.dll`) carries version information: product FeverLink3, its version, publisher and description, like the launcher. Windows Defender's cloud check removed the 0.2.12 release's file, which had none, as a trojan (a false positive).
+- What's new: the full changelog opens with a button instead of an address to type.
+- Starting a session: each way to play has its explanation on its right, and "Company for each player" (still upcoming) says what it will be.
+
+### Fixed
+- A player whose game misses a mod the world uses no longer makes the host pause, save and reload for nothing at each join attempt: such a join is refused at once with the list of what is missing, the first one of a session too (the host's game saves its world once when the session starts, to learn which mods it uses).
+- Building during a pause: after many builds in one pause, a build could be applied one step late on every game and make every game reload for a repair. Each build of a pause now runs the paused world one step more (0.2 s of game time), so it always arrives in time.
+- A road built across railway tracks (a level crossing) was refused on every game with "FeverLink3 could not copy it exactly"; rails across a road worked. It is built again, as your road tool made it.
+- Bug reports after a crash: when the game stops while FeverLink3 checks a build, the report now holds that build, so the cause can be found (a game crashed on a second quick bulldozer click on a junction; the build that caused it was not kept).
+- The automatic update said "Downloading FeverLink3 <version>" for as long as a session (or a join attempt) was open, although the download was done: it only puts the new files in place outside a session. It now says that the new version is downloaded and that you finish the update by leaving the session.
+- Joining a host one FeverLink3 version ahead listed several differences (FeverLink3, its module and its own mod files) for one cause. The window now shows one line: the two versions and who has to update.
+- A player whose game crashed and who joined again showed twice in the host's list, as "Name (reconnecting)" and as "Name#2", and got a new place. A join from the same Steam account now takes the old place back: same number, same name, same permissions, and the game loads the host's world. Not yet seen in a game.
+
 ## 0.2.12 (2026-11-01)
 
 ### In short

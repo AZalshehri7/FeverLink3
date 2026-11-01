@@ -91,6 +91,40 @@ fn a_world_mod_with_another_revision_or_other_files_or_missing_removes_the_playe
 }
 
 #[test]
+fn once_a_save_named_the_worlds_mods_a_join_without_them_is_refused_at_once_without_a_round() {
+    let ok = vec![entry("trains_pack", 3, false, Some("f1")), entry("nice_ui", 2, true, Some("u1"))];
+    let (mut h, _c, id) = round(Some(game(ok)), Some(&WORLD));
+    h.send_file(id, b"world");
+    let rounds = h.host.resync_id();
+    let c2 = h.connect_with_mods("Sam", Some(game(vec![entry("nice_ui", 2, true, Some("u1"))])));
+    let r = h.p(c2).rejected.clone().expect("refused at the join");
+    assert_eq!(r.reason, "mods");
+    assert!(r.detail.unwrap().contains("trains_pack"), "names the missing world mod");
+    let ids: Vec<String> = r.mods.expect("the world's list").mods.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, ["nice_ui", "trains_pack"]);
+    assert_eq!(h.host.resync_id(), rounds, "no new round: the host's game is not paused, saved or reloaded");
+    assert_eq!(h.host.players().len(), 2);
+}
+
+#[test]
+fn the_hosts_save_at_the_sessions_start_names_the_worlds_mods_so_the_first_join_without_them_is_refused_at_once() {
+    let mut h = Harness::with(HostOptions { mods: Some(game(host_mods())), ..HostOptions::default() });
+    h.hello_all(10_000, 0);
+    let ask: ResyncSaveMessage = h.host_game_last(MessageKind::ResyncSave);
+    assert_eq!((ask.id, ask.name.as_str()), (HostSession::WORLD_SAVE_ID, "feverlink3-resync-0"));
+    let mods = Some(serde_json::json!(WORLD));
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id: ask.id, ok: true, detail: None, mods }));
+    let c = h.connect_with_mods("Sam", Some(game(vec![entry("nice_ui", 2, true, Some("u1"))])));
+    let r = h.p(c).rejected.clone().expect("refused at the join");
+    assert!(r.detail.unwrap().contains("trains_pack"), "names the missing world mod");
+    assert_eq!(h.host.resync_id(), None, "no round: the host's game is not paused, saved or reloaded for it");
+    assert_eq!(h.host.players().len(), 1);
+    // asked once a session: the host's hello after a load asks nothing more
+    h.hello_all(10_000, 0);
+    assert_eq!(h.host_game_count(MessageKind::ResyncSave), 1);
+}
+
+#[test]
 fn cosmetic_differences_unknown_files_and_lists_that_cannot_be_read_warn_and_do_not_refuse() {
     // a cosmetic world mod with another revision, files unknown on one side, an extra mod of the player's
     let guest =
@@ -172,6 +206,22 @@ fn a_newer_player_is_told_the_host_must_update() {
     mine.feverlink3 = "0.2.0-beta.1".into();
     let lines: Vec<String> = diff(&host, &mine).into_iter().map(|d| d.text).collect();
     assert_eq!(lines[0], "FeverLink3: host has 0.2.0, you have 0.2.0-beta.1", "no advice without a plain version");
+}
+
+#[test]
+fn a_player_one_version_behind_reads_one_line() {
+    // 0.2.12 two-PC test: the version, the native module and FeverLink3's own mod files were three reasons for one cause
+    let host = game(vec![entry("feverlink3", 1, false, Some("a")), entry("trains_pack", 3, false, Some("f1"))]);
+    let mut mine = game(vec![entry("feverlink3", 1, false, Some("b")), entry("trains_pack", 3, false, Some("f1"))]);
+    mine.feverlink3 = "0.1.9".into();
+    mine.native = "other".into();
+    let lines: Vec<String> = diff(&host, &mine).into_iter().map(|d| d.text).collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("FeverLink3: host has 0.2.0, you have 0.1.9. An update is available"), "{lines:?}");
+    // the same version: a different module or mod files are a real difference and stay
+    mine.feverlink3 = host.feverlink3.clone();
+    let lines: Vec<String> = diff(&host, &mine).into_iter().map(|d| d.text).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
 }
 
 #[test]

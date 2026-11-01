@@ -4,7 +4,7 @@ title: FeverLink3 FAQ
 
 # Frequently asked questions
 
-Last updated 2026-11-01, for version 0.2.12. [Back to the start page](../index.html)
+Last updated 2026-11-02, for version 0.2.13. [Back to the start page](../index.html)
 
 ## The project
 
@@ -73,7 +73,7 @@ Not yet. See the [roadmap](../ROADMAP.html).
 Once per game start (never during a session) FeverLink3 asks GitHub whether a newer version exists. If so, it downloads it inside the game, only from the official GitHub releases over HTTPS, and checks every file's SHA-256 checksum against the release. One restart of the game finishes the update. This was tested on the maintainer's PC with the real 0.2.1 release. If a new version does not start, FeverLink3 is meant to put the previous version back (not yet seen in a real game).
 
 **Can I turn automatic updates off?**
-Yes: in the FeverLink3 window, under **Troubleshooting**. To update by hand, close the game and copy the new files over the old ones.
+Yes: in the FeverLink3 window, under **Troubleshooting**. To update by hand, close the game and copy the new files over the old ones. Under the same switch, **Pre-release updates** (off by default) also brings test versions before everyone gets them, for players who test with the maintainer; everyone in a session needs the same version.
 
 ## Safety
 

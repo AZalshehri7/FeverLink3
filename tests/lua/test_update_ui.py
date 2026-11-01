@@ -20,6 +20,8 @@ class UpdateLine(unittest.TestCase):
             T = rt.execute(f.read())
         line = lambda **u: T.updateLine(rt.table_from(u))
         self.assertEqual(("Downloading FeverLink3 0.2.1.", "info"), line(state="downloading", version="0.2.1"))
+        self.assertEqual(("FeverLink3 0.2.1 is downloaded. Leave the session to finish the update.", "info"),
+                         line(state="waiting", version="0.2.1"))
         self.assertEqual(("Updated to 0.2.1. Restart the game to finish.", "info"),
                          line(state="ready", version="0.2.1", current="0.2.0"))
         self.assertEqual(("Update to 0.2.1 failed: GitHub could not be reached. You keep 0.2.0.", "warn"),

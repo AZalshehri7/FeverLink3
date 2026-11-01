@@ -124,6 +124,7 @@ T.UPDATE = {
 	checking = "Your FeverLink3 is older than the host's ({version}). Checking for an update now...",
 	behind = "Your FeverLink3 is older than the host's ({version}). Download the new version from GitHub or Nexus.",
 	downloading = "Downloading FeverLink3 {version}.",
+	waiting = "FeverLink3 {version} is downloaded. Leave the session to finish the update.",
 	ready = "Updated to {version}. Restart the game to finish.",
 	updated = "FeverLink3 is now {version}.",
 	failed = "Update to {version} failed: {reason}. You keep {current}.",
@@ -131,6 +132,11 @@ T.UPDATE = {
 	restart = "Restart the game before you play together.",
 	on = "Automatic updates: on",
 	off = "Automatic updates: off",
+	-- the second switch: pre-releases (test versions) too; off by default
+	preOn = "Pre-release updates: on",
+	preOff = "Pre-release updates: off",
+	preExplain = "On: test versions too, before they are released for everyone. They can have new bugs. " ..
+		"Everyone in a session needs the same version.",
 	explain = "At each game start FeverLink3 looks on GitHub for a newer version and gets it ready for the next start, " ..
 		"never during a session. A change here counts from the next start.",
 	dev = "This copy of FeverLink3 was not made by the release page, so it does not update itself.",
@@ -205,7 +211,7 @@ end
 -- The window's line for the automatic update (ctl.update): text and level, or nil when there is nothing to say.
 function T.updateLine(u)
 	if type(u) ~= "table" or type(T.UPDATE[u.state]) ~= "string" then return nil end
-	local shown = { checking = true, behind = true, downloading = true, ready = true, updated = true, failed = true }
+	local shown = { checking = true, behind = true, downloading = true, waiting = true, ready = true, updated = true, failed = true }
 	if not shown[u.state] then return nil end
 	local text = fill(T.UPDATE[u.state], {
 		version = u.version or "", current = u.current or "", reason = (u.reason and u.reason ~= "") and u.reason or "unknown problem",
@@ -221,11 +227,12 @@ T.COMPANY = {
 	tab = "Companies",
 	pick = "How do you want to play?",
 	shared = "One shared company",
-	sharedNote = "Everyone builds and pays from one account.",
+	sharedNote = "Everyone builds and pays from one account, as in single player with several hands on it.",
 	separate = "Company for each player",
-	separateNote = "Every player gets a company with its own money.",
-	separateLocked = "Company for each player (not available on this game)",
-	separateUpcoming = "Company for each player (upcoming)",
+	separateNote = "Every player runs a company of their own: own money, own loan, own lines and vehicles; " ..
+		"players can pay each other.",
+	separateUpcomingNote = "Upcoming: not playable yet.",
+	separateLockedNote = "Not available on this game.",
 	starting = "Starting the session...",
 	modeShared = "One shared company: everyone pays from the same account. A company here groups who built and spent what.",
 	modeSeparate = "Company for each player: every company has its own money.",

@@ -57,6 +57,8 @@ pub const CMD_FILE: &str = "ctl_cmd.log";
 pub const STATUS_FILE: &str = "ctl_status.txt";
 /// The session's log lines, written by the controller (see `Controller::write_session_log`).
 pub const SESSION_LOG_FILE: &str = "session.log";
+/// The changelog page the What's new window's button opens (the same as `tools/release` writes into the window's notes).
+pub const CHANGELOG_URL: &str = "https://azalshehri7.github.io/FeverLink3/CHANGELOG.html";
 const SESSION_LOG_MAX: u64 = 2 << 20;
 /// The Steam API is looked up again every couple of seconds (for about five minutes) when it was not there yet.
 const STEAM_LOAD_EVERY: Duration = Duration::from_secs(2);
@@ -713,6 +715,17 @@ impl Controller {
             "autoupdate" => {
                 let on = params.get("on").and_then(Value::as_bool).unwrap_or(true);
                 let outcome = crate::autoupdate::set_enabled(on);
+                self.note(n, kind, outcome);
+            }
+            // the What's new window's button: the browser gets the project's changelog page. The address is this program's
+            // own, never one the window sends, so the button cannot open anything else
+            "changelog" => {
+                (self.reporter.opener)(&report::OpenTarget::Address(CHANGELOG_URL.to_owned()));
+                self.note(n, kind, Ok("the changelog opens in the browser".to_owned()));
+            }
+            "prerelease" => {
+                let on = params.get("on").and_then(Value::as_bool).unwrap_or(false);
+                let outcome = crate::autoupdate::set_prerelease(on);
                 self.note(n, kind, outcome);
             }
             "leave" => self.leave(),
@@ -3343,6 +3356,20 @@ mod tests {
         // one run is kept: a second start replaces it
         drop(Controller::new(dir.clone(), "Solo".into(), Vec::new()).unwrap());
         assert!(!previous.join("mod.3.log").exists());
+    }
+
+    #[test]
+    fn the_whats_new_button_opens_the_changelog_page_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("live");
+        let (opener, opened) = report::recording_opener();
+        let mut c = Controller::new(dir.clone(), "Solo".into(), Vec::new())
+            .unwrap()
+            .with_report_output(opener, vec![root.path().join("desk")]);
+        let mut w = Window::new(&dir);
+        w.send("changelog", "{[\"url\"]=\"https://example.com/evil\"}");
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || !opened.lock().unwrap().is_empty()));
+        assert_eq!(*opened.lock().unwrap(), vec![OpenTarget::Address(CHANGELOG_URL.to_owned())]);
     }
 
     #[test]

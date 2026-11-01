@@ -425,6 +425,67 @@ fn a_return_during_a_round_waits_for_the_next_one_when_the_files_are_moving() {
     assert!(n.logged("player returned waits for the next resync round"), "{:?}", n.host_log);
 }
 
+// ------------------------------------------------------------------ a crashed game: same account, no ticket
+
+/// Real session 2026-11-01: a game crashed, its launcher lost the ticket, and the join without one was "Sam#2" next to the held
+/// "Sam (reconnecting)". From the same authenticated account it gets the old slot back, with a new token and a hot-join round.
+#[test]
+fn a_crashed_player_joining_again_from_the_same_account_gets_its_old_slot() {
+    let mut n = Net::new();
+    let a = n.connect_from("Sam", Some(7_656_119_876));
+    n.hello_all(10_000, 0);
+    n.host_call(HostSession::start);
+    n.host_call(|h| h.set_speed(2));
+    n.hello_all(10_000, 2);
+    let (a_id, old) = (n.id(a), n.ticket(a));
+    n.lose(a);
+
+    let a2 = n.connect_from("Sam", Some(7_656_119_876));
+    assert_eq!(a_id, n.id(a2), "the same id");
+    assert_eq!(Some("Sam"), n.peer(a2).session.assigned_name(), "the same name, no #2");
+    assert_eq!(2, n.host.roster().len(), "the host and one Sam");
+    assert!(n.peer(a2).welcomes[0].resumed);
+    assert!(!n.host.players()[&a_id].ready, "its game loads the host's world and says hello again");
+    assert_eq!(ResyncState::Pausing, n.host.resync_state(), "the hot-join round brings it back into play");
+    assert!(!n.host_log.iter().any(|l| l.contains("7656119876")), "the account is never logged: {:?}", n.host_log);
+    let ticket = n.ticket(a2);
+    assert_ne!(old.token, ticket.token, "a fresh token");
+
+    // and the new token works for the next return
+    n.lose(a2);
+    let a3 = n.connect_resuming("Sam", ticket);
+    assert_eq!(a_id, n.id(a3));
+}
+
+#[test]
+fn the_same_account_takes_over_a_connection_the_host_has_not_noticed_is_dead() {
+    let mut n = Net::new();
+    let a = n.connect_from("Sam", Some(7_656_119_876));
+    let a_id = n.id(a);
+    n.cut(a);
+    let a2 = n.connect_from("Sam", Some(7_656_119_876));
+    assert_eq!(a_id, n.id(a2));
+    assert!(n.closed.contains(&a), "the old connection is closed by the host");
+    assert_eq!(2, n.host.roster().len());
+}
+
+#[test]
+fn another_account_or_none_never_takes_a_held_slot() {
+    let mut n = Net::new();
+    let a = n.connect_from("Sam", Some(7_656_119_876));
+    let t = n.connect("Tcp");
+    let (a_id, t_id) = (n.id(a), n.id(t));
+    n.lose(a);
+    n.lose(t);
+
+    let other = n.connect_from("Sam", Some(7_656_119_877));
+    assert!(![a_id, t_id].contains(&n.id(other)), "another account is a new player");
+    let name = n.peer(other).session.assigned_name().unwrap_or("");
+    assert!(name.starts_with("Sam#"), "{name}: the held slot keeps its name");
+    let tcp = n.connect("Tcp");
+    assert!(![a_id, t_id].contains(&n.id(tcp)), "no account matches nothing, not even another one with none");
+}
+
 // ------------------------------------------------------------------ leaving on purpose, and after a restart
 
 #[test]

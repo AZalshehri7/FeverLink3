@@ -130,7 +130,7 @@ fn run(core: &CoreRef, checks: &mut Vec<Check>) {
             other => return Err(format!("the client's first event was {}", brief(&other))),
         }
         match next(&hrx, "the host's Opened")? {
-            NetEvent::Opened { conn: 1, peer: None } => Ok("both sides, connection 1".to_string()),
+            NetEvent::Opened { conn: 1, peer: None, .. } => Ok("both sides, connection 1".to_string()),
             other => Err(format!("the host's first event was {}", brief(&other))),
         }
     })();

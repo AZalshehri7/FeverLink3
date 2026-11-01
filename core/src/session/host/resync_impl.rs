@@ -488,6 +488,9 @@ impl HostSession {
             match state {
                 ResyncState::Pausing => {
                     if self.pause_reached(pause_at) {
+                        if self.world_save_pending() {
+                            return;
+                        }
                         self.enter_saving();
                     } else if waited >= ResyncLimits::PAUSE_TIMEOUT {
                         let waiting = self.pause_laggards(pause_at);
@@ -656,6 +659,10 @@ impl HostSession {
     }
 
     pub(super) fn on_save_done(&mut self, from: u16, m: SaveDoneMessage) {
+        if from == Self::HOST_ID && m.id == Self::WORLD_SAVE_ID {
+            self.on_world_save_done(m);
+            return;
+        }
         let Some((state, id, source)) = self.resync.as_ref().map(|r| (r.state, r.id, r.source)) else { return };
         if from != source {
             if self.first_time(format!("savedone/{from}")) {
@@ -672,6 +679,10 @@ impl HostSession {
             // before any world data goes out: the players' mods against the ones this world uses
             let world = m.world_mods();
             self.check_world_mods(world.as_deref());
+            // remembered for the joins that follow: refused at once, without a round (`mods_match`)
+            if world.is_some() {
+                self.world_mods = world;
+            }
             let checked: BTreeSet<u16> = self.players.keys().copied().collect();
             if let Some(r) = self.resync.as_mut() {
                 r.mods_checked = Some(checked);

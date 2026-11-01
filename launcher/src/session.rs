@@ -784,11 +784,12 @@ fn host_loop(
 fn host_net_event(host: &mut HostSession, event: NetEvent, io: &mut HostIo<'_, '_>) -> Vec<HostOutput> {
     let shared = io.shared;
     match event {
-        NetEvent::Opened { conn, peer } => {
+        NetEvent::Opened { conn, peer, account } => {
             if let Some(peer) = peer {
                 shared.log(format!("connection {conn} from {peer}"));
             }
-            host.connection_opened(conn)
+            // the account itself is not logged: logs go into bug reports
+            host.connection_opened_from(conn, account)
         }
         NetEvent::Frame { conn, frame } => host.frame_received(conn, &frame),
         NetEvent::Closed { conn, reason } => {

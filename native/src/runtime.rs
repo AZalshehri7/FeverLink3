@@ -117,6 +117,10 @@ pub struct Runtime {
     /// The originator's refusal of a held command's text before it is shipped (`native_refused_<id>.txt`, the reason): every receiver
     /// would refuse the same text, so the mod fails the held command and ships nothing (`inject::text_refusal`).
     refused_text: crate::input::InputOut,
+    /// The text of a held command while this game's own engine proof of it runs (`native_proving_<id>.txt`), removed when the proof
+    /// returns: a game that dies inside the proof leaves the text that killed it for the bug report (0.2.12 session: a second bulldozer
+    /// click on a junction corrupted the heap inside the own proof, and its text was never written, as it is written after the proof).
+    proving_text: crate::input::InputOut,
     inject: crate::inject::State,
     /// `FEVERLINK3_ACTING_PLAYER` (on unless `=0`, `acting.rs`): at an injection the text's owners that are its own player become the carrier's player.
     acting_player: AtomicBool,
@@ -253,6 +257,7 @@ impl Runtime {
             side_files: crate::sidefile::Bounded::default(),
             text: crate::input::InputOut::with_prefix("native_text_"),
             refused_text: crate::input::InputOut::with_prefix("native_refused_"),
+            proving_text: crate::input::InputOut::with_prefix("native_proving_"),
             inject: Default::default(),
             acting_player: AtomicBool::new(false),
             terrain: Default::default(),
@@ -906,6 +911,7 @@ impl Runtime {
         self.input.set_dir(dir);
         self.text.set_dir(dir);
         self.refused_text.set_dir(dir);
+        self.proving_text.set_dir(dir);
         self.inject_dir(dir);
         if let Some(d) = self.dump.get() {
             d.set_dir(dir);

@@ -525,12 +525,12 @@ fn an_action_of_the_pause_is_stamped_past_the_furthest_place_a_game_really_stand
     assert!(paused_actions(&h.p(b).game).is_empty());
     odd.stop = Some(p + 600);
     h.player_game(b, MessageKind::Clock, &json(&odd));
-    let first = p + 600 + Lockstep::STEP;
+    let first = p + 600 + HostSession::PAUSE_STAMP_STEPS * Lockstep::STEP;
     for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
         assert_eq!(
             vec![(1, first, 1)],
             paused_actions(game),
-            "one step past the furthest stop, to every game, the sender too"
+            "two steps past the furthest stop (a stop can be one step early), to every game, the sender too"
         );
     }
     // the next one waits until every game stands still at or past that stamp again (they run on to apply it)
@@ -539,7 +539,7 @@ fn an_action_of_the_pause_is_stamped_past_the_furthest_place_a_game_really_stand
     h.host_game(MessageKind::Clock, &stopped(first, p));
     h.player_game(a, MessageKind::Clock, &stopped(first + 3 * Lockstep::STEP, p));
     h.player_game(b, MessageKind::Clock, &stopped(first + Lockstep::STEP, p));
-    let second = first + 4 * Lockstep::STEP;
+    let second = first + 3 * Lockstep::STEP + HostSession::PAUSE_STAMP_STEPS * Lockstep::STEP;
     for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
         assert_eq!(vec![(1, first, 1), (1, second, 2)], paused_actions(game));
     }
@@ -561,7 +561,7 @@ fn an_action_of_the_pause_is_stamped_past_the_furthest_place_a_game_really_stand
         );
     }
     h.player_game(b, MessageKind::Action, &json(&ActionMessage::new(p, 2, "{b2}").paused()));
-    let third = stand + Lockstep::STEP;
+    let third = stand + HostSession::PAUSE_STAMP_STEPS * Lockstep::STEP;
     for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
         assert_eq!(Some(&(2, third, 4)), paused_actions(game).last(), "the next one past where every game stands");
     }

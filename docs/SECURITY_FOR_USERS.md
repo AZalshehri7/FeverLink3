@@ -1,6 +1,6 @@
 # What is in winhttp.dll, and how to check it
 
-For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-11-01 (version 0.2.12). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
+For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-11-02 (version 0.2.13). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
 
 ## The short version
 
@@ -89,7 +89,7 @@ The release zip holds `winhttp.dll`, the mod folder `mods\release\feverlink3` an
 | `<game folder>\feverlink3_update\` | the automatic update: `state.json` (what the next start must finish), `<version>\` (the checked new files), `backup-<version>\` (the previous mod, until the new version started well), `download\` (during a download) | the DLL | delete it (only while the game is closed) |
 | `<game folder>\winhttp.dll.old-<version>`, `winhttp.dll.failed-<version>`, `feverlink3_update_skip.txt` | the previous DLL until the new one started well; a DLL that failed and was taken back; versions not to offer again | the DLL | delete them |
 | `%LOCALAPPDATA%\FeverLink3\build-search-<timestamp>.txt` | where FeverLink3 found its places in that game build, so the next start only checks them | the DLL | optional: delete the folder |
-| `%LOCALAPPDATA%\FeverLink3\settings.txt` | `autoupdate=off` when you turned automatic updates off | the DLL, when you click the switch | optional: delete the folder |
+| `%LOCALAPPDATA%\FeverLink3\settings.txt` | `autoupdate=off` when you turned automatic updates off, `prerelease=on` when you turned pre-release updates on | the DLL, when you click the switch | optional: delete the folder |
 
 `<game folder>` is `<Steam library>\steamapps\common\Transport Fever 3\`. To open it: in Steam, right-click Transport Fever 3, Manage, Browse local files.
 
@@ -126,7 +126,7 @@ From 0.2.0 on, FeverLink3 updates itself. This section says exactly what it does
 
 **When.** Once per game start, right after the module has loaded, on a thread of its own. It does not start while you are in a session and never changes a file during one (it waits until the session is over). It is not a background service: when the game is closed, nothing runs.
 
-**What it asks.** One HTTPS request to `https://api.github.com/repos/AZalshehri7/FeverLink3/releases/latest`, GitHub's page of the newest full release of this repository (drafts and pre-releases are never listed there, and the module refuses them again). If that release is not newer than yours, nothing else happens. The request carries no personal data beyond what any web request carries (your IP address reaches GitHub; the user agent is `feverlink3-updater/<version>`).
+**What it asks.** One HTTPS request to `https://api.github.com/repos/AZalshehri7/FeverLink3/releases/latest`, GitHub's page of the newest full release of this repository (drafts and pre-releases are never listed there, and the module refuses them again). If you turned **pre-release updates** on (see below), it asks `https://api.github.com/repos/AZalshehri7/FeverLink3/releases?per_page=20` instead, the list of the newest releases, and takes the newest one there that is newer than yours, a pre-release too (never a draft); every check below applies to it the same way. If that release is not newer than yours, nothing else happens. The request carries no personal data beyond what any web request carries (your IP address reaches GitHub; the user agent is `feverlink3-updater/<version>`).
 
 **What it downloads, and the checks.** The release's `manifest.json`, its zip and the zip's `.sha256` file, only from `https://github.com/AZalshehri7/FeverLink3/releases/download/<that release's tag>/`, inside the game with Windows' own WinHTTP (`C:\Windows\System32\winhttp.dll`; no program is started; HTTPS only, also for redirects, only to GitHub's addresses `api.github.com`, `github.com`, `objects.githubusercontent.com` and `release-assets.githubusercontent.com`, TLS 1.2 or newer, the server's certificate checked by Windows, size and time limits). The first check waits two minutes after the game started. The update is used only if all of these hold:
 
@@ -141,7 +141,7 @@ From 0.2.0 on, FeverLink3 updates itself. This section says exactly what it does
 
 **If something goes wrong.** If the new version does not stay up for 30 seconds in two starts, or the mod folder cannot be swapped, the old DLL and the old mod are put back, the version goes on the skip list (`feverlink3_update_skip.txt`) and is not offered again, and the window says "Update to X failed: <reason>. You keep <old version>." A game run whose files on disk no longer match the DLL in memory does not let you host or join until you restart it.
 
-**Turning it off.** In the FeverLink3 window, Troubleshooting, "Automatic updates: on" (click to switch to off). The setting is stored in `%LOCALAPPDATA%\FeverLink3\settings.txt` (`autoupdate=off`) and counts from the next game start. A FeverLink3 that you built yourself from the source never updates itself (only the release workflow's builds do).
+**Turning it off.** In the FeverLink3 window, Troubleshooting, "Automatic updates: on" (click to switch to off). The setting is stored in `%LOCALAPPDATA%\FeverLink3\settings.txt` (`autoupdate=off`) and counts from the next game start. Under it, "Pre-release updates: off" (the default) switches to on: FeverLink3 then also installs test versions (GitHub pre-releases) before they are released for everyone; they can have new bugs, and everyone in a session needs the same version (`prerelease=on`, counts from the next check). A FeverLink3 that you built yourself from the source never updates itself (only the release workflow's builds do).
 
 ## Verify what you downloaded
 
@@ -150,8 +150,8 @@ Each release has these files: `FeverLink3-<version>.zip`, `FeverLink3-<version>.
 In PowerShell, in the folder with the downloaded files:
 
 ```powershell
-(Get-FileHash .\FeverLink3-0.2.12.zip -Algorithm SHA256).Hash.ToLower()
-Get-Content .\FeverLink3-0.2.12.zip.sha256
+(Get-FileHash .\FeverLink3-0.2.13.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content .\FeverLink3-0.2.13.zip.sha256
 
 # the DLL you installed against the manifest (your game folder: Steam, right-click Transport Fever 3, Manage, Browse local files)
 $m = Get-Content .\manifest.json -Raw | ConvertFrom-Json
@@ -173,7 +173,9 @@ As a player:
 2. If the hash matches and you trust the project: restore the file (Windows Security, Virus and threat protection, Protection history, pick the item, Actions, Restore or Allow) and, if it comes back, add an exclusion for that one file instead of a whole folder. If you do not trust it, remove FeverLink3 ("Remove it" below).
 3. Report the false positive, so it is fixed for everyone. A report that names the exact detection and carries the file's SHA-256 is the most useful, and vendors take more notice when several people report the same file.
 
-Things in the file that make heuristics suspicious, so you know what to expect: it is a proxy DLL next to a program, it is not signed, it carries no version information, it is new and few people have it (reputation systems distrust rare files), it starts a thread, reads the Steam path from the registry, and uses networking.
+Known case: Windows Defender removed the 0.2.12 release's `winhttp.dll` as `Trojan:Win32/Posilod.CA!cl` ("!cl": a verdict of Microsoft's cloud, not a signature). Since 0.2.13 the file carries version information (product FeverLink3, its version, publisher and description), which you can see in its Properties, Details.
+
+Things in the file that make heuristics suspicious, so you know what to expect: it is a proxy DLL next to a program, it is not signed, it is new and few people have it (reputation systems distrust rare files), it starts a thread, reads the Steam path from the registry, and uses networking.
 
 ### Where to report a false positive
 

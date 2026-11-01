@@ -222,7 +222,7 @@ mod tests {
     use super::*;
 
     fn opened(conn: u64) -> NetEvent {
-        NetEvent::Opened { conn, peer: None }
+        NetEvent::Opened { conn, peer: None, account: None }
     }
 
     fn conn_of(e: &NetEvent) -> u64 {

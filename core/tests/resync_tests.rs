@@ -1787,7 +1787,7 @@ fn after_the_load_the_pause_is_the_time_the_games_loaded_at() {
 
     // an action of the pause made now is stamped past the loaded world's time on every game
     h.player_game(ids[0], MessageKind::Action, &json(&ActionMessage::new(saved, 1, "{a}").paused()));
-    let first = saved + Lockstep::STEP;
+    let first = saved + HostSession::PAUSE_STAMP_STEPS * Lockstep::STEP;
     assert_eq!(vec![(1, first)], pause_order(&h.p(ids[0]).game));
     assert_eq!(vec![(1, first)], pause_order(&h.host_game));
     report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
@@ -1844,7 +1844,7 @@ fn an_action_of_the_pause_made_before_the_load_is_stamped_after_the_loaded_time(
     assert!(pause_order(&h.p(ids[0]).game).iter().all(|&(seq, _)| seq != 8), "the player's loaded clock is not in yet");
     h.player_game(ids[0], MessageKind::Clock, &still(saved, saved));
     let order = pause_order(&h.p(ids[0]).game);
-    assert!(order.contains(&(8, saved + Lockstep::STEP)), "{order:?}");
+    assert!(order.contains(&(8, saved + HostSession::PAUSE_STAMP_STEPS * Lockstep::STEP)), "{order:?}");
     assert!(order.iter().all(|&(_, at)| at > saved), "no stamp at or before the loaded time: {order:?}");
     assert_eq!(order, pause_order(&h.host_game), "the same order on the host's game");
 }
