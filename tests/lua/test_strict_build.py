@@ -615,7 +615,7 @@ class StrictOnTest(StrictTest):
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
         self.tick(40)
         (_, pa), (_, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
-        self.assertEqual(pa, pb, "every checksum part agrees")
+        self.assertEqual(N.content_parts(pa), N.content_parts(pb), "every checksum part agrees")
         self.assertIn("companies", pa)
 
     def test_terrain_tools_are_switched_off_during_a_session_and_on_again_at_its_end(self):
@@ -755,7 +755,7 @@ class StrictOnTest(StrictTest):
             self.assertEqual((self.A.native.released, self.B.native.released), ([1], [1]))
             self.relay.checksum_request(1, self.relay.future_stamp(), False)
             self.tick(40)
-            self.assertEqual(self.relay.reports[1][0][1], self.relay.reports[1][1][1])
+            self.assertEqual(N.content_parts(self.relay.reports[1][0][1]), N.content_parts(self.relay.reports[1][1][1]))
 
         self.cases([("the held event before the tool event", {}, held_event_first), ("two commands held at once", {}, two_held_at_once),
                     ("a preview that gets no held command", {}, preview_without_command), ("a tool build the module did not hold", {}, not_held),
@@ -839,6 +839,7 @@ class StrictOnTest(StrictTest):
             self.tick(14)
             self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]), "never given back to the engine")
             self.assertIn("was refused at its stamp: FAILED, NOT released", self.B.log())
+            self.assertEqual(self.relay.replay_failed, [], "its own cancel comes back as `dropped`: no game has the build, nothing is asked")
             self.assertEqual(self.B.builds_applied(), 0, "the refused build is not applied on its originator")
             self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "nothing stays held")
 
@@ -896,11 +897,52 @@ class StrictOnTest(StrictTest):
             self.tick(16)
             self.assertEqual(self.B.native.released, [1])
             self.assertIn("released by the module (hold_off) before its stamp", self.B.log())
+            # in this world steps before its stamp, at the stamp on the other: the entity ids part, so the repair is asked for at once
+            self.assertEqual([g for g, d in self.relay.replay_failed], [1], "the early release asks for the repair, once")
             self.assertEqual(self.B.shipped_count(), 1, "shipped once")
             self.assertNotIn("native build captured", self.B.log())
             self.assertIn("is the early release of the held command of 1:1", self.B.log())
             self.assertSameWorld()
             self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+
+        def lost_by_the_module():
+            # owner decision 2026-11-01: the module destroys or fails a shipped held build on its own (its age limit outside a pause, a
+            # tool used while the mod is silent, the control file gone: `completed` with a failed result; an older module: `dropped`).
+            # Nothing of it comes into this world and the other game applies it at the stamp: the repair is asked for at once, once each.
+            self.start()
+            for i, (kind, p) in enumerate((("completed", {"ok": False, "fired": True, "reason": "timeout", "ms": 0}), ("dropped", {"reason": "timeout"}))):
+                self.B.tool(self.road(300 + 200 * i, 0, 400 + 200 * i, 0))
+                self.frames(2)
+                hid = self.B.native.held[-1]
+                self.B.native.ring = [e for e in self.B.native.ring if e["id"] != hid]
+                self.B.L.globals().NATIVE_DROP(hid)
+                self.B.native.emit(kind, dict(p, id=hid))
+                self.tick(16)
+            self.assertEqual([g for g, d in self.relay.replay_failed], [1, 1], self.relay.replay_failed)
+            self.assertIn("failed by the native module before its stamp (timeout)", self.relay.replay_failed[0][1])
+            self.assertIn("destroyed by the native module before its stamp (timeout)", self.relay.replay_failed[1][1])
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (2, 0), "applied on the other game only")
+            self.assertNotIn("release", self.B.native.ctl_kinds(), "never released at the stamp")
+            self.assertEqual(self.B.shipped_count(), 2)
+            # released by this game at the stamp, but the module never read the `release` before its age limit failed the command (it
+            # fails only a command still waiting): the build is missing here whatever this game wrote, so that asks for the repair too
+            native, orig = self.B.native, self.B.native.handle
+            native.handle = lambda seq, kind, p: None if kind == "release" else orig(seq, kind, p)
+            self.B.tool(self.road(700, 0, 800, 0))
+            self.frames(2)
+            hid = native.held[-1]
+            self.tick(16)
+            self.assertIn("release", native.ctl_kinds(), "this game wrote the release at the stamp")
+            self.assertEqual(len(self.relay.replay_failed), 2, "nothing asked while the release may still land")
+            native.handle = orig
+            native.ring = [e for e in native.ring if e["id"] != hid]
+            self.B.L.globals().NATIVE_DROP(hid)
+            native.emit("completed", {"ok": False, "fired": True, "reason": "timeout", "ms": 0, "id": hid})
+            self.tick(4)
+            self.assertEqual([g for g, d in self.relay.replay_failed], [1, 1, 1], self.relay.replay_failed)
+            self.assertIn("failed by the native module before it read this game's release (timeout)", self.relay.replay_failed[2][1])
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (3, 0))
+            self.assertNotIn("never entered this game's queue", self.B.log(), "it left the queue at its stamp: no drop says this game vetoed it")
 
         # real run 2026-10-11: a held host build was never released at its stamp, a resync saved a world without it and the module's 30 s
         # limit put it into the world later, shipped a second time
@@ -958,18 +1000,43 @@ class StrictOnTest(StrictTest):
             self.assertEqual(self.A.native.held, [1])
             self.frames(500)   # the game is stopped (frames go on, the clock does not) for longer than the limit
             self.assertEqual((self.A.native.released, self.A.native.dropped), ([], [1]), "never given back early")
-            self.assertTrue(any("game stayed paused too long" in c[1] for c in self.relay.chats))
+            self.assertTrue(any("stood still too long before the build was due" in c[1] for c in self.relay.chats))
             self.assertEqual(self.B.builds_applied(), 0)
 
+        def pause_menu_after_the_click():
+            # review 2026-10-31: the pause menu (or a freeze) right after the click stops every script; the module leaves that silence out
+            # of the command's age, and the others run on past the stamp meanwhile (the host's stall rule). Counted as held time, it
+            # cancelled the build at the return on this game alone, too late for the others. Left out, it is released at its stamp.
+            self.start(speed=2)
+            self.tick(6)
+            self.A.tool(self.road(300, 0, 400, 0))
+            self.tick(1)
+            self.assertEqual(self.A.native.held, [1])
+            self.clock.advance(25)   # 25 s without a frame on either game (the host's stall is not emulated), the fake module not serviced either
+            self.tick(16)
+            self.assertEqual((self.A.native.released, self.A.native.dropped), ([1], []), "released at its stamp, never vetoed")
+            self.assertNotIn("while the session ran", self.log())
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.relay.replay_failed), (1, 1, []))
+            self.assertSameWorld()
+
         self.cases([("a late stamp", {}, late_stamp), ("given back early by the module", {}, given_back_early),
+                    ("destroyed or failed by the module on its own", {}, lost_by_the_module),
                     ("a town build while held", FIRE, town_build), ("a resync request while held", FIRE, resync_while_held),
                     ("the stamp passed without a release", FIRE, stamp_passed_without_a_release),
-                    ("held in a game that stays paused", FIRE, paused_past_the_limit)])
+                    ("held in a game that stays paused", FIRE, paused_past_the_limit),
+                    ("the pause menu right after the click", FIRE, pause_menu_after_the_click)])
 
     def test_strict_mode_stops_before_a_reload_or_the_session_end_and_comes_back_by_itself(self):
         def resync_load():
             self.start()
             self.strict_on(self.B)
+            # a shipped build held for its stamp when the load comes: hold_off gives it back early while the session goes on, but the load
+            # replaces this world, so it asks for nothing (natStop's `going`, false here, is what keeps the request back)
+            self.B.tool(self.road(1500, 0, 1600, 0))
+            self.frames(3)
+            self.assertEqual((self.B.shipped_count(), self.B.native.released), (1, []))
+            # an event nobody registered, counted in the script-GUI state: the load replaces that state, so the count is written before it
+            self.B.send_gui('for i = 1, 2 do api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Tutorial", "Step", {})) end')
             n_ctl = len(self.B.native.ctl_records())
             # what native_ctl.log holds at the very moment the game is told to load
             self.B.run("local base = app.loadGame; app.loadGame = function(id, flag) local f = io.open(%s, 'rb'); CTL_AT_LOAD = f and f:read('*a') or ''; if f then f:close() end; return base(id, flag) end"
@@ -981,6 +1048,10 @@ class StrictOnTest(StrictTest):
             self.assertIn("hold_off", [k for _, k, _ in self.B.native.ctl_records()[n_ctl:]], "hold_off was written before the load")
             self.B.native.service()
             self.assertFalse(self.B.native.holding, "the module stopped holding before the scripts were replaced")
+            self.assertIn("goes back to the engine before its stamp (resync load)", self.B.log())
+            self.assertEqual(self.relay.replay_failed, [], "a resync load asks for no repair")
+            self.assertIn("resync: before the load: events nobody registered that the script-GUI state sent, each applied on this game only"
+                          " (name xtimes): Tutorial/Step x2", self.B.log())
             self.B.reload()
             self.relay.session()   # the launcher tells the reloaded game the session state again (as in the resync test)
             self.tick(6)
@@ -995,9 +1066,10 @@ class StrictOnTest(StrictTest):
                             "the reloaded script writes a control file of its own: %r %r" % (before, after))
             self.B.tool(self.road(300, 0, 400, 0))   # and a build after the reload is strict again
             self.tick(20)
-            self.assertEqual(self.B.native.released, [1])
+            self.assertEqual(self.B.native.released, [1, 2], "the one given back at the load, then the new one at its stamp")
             self.assertSameWorld()
-            self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.B.shipped_count()), (1, 1, 1))
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.B.shipped_count()), (2, 2, 2))
+            self.assertEqual(self.relay.replay_failed, [])
 
         def scripts_restarted():
             self.start()
@@ -1030,6 +1102,7 @@ class StrictOnTest(StrictTest):
             self.end_session_of_b()   # the session ended while the command is held: strict mode stops
             self.frames(30)
             self.assertIn("goes back to the engine before its stamp (the session ended)", self.B.log())
+            self.assertEqual(self.relay.replay_failed, [], "the session's end asks for no repair")
             # B's game is single-player now and sends no more clock lines; the host tells A that B left (its promise no longer holds A)
             self.relay.broadcast("player_left", self.relay.ser({"id": 1}), exclude=self.B)
             self.tick(16)
@@ -1134,11 +1207,20 @@ class StrictOnTest(StrictTest):
         def three_faults():
             self.start()
             for i in range(3):
+                if i == 2:
+                    # a build shipped and held for its stamp when the third fault switches strict mode off: given back now, it lands here
+                    # before the stamp the other game applies it at (owner decision 2026-11-01: asked for at once, once)
+                    self.B.tool(self.road(1500, 0, 1600, 0))
+                    self.frames(3)
+                    self.assertEqual(self.B.shipped_count(), 1)
                 self.B.tool(self.road(300 + 200 * i, 0, 400 + 200 * i, 0))
                 self.B.run("FAIL_NEXT_PLAYER = true")
                 self.tick(14)
             self.assertIn("three faults", self.B.log())
             self.assertFalse(self.B.native.holding)
+            self.assertIn("goes back to the engine before its stamp (three faults)", self.B.log())
+            self.assertEqual([g for g, d in self.relay.replay_failed], [1], self.relay.replay_failed)
+            self.assertIn("strict mode went off during the session (three faults)", self.relay.replay_failed[0][1])
             self.tick(320)   # 64 s
             self.assertIn("mode re-armed after three faults", self.B.log())
             self.strict_on(self.B)
@@ -1357,6 +1439,9 @@ class VetoTest(StrictTest):
         self.relay.send(self.B, "build_veto", 0, self.relay.ser({"seq": 2, "owner": 1, "why": "unresolved node 1,2,3", "from": 0, "name": "host"}))
         self.tick(2)
         self.assertEqual(len(self.relay.chats), chats, "a second veto of the same build adds no second line")
+        # review 2026-10-31: the command is cancelled already, nothing of it is in any world: no resync of equal worlds
+        self.assertEqual(self.relay.replay_failed, [], "a second veto of a cancelled build asks for no repair")
+        self.assertIn("the command was cancelled or failed already", self.B.log())
         # the tool of a vetoed build is freed by its fired callback, and the session goes on
         self.B.tool(self.road(500, 0, 600, 0))
         self.tick(20)
@@ -1652,6 +1737,22 @@ class PausedGraceTest(StrictTest):
             self.assertIn("unresolved segment", self.B.log())
             self.assertEqual(self.A.log().count("notice client: client's build"), 1, "the other game gets that one notice, not a chat line")
 
+        def lost_in_the_grace():
+            # the module fails the held command on its own while its record is parked on the other game (owner decision 2026-11-01): no
+            # commit is sent now, the originator's veto drops the parked record, no game has the build, so nothing is asked
+            self.pause()
+            self.B.tool(self.road(300, 0, 400, 0))
+            self.frames(2)
+            self.assertEqual((self.B.native.held, self.relay.commits), ([1], []))
+            self.B.native.ring = []
+            self.B.L.globals().NATIVE_DROP(1)
+            self.B.native.emit("completed", {"id": 1, "ok": False, "fired": True, "reason": "control_gone", "ms": 0})
+            self.tick(20)
+            self.assertEqual((self.relay.commits, self.relay.replay_failed, len(self.relay.vetoes)), ([], [], 1))
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
+            self.assertIn("in its grace: its commit is not sent, the veto tells the other games to drop the parked record", self.B.log())
+            self.assertSameWorld()
+
         def unpaused_in_the_grace():
             self.pause()
             self.B.tool(self.road(300, 0, 400, 0))
@@ -1667,14 +1768,63 @@ class PausedGraceTest(StrictTest):
             self.assertSameWorld()
             self.assertIn("no longer paused", self.B.log())
 
-        def commit_never_comes():
+        def commit_comes_late():
+            # review 2026-10-31: the host keeps a paused commit in its pause order until every game said where it stands (a player in the
+            # pause menu says nothing for minutes): the peer keeps the parked record on no clock and applies it when the commit comes
             self.pause()
-            orig = self.relay.send
-            self.relay.send = lambda g, kind, frm, payload: None if kind == "build_commit" else orig(g, kind, frm, payload)
+            flush = self.relay.flush_pause
+            self.relay.flush_pause = lambda: None
             self.B.tool(self.road(300, 0, 400, 0))
-            self.frames(260)   # 13 s of interface frames
-            self.assertIn("originator never committed it: dropped", self.A.log())
-            self.assertEqual(self.A.builds_applied(), 0)
+            self.frames(2600)   # 130 s of interface frames: past every time limit of the peer and of the originator
+            self.assertEqual((self.relay.vetoes, self.relay.commits, self.relay.replay_failed), ([], [], []), "no veto, no repair while it waits")
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
+            self.relay.flush_pause = flush
+            self.tick(14)
+            self.assertEqual(len(self.relay.commits), 1)
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1), "applied on every game at its commit")
+            self.assertSameWorld()
+            self.assertEqual((self.relay.vetoes, self.relay.replay_failed), ([], []))
+            self.assertNotIn("dropped from the parked records", self.A.log())
+            self.assertIn("held 1 (1:1) applied by the engine", self.B.log(), "the record released minutes after the click is still there")
+            # a third game's veto long after (it read the record late): the originator has the build, the vetoing game not. It still knows
+            # once the record is forgotten (review 2026-10-31: forgotten 120 s after the click, the veto was "not held here", nothing asked)
+            self.frames(2600)
+            self.relay.send(self.B, "build_veto", 0, self.relay.ser({"seq": 1, "owner": 1, "why": "unresolved node 1,2,3", "from": 2, "name": "third"}))
+            self.tick(2)
+            self.assertEqual([g for g, d in self.relay.replay_failed], [1], "one request, from the originator")
+            self.assertIn("released more than 2 minutes ago", self.B.log())
+            # only memory bounds the parked records: one dropped for it cannot be applied here, so its commit asks for the repair, once
+            self.A.L.execute(T.FIND_UP)
+            self.A.L.execute("FIND_UP('X').PARK_CAP = 0")
+            self.B.tool(self.road(500, 0, 600, 0))
+            self.tick(14)
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 2), "this world lacks the build the other has")
+            self.assertEqual([g for g, d in self.relay.replay_failed[1:]], [0])
+            self.assertIn("dropped its parked record for memory", self.relay.replay_failed[1][1])
+
+        def made_just_before_a_pause():
+            # review 2026-10-31: its stamp lies past the pause point, so it waits for the resume however long the pause lasts. The module
+            # does not age a held command while the session stands still (the pings say so), and neither does the watchdog now: it was
+            # cancelled on every game after 20 s of pause
+            self.start(speed=2)
+            self.tick(6)
+            self.B.tool(self.road(300, 0, 400, 0))
+            self.frames(2)
+            stamp = self.B.action_records()[0]["stamp"]
+            self.relay.pauseAt = (max(self.A.time(), self.B.time()) // STEP + 2) * STEP
+            self.assertLess(self.relay.pauseAt, stamp)
+            self.relay.session()
+            self.tick(18)
+            self.frames(600)   # 30 s of session pause
+            self.assertEqual((self.B.native.released, self.B.native.dropped, self.relay.vetoes), ([], [], []), "still held, nothing vetoed")
+            self.assertTrue([h for h in self.B.native.heard if h[2] == "ping"][-1][3].get("paused"), "the pings tell the module")
+            self.relay.pauseAt = None
+            self.relay.session()
+            self.tick(30)
+            self.assertEqual(self.B.native.released, [1])
+            self.assertEqual((self.A.builds(), self.B.builds()), (["makeWorldBuildProposalCmd@%d" % stamp],) * 2, "applied at its stamp on both")
+            self.assertSameWorld()
+            self.assertEqual((self.relay.vetoes, self.relay.replay_failed), ([], []))
 
         def second_build_needs_the_first():
             self.pause()
@@ -1700,7 +1850,8 @@ class PausedGraceTest(StrictTest):
             self.assertEqual((self.relay.vetoes, self.B.native.released), ([], [1, 2]))
 
         self.cases([("the grace, then the commit", {}, grace_then_commit), ("a veto in the grace", {}, veto_in_the_grace),
-                    ("unpaused in the grace", {}, unpaused_in_the_grace), ("the commit never comes", {}, commit_never_comes),
+                    ("failed by the module in the grace", {}, lost_in_the_grace), ("unpaused in the grace", {}, unpaused_in_the_grace), ("the commit comes late", {}, commit_comes_late),
+                    ("made just before a pause", {}, made_just_before_a_pause),
                     ("a second build that needs the first", {}, second_build_needs_the_first),
                     ("a depot, then a road from its street end", {}, depot_then_road_from_its_street_end)])
 

@@ -12,6 +12,7 @@ use crate::session::messages::{
     ResyncSaveMessage, SaveDoneMessage, SessionState, CAP_RESYNC_SOURCE,
 };
 use crate::session::notices::{self, Level};
+use crate::session::policy::ChecksumPolicy;
 use crate::session::resync::{normalize_sha256, IncomingSave, ResyncLimits, ResyncState};
 use crate::session::verdict::{Verdict, VerdictOutcome};
 
@@ -49,7 +50,8 @@ pub(super) struct ResyncRound {
     /// The time the participants' games said hello at after the load (the save's time), once one has.
     loaded_at: Option<i64>,
     file: Option<FileInfo>,
-    /// Players present when the transfer started: they get the chunks and the load, and must say Hello again.
+    /// Fixed at file_ready: the host's game and the players present at the round's mod check (SaveDone, `mods_checked`) who are
+    /// still connected. They get the chunks and the load, and must say Hello again.
     participants: Option<BTreeSet<u16>>,
     /// Participants whose save travels another way (bulk datagrams): they are not sent `ResyncChunk`s, and the
     /// launcher falls back to [`HostSession::resync_chunk_to`] for one whose transfer fails.
@@ -70,6 +72,11 @@ pub(super) struct ResyncRound {
     source: u16,
     /// A player's game is the source and said its save is done: its launcher uploads the file (`ResyncUpload`) into this.
     upload: Option<IncomingSave>,
+    /// The players present when the round's save was done, whose mods `check_world_mods` compared with this world (`None`
+    /// before the save is done). Only they become participants at file_ready: a player admitted later waits for the next
+    /// round, whose save checks it first (review 2026-10-31: such a joiner got the world without the world mod check).
+    /// A player that leaves is taken out (`forget_participant`), so a game gets the world only if it was there since the check.
+    mods_checked: Option<BTreeSet<u16>>,
 }
 
 impl ResyncRound {
@@ -105,6 +112,19 @@ impl HostSession {
     /// player is connected.
     pub fn resync_file_ready(&mut self, id: i32, sha256: &str, len: u64) -> Vec<HostOutput> {
         self.file_ready(id, sha256, len);
+        self.drain()
+    }
+
+    /// The launcher cannot provide round `id`'s save (the source player's upload could not be written, or the file it
+    /// found is missing, older than the round or not the uploaded one): the round fails now with `reason` instead of
+    /// waiting out its transfer timeout, and no game loads anything (review 2026-10-31: a failed write let an earlier
+    /// session's same-named save go out to every game). Ignored unless round `id` is in Transferring.
+    pub fn resync_abort(&mut self, id: i32, reason: &str) -> Vec<HostOutput> {
+        if self.resync.as_ref().is_some_and(|r| r.id == id && r.state == ResyncState::Transferring) {
+            self.fail(format!("the launcher cannot provide the save: {reason}"));
+        } else {
+            self.log(format!("resync {id}: abort ignored ({reason}): the round is not transferring"));
+        }
         self.drain()
     }
 
@@ -176,6 +196,11 @@ impl HostSession {
             r.bulk.remove(&id);
             if let Some(participants) = r.participants.as_mut() {
                 participants.remove(&id);
+            }
+            // the round compared the mods of the Join it left with; a return is a new Join whose mods were never compared, so it
+            // waits like any joiner after the check (review 2026-11-01: a return before file_ready was given the world unchecked)
+            if let Some(checked) = r.mods_checked.as_mut() {
+                checked.remove(&id);
             }
             r.held.retain(|(to, ..)| *to != id);
         }
@@ -348,6 +373,7 @@ impl HostSession {
             held: Vec::new(),
             source: Self::HOST_ID,
             upload: None,
+            mods_checked: None,
         });
         self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
@@ -364,12 +390,26 @@ impl HostSession {
         self.outsiders.insert(id);
         match &self.resync {
             None => self.begin_resync(reason),
-            Some(r) if r.participants.is_some() => {
+            // past the save the round's mod check has run without this player: the next round checks it and brings it the world
+            Some(r) if r.participants.is_some() || r.mods_checked.is_some() => {
                 self.pending_new_player = Some(reason);
                 self.log(format!("{reason} waits for the next resync round"));
             }
             Some(_) => {}
         }
+    }
+
+    /// Whether a round still sends player `id` its load: the round waiting to start takes every connected player, a running round
+    /// whose participants are not fixed yet takes at file_ready the players present at its mod check (SaveDone) who are still
+    /// connected (one that came in after the check is pending, so the first case covers it), and one in Transferring or Loading
+    /// sends (or sent) its participants the load. A participant of a round past Loading (its hello came after the timeout) is not
+    /// taken in any more.
+    pub(super) fn round_takes_in(&self, id: u16) -> bool {
+        self.pending_new_player.is_some()
+            || self.resync.as_ref().is_some_and(|r| match &r.participants {
+                None => true,
+                Some(p) => p.contains(&id) && matches!(r.state, ResyncState::Transferring | ResyncState::Loading),
+            })
     }
 
     /// From the save to the load: the games' worlds are about to be replaced by the save, so what they report (where they stand still)
@@ -386,10 +426,18 @@ impl HostSession {
     /// the pause stayed at 10341800 after both games had loaded the save at 10342400; a build made then was stamped at the stale pause
     /// and reached the other game 3 steps after its stamp (LATE, a fork, another resync). The game's clock from before the load goes
     /// too: it describes the world it left (the clock that follows the hello is the loaded world's).
+    ///
+    /// Only a game that was sent this round's load says hello of the save: every participant once the round is in Loading, the host's
+    /// game in Transferring when it loaded early. Any other hello is of the game's own world (review 2026-10-31: a joiner taken in just
+    /// before file_ready said hello from its own later save during Transferring, and the pause and the verify stamp moved to that date).
     pub(super) fn on_load_hello(&mut self, from: u16, time: i64) {
         let Some(r) = self.resync.as_mut() else { return };
-        let loading = matches!(r.state, ResyncState::Transferring | ResyncState::Loading);
-        if !loading || !r.participants.as_ref().is_some_and(|p| p.contains(&from)) {
+        let sent_load = match r.state {
+            ResyncState::Loading => true,
+            ResyncState::Transferring => from == Self::HOST_ID && r.host_loading,
+            _ => false,
+        };
+        if !sent_load || !r.participants.as_ref().is_some_and(|p| p.contains(&from)) {
             return;
         }
         if !PlayerClock::plausible(time, 0) {
@@ -405,12 +453,9 @@ impl HostSession {
         r.loaded_at = Some(loaded);
         r.pause_at = r.pause_at.max(loaded);
         let pause = r.pause_at;
-        let sent_load = r.state == ResyncState::Loading;
         self.clocks.remove(&from);
-        // its world is the session's now (a player is sent the load as the round enters Loading; a hello before that is not of the save)
-        if sent_load {
-            self.outsiders.remove(&from);
-        }
+        // its world is the session's now
+        self.outsiders.remove(&from);
         if let Some(t) = earlier.filter(|&t| t != time) {
             // one save, one time: a game that says otherwise did not load what the others did (the verify round will tell)
             let who = self.name(from);
@@ -627,6 +672,10 @@ impl HostSession {
             // before any world data goes out: the players' mods against the ones this world uses
             let world = m.world_mods();
             self.check_world_mods(world.as_deref());
+            let checked: BTreeSet<u16> = self.players.keys().copied().collect();
+            if let Some(r) = self.resync.as_mut() {
+                r.mods_checked = Some(checked);
+            }
             if source == Self::HOST_ID {
                 self.enter(ResyncState::Transferring, "waiting for the launcher to read the save".to_owned());
             } else {
@@ -699,7 +748,26 @@ impl HostSession {
             self.fail(format!("a save of {len} bytes cannot be sent (1 byte to 512 MiB)"));
             return;
         };
-        let participants: BTreeSet<u16> = self.players.keys().copied().collect();
+        // every game given this world passed its mod check at SaveDone and stayed since; one that joined or returned after waits for
+        // the next round. on_new_player already made each of those an outsider pending for it: the loop below is a guard that keeps
+        // this true whatever the path, and the line to grep. Without a recorded check no player is given the world (fail closed).
+        let checked = self.resync.as_ref().and_then(|r| r.mods_checked.clone());
+        let (participants, late): (BTreeSet<u16>, Vec<u16>) = {
+            let (inn, out): (Vec<u16>, Vec<u16>) = self
+                .players
+                .keys()
+                .copied()
+                .partition(|id| *id == Self::HOST_ID || checked.as_ref().is_some_and(|c| c.contains(id)));
+            (inn.into_iter().collect(), out)
+        };
+        for id in late {
+            self.outsiders.insert(id);
+            if self.pending_new_player.is_none() {
+                self.pending_new_player = Some("new player");
+            }
+            let who = self.name(id);
+            self.log(format!("{who} came in after the round's mod check; it waits for the next resync round"));
+        }
         let remote = participants.iter().any(|&p| p != Self::HOST_ID);
         if let Some(r) = self.resync.as_mut() {
             r.file = Some(FileInfo { sha256, len, count, next: 0 });
@@ -948,8 +1016,12 @@ impl HostSession {
     }
 
     /// The first compared round a player caught up after a drop took part in (`HostSession::begin_catch_up`): the same world, or a
-    /// repair at once (today's resync: every game gets the host's world), without waiting for the policy's second round. True when
-    /// the repair was asked for.
+    /// repair (today's resync: every game gets the host's world) without waiting for the policy's second round. Only an ordinary
+    /// part counts: a drift lane (vehicles, persons, script:*) may differ in a healthy session and has the policy's drift window,
+    /// and money (balance, loan) can round differently for one round, so it waits for the policy's second round; both go on to the
+    /// policy as in any round. The repair is the policy's decision, so it
+    /// keeps the cooldown (review 2026-10-31: a caught-up player whose vehicles differed reloaded every game at once, cooldown or
+    /// not, the very reload catching up avoids). True when the round was judged here (repair asked for, or waiting for the cooldown).
     fn check_caught_up(&mut self, outcome: &ChecksumOutcome) -> bool {
         if !outcome.comparable() {
             return false;
@@ -959,17 +1031,33 @@ impl HostSession {
             return false;
         }
         let names = checked.iter().map(|&id| self.name(id)).collect::<Vec<_>>().join(", ");
-        if outcome.differences.is_empty() {
-            self.log(format!("resume: {names} caught up and the worlds match (checksum round {})", outcome.n));
+        let ordinary: Vec<&str> = outcome
+            .differing_parts()
+            .filter(|p| !ChecksumPolicy::is_drift_part(p) && !ChecksumPolicy::is_money_part(p))
+            .collect();
+        if ordinary.is_empty() {
+            let rest = if outcome.differences.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " apart from {} (left to the policy)",
+                    ChecksumPolicy::describe_parts(outcome.differing_parts())
+                )
+            };
+            self.log(format!("resume: {names} caught up and the worlds match{rest} (checksum round {})", outcome.n));
             return false;
         }
-        let parts: Vec<&str> = outcome.differing_parts().collect();
         self.log(format!(
-            "resume: {names} caught up but the worlds differ in checksum round {} ({}): repair",
+            "resume: {names} caught up but the worlds differ in checksum round {} ({}): repair requested (policy decides)",
             outcome.n,
-            parts.join(", ")
+            ordinary.join(", ")
         ));
-        self.request_resync(format!("{names}'s world differs after catching up"));
+        // Judged here, so `on_outcome` is skipped for this round: its drift parts neither open nor extend the drift window. That costs
+        // nothing, since the repair asked for here (now or at the cooldown's end) reloads every game, drift included.
+        let now = self.now();
+        let waited = self.policy.pending().is_some();
+        let decision = self.policy.on_resume_differs(now, &names);
+        self.policy_decided(now, waited, decision);
         true
     }
 
@@ -1018,7 +1106,7 @@ impl HostSession {
                 let names = |ids: Vec<u16>| ids.into_iter().map(|g| self.name(g)).collect::<Vec<_>>().join(", ");
                 if refused.is_empty() {
                     self.log(format!(
-                        "action {key}: applied on {} with different results (a terrain edit's heights differ): the worlds forked at this action",
+                        "action {key}: applied on {} with different results (a terrain edit's heights, or a game's own rebuild of a build the others applied as the exact copy): the worlds forked at this action",
                         names(applied)
                     ));
                 } else {

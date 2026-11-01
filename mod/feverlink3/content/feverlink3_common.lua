@@ -127,12 +127,24 @@ C.SESSION_START = nil -- {gen, offset}: to_game.log lines before this place belo
 C.GEN = 0             -- counts the sessions this Lua state has seen begin: a half that started in another one must end first
 C.ROLE = nil
 
--- `start=<gen>:<offset>` as a place in to_game.log (nil without one)
-local function startPos(text)
-	local g, o = text:match("start=(%d+):(%d+)[" .. CR .. NL .. "]")
+-- the value of `start=<gen>:<offset>` as a place in to_game.log (nil without one)
+local function startPos(v)
+	local g, o = (v or ""):match("^(%d+):(%d+)$")
 	g, o = tonumber(g), tonumber(o)
 	if g and o and g >= 1 then return { gen = g, offset = o } end
 	return nil
+end
+
+-- identity.txt's complete lines as { key = value }, each key read from the start of its own line (the first one wins). The writer
+-- puts one field a line and cleans CR, LF and tab out of the values, so a value (the player's name) can never be read as another
+-- key (review 2026-10-31: a name ending in `role=host` was taken for the role, also while the real role line was not written yet).
+local function identityFields(text)
+	local f = {}
+	for line in text:gmatch("([^" .. CR .. NL .. "]*)" .. CR .. "?" .. NL) do
+		local k, v = line:match("^([%w_]+)=(.*)$")
+		if k and f[k] == nil then f[k] = v end
+	end
+	return f
 end
 
 -- identity.txt as a table, or nil when it is missing or incomplete (only a complete `role=` line counts: the writer puts it
@@ -140,14 +152,15 @@ end
 function C.readIdentity()
 	local text = C.readFile(C.path("identity.txt"))
 	if not text then return nil end
-	local role = text:match("role=(%a+)[" .. CR .. NL .. "]")
+	local f = identityFields(text)
+	local role = (f.role or ""):match("^(%a+)$")
 	if not role then return nil end
 	return {
 		role = role,
-		id = tonumber(text:match("id=(%d+)")),
-		name = text:match("name=([^" .. CR .. NL .. "]*)"),
-		session = text:match("session=([%w%-]+)[" .. CR .. NL .. "]") or "",
-		start = startPos(text),
+		id = tonumber((f.id or ""):match("^(%d+)")),
+		name = f.name,
+		session = (f.session or ""):match("^([%w%-]+)$") or "",
+		start = startPos(f.start),
 	}
 end
 
@@ -471,6 +484,34 @@ function C.callerOf(wrapper, own)
 		end
 	end
 	return nil
+end
+
+-- ------------------------------------------------------------------ a line that may repeat every frame
+
+-- A wrapped sendCommand can see the same thing in every frame (a script GUI whose guiUpdate sends one command each time), so its line is
+-- written the first time, then at every C.TALLY_EVERY-th time with the count so far, and the counts once more at the end of the session
+-- (C.tallyText). `book`: the caller's table, one per session; `key`: what is counted (an event's or a command's name). More than
+-- C.TALLY_KEYS names are counted as one, "(other names)", so a sender that makes up a new name each time cannot fill the log either.
+-- Returns whether to write the line now, the count, and the key it was counted under.
+C.TALLY_EVERY = 1000
+C.TALLY_KEYS = 64
+function C.tally(book, key)
+	book.n = book.n or {}
+	key = tostring(key)
+	if book.n[key] == nil and (book.keys or 0) >= C.TALLY_KEYS then key = "(other names)" end
+	if book.n[key] == nil then book.keys = (book.keys or 0) + 1 end
+	local n = (book.n[key] or 0) + 1
+	book.n[key] = n
+	return n == 1 or n % C.TALLY_EVERY == 0, n, key
+end
+
+-- A book's counts as one text, "name xN" in the order of the names; nil when nothing was counted.
+function C.tallyText(book)
+	local out = {}
+	for key, n in pairs(type(book) == "table" and book.n or {}) do out[#out + 1] = key .. " x" .. tostring(n) end
+	if #out == 0 then return nil end
+	table.sort(out)
+	return table.concat(out, ", ")
 end
 
 -- ------------------------------------------------------------------ a command callback's result entities

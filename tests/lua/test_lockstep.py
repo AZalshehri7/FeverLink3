@@ -184,6 +184,12 @@ function EXECUTE(cmd, cb)
     if cb then cb({}, true, {}) end
     return
   end
+  if name == "makeCreateIndustryExtendProposalCmd" then
+    -- a query: the engine answers with a proposal and changes nothing
+    QUERIES = (QUERIES or 0) + 1
+    if cb then cb({}, true, {}) end
+    return
+  end
   if name == "makeJournalBookAssetCmd" then
     assert(a[1] == 7, "player entity expected")
     ACCOUNT.balance = ACCOUNT.balance + a[2].amount
@@ -240,7 +246,7 @@ function MAKE_API()
       GAME.guiQueue[#GAME.guiQueue + 1] = { c, cb }
     end,
   }
-  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd", "makeJournalBookAssetCmd", "makeTownUpdateSizeCmd", "makeTownUpdateCargoNeedsCmd" }) do
+  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd", "makeJournalBookAssetCmd", "makeTownUpdateSizeCmd", "makeTownUpdateCargoNeedsCmd", "makeCreateIndustryExtendProposalCmd" }) do
     cmd[n] = mk(n)
   end
   return {
@@ -343,7 +349,6 @@ function LOAD_HALF(label)
   local env = setmetatable({}, { __index = _G })
   env.api = MAKE_API()
   env.package = { loaded = {} }
-  env.FEVERLINK3_ENGINE = { adjustLoan = function(d) ACCOUNT.loan = ACCOUNT.loan + d end }   -- the injected loan accessor
   env.ug_require = function(p)
     if p:find("feverlink3_link.lua", 1, true) then return assert(load(LINK_SRC, "=link", "t", env))() end
     if p:find("feverlink3_log.lua", 1, true) then return assert(load(LOG_SRC, "=log", "t", env))() end
@@ -490,11 +495,16 @@ function SIMSTEP()
   for _, c in ipairs(q) do EXECUTE(c[1], c[2]) end
   local steps = GAME.speed
   if steps == 0 and (GAME.coast or 0) > 0 then steps, GAME.coast = 1, GAME.coast - 1 end   -- speed 0 not in effect yet
-  for _ = 1, steps do
-    for _, e in ipairs(GAME.deferred) do WORLD[e] = { TRANSPORT_VEHICLE = {} } end
-    GAME.deferred = {}
-    GAME.time = GAME.time + 200
-    if STEP_HOOK then STEP_HOOK(GAME.time) end   -- a test's own world change at a step (as the engine's town growth), before the script
+  -- STILL (a test's): at speed 0 the engine still calls the script, at the same game time (host log of 2026-10-23: states updated at
+  -- t=41580000 again and again while the game stood still)
+  local still = steps == 0 and STILL
+  for _ = 1, still and 1 or steps do
+    if not still then
+      for _, e in ipairs(GAME.deferred) do WORLD[e] = { TRANSPORT_VEHICLE = {} } end
+      GAME.deferred = {}
+      GAME.time = GAME.time + 200
+      if STEP_HOOK then STEP_HOOK(GAME.time) end   -- a test's own world change at a step (as the engine's town growth), before the script
+    end
     -- one simulation step as the wiki describes it (modding:scripting:gamescripts): every game script's update, which "may not write
     -- the state itself" and whose result "is forwarded to the next script", then postUpdate, "executed after all the update scripts are
     -- done", at the same game time. Commands sent in either run at once (the simulation state) and may not carry a callback.
@@ -510,7 +520,17 @@ function SIMSTEP()
     GAME.stepN = (GAME.stepN or 0) + 1
     if S and not (POST_MODE == "never" or (POST_MODE == "alternate" and GAME.stepN % 2 == 0)) then
       GAME.phase = "postUpdate"
-      S.postUpdate(nil, STATE, 0.2, res)
+      -- POST_SPLIT(t) (a test's, 1: SIM, 2: SIM2): the state that runs postUpdate when it is not update's (a game without the single-
+      -- worker script pool, session 2026-10-23); update's result is handed over as a copy, as between two Lua states
+      -- POST_NORESULT (a test's): the result does not reach a postUpdate in the other state
+      local P, r = S, res
+      if POST_SPLIT then
+        P = POST_SPLIT(GAME.time) == 2 and SIM2 or SIM
+        if P ~= S and type(res) == "table" then r = {}; for k, v in pairs(res) do r[k] = v end end
+        if P ~= S and POST_NORESULT then r = nil end
+      end
+      SIM_CUR = P
+      P.postUpdate(nil, STATE, 0.2, r)
     end
     GAME.phase = nil
     GAME.inUpdate = false
@@ -644,7 +664,7 @@ class Relay:
         self.history = {g.id: [] for g in games}
         self.clocks, self.aheads, self.hello, self.reports, self.speed_requests = {}, {}, {}, {}, []
         self.costs = {}
-        self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
+        self.hellos, self.saves_done, self.replay_failed, self.refused, self.chats = [], [], [], [], []
         self.vetoes = []
         # every game's verdict of an action at its stamp, as the host keeps them (core VerdictBook): (owner, seq) -> {game: (applied, detail)}
         self.verdicts, self.verdict_resyncs = {}, []
@@ -742,13 +762,6 @@ class Relay:
         if detail:
             body["detail"] = True   # host.rs: after a round that differed, the round keeps its itemised keys in the game-script state
         self.broadcast("checksum_request", self.ser(body))
-
-    def send_authority(self, n):
-        """The host's authority values of round n, to every other game (what the core does after a round)."""
-        payload = self.ser({"n": n, "values": self.authority[n]})
-        for g in self.games:
-            if g.id != 0:
-                self.send(g, "authority", 0, payload)
 
     def rewrite_history(self, g, drop=1):
         """Truncate the game's to_game.log and write its history again without the first `drop` lines (a
@@ -849,8 +862,6 @@ class Relay:
                         self.costs.setdefault(int(p.n), {})[g.id] = {k: int(v) for k, v in p.cost.items()}
                     # the parts the game could not hash this round (core ChecksumReportMessage.not_ready)
                     self.not_ready.setdefault(int(p.n), {})[g.id] = sorted(p.notReady.values()) if p.notReady is not None else []
-                    if g.id == 0 and p.authority is not None:
-                        self.authority[int(p.n)] = {k: v for k, v in p.authority.items()}
                 elif rec.kind == "speed_request":
                     self.speed_requests.append(int(p.speed))
             self.flush_pause()
@@ -982,6 +993,16 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.B.L.eval("GAME.applied[3].args[1] .. ',' .. GAME.applied[3].args[2]"), "%d,%d" % (vb, lb), "client ids")
         self.assertEqual(self.A.applied(), self.B.applied())
         self.assertTrue(self.B.L.eval("SET_CB == true"))
+        # every replicated action's verdict, not a build's alone (review 2026-10-31): each game said applied once per action, the
+        # host's book closed every one of them
+        for g in (self.A, self.B):
+            self.assertEqual(len(self.shipped(g, "action_applied")), 3, g.label)
+        self.assertEqual((self.relay.verdicts, self.relay.verdict_resyncs), ({}, []))
+        # the vehicle's key is lost on the host's game: the assignment is refused there and applied on the client; the verdicts differ
+        self.A.L.execute("local s = STATE:get(); for k, e in pairs(s.bind) do if e == %d then s.bind[k] = nil end end; STATE:set(s)" % va)
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(%d, %d, 0), function(d, s) end)" % (vb, lb))
+        self.tick(40, lag_b=True)
+        self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:%d differ" % int(self.shipped(self.B)[-1].seq)], self.relay.refused)
         self.assertFalse(self.log_has("LATE"), "no late action")
         for g in (self.A, self.B):
             # the wiki (modding:scripting:gamescripts): update "may not write the state itself"; postUpdate runs after every update
@@ -1018,15 +1039,34 @@ class LockstepTest(unittest.TestCase):
         self.B.step()
         self.assertIn("state:set", self.update_writes(self.B))
 
-    def test_a_game_whose_engine_skips_postupdate_still_applies_every_step_once_at_its_stamp(self):
-        for i, mode in enumerate(("never", "alternate")):
+    def test_a_game_whose_engine_skips_postupdate_or_runs_it_in_another_lua_state_applies_every_step_once_at_its_stamp(self):
+        # update and postUpdate of one step in two Lua states (a game without the single-worker script pool, session 2026-10-23: dozens
+        # of states each logged "postUpdate missing"; review 2026-10-31): "split" runs every update in one state and every postUpdate in
+        # the other; "mixed" runs update two steps in one state, two in the other (the live log of 2026-10-18), and postUpdate in one
+        # state, then the other, so a step's two calls pair up, then not, then not, then do; the guest is a step out of phase; "no result"
+        # splits them as "split" does and update's result does not reach postUpdate: it takes the game time now (this state's own update
+        # never ran)
+        splits = {"split": lambda k: ("function(t) return 1 end", "function(t) return 2 end"),
+                  "mixed": lambda k: ("function(t) return (math.floor(t / 200) + %d) %% 4 < 2 and 1 or 2 end" % k,
+                                      "function(t) return (math.floor(t / 200) + %d) %% 2 + 1 end" % k)}
+        splits["no result"] = splits["split"]
+        for i, mode in enumerate(("never", "alternate", "split", "mixed", "no result")):
             with self.subTest(mode=mode):
                 if i:
                     self.again()
-                for g in (self.A, self.B):
-                    g.L.execute('POST_MODE = "%s"' % mode)
+                for k, g in enumerate((self.A, self.B)):
+                    if mode in splits:
+                        upd, post = splits[mode](k)
+                        g.split_sim(upd)
+                        g.L.execute("POST_SPLIT = %s; POST_NORESULT = %s" % (post, "true" if mode == "no result" else "nil"))
+                    else:
+                        g.L.execute('POST_MODE = "%s"' % mode)
                 self.start()
                 self.tick(10)
+                if mode in splits:
+                    # a spread checksum round: every chunk read at its own step on both games, whichever state runs it
+                    at = self.relay.future_stamp()
+                    self.relay.checksum_request(1, at, False, spread=1, chunk=3)
                 self.B.send_gui(BUY % "BUY_CB")
                 self.tick(40)
                 self.B.send_gui(LINE % ("Line 1", "LINE_CB"))
@@ -1041,13 +1081,27 @@ class LockstepTest(unittest.TestCase):
                 self.assertEqual(a, b, "same actions, same steps, same order on both games")
                 self.assertTrue(self.B.L.eval("SET_CB == true"))
                 for got, stamp in zip([int(x.split("@")[1]) for x in a], stamps):
-                    # never: applied in update at its stamp; alternate: a step caught up in the next update lands one step late, never twice
-                    self.assertIn(got - stamp, (0,) if mode == "never" else (0, STEP))
+                    # never: applied in update at its stamp; alternate: a step caught up in the next update lands one step late, never twice;
+                    # split, mixed: in postUpdate, at its stamp
+                    self.assertIn(got - stamp, (0, STEP) if mode == "alternate" else (0,))
                 for g in (self.A, self.B):
                     self.assertNotIn("update fallback failed", g.log())
                     if mode == "never":
                         self.assertIn("postUpdate was not called after the update at t=", g.log())
                         self.assertIn("step(s) of this session applied in update instead", g.log())
+                if mode in splits:
+                    (ta, pa), (tb, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
+                    self.assertEqual((ta, tb, pa), (at, at, pb), "the round's chunks were read at their steps, the same on both games")
+                    self.assertEqual(self.relay.replay_failed, [], "no late apply, no repair asked for")
+                    for g in (self.A, self.B):
+                        self.assertEqual(self.update_writes(g), [], "%s: the steps ran in postUpdate, nothing in update" % g.label)
+                        self.assertEqual(g.sim_runs()[2] > 0, mode == "mixed", "the update ran in the state the mode names")
+                        # "no result": the step's time is the game time now, never this state's own (older) update's
+                        self.assertEqual("postUpdate received no result from update (nil); the step's time is taken from the game time now" in g.log(),
+                                         mode == "no result", g.label)
+                        bad = ("postUpdate was not called", "postUpdate missing", "LATE", "read after their step")
+                        for b in bad + (() if mode == "no result" else ("postUpdate received no result",)):
+                            self.assertNotIn(b, g.log(), g.label)
 
     def test_an_action_a_game_may_not_apply_is_refused_and_a_denied_one_is_never_stamped(self):
         self.start()
@@ -1065,6 +1119,29 @@ class LockstepTest(unittest.TestCase):
         self.tick(40)
         self.assertEqual(len(self.A.applied()), 1)
         self.assertEqual(self.A.applied(), self.B.applied())
+        # review 2026-10-31: in a session this state (the game scripts' and other mods' script GUIs) sent what no schema replicates, and a
+        # command of a maker the wrap did not know, to the engine on this game alone; both are refused here too, by name where there is
+        # one, and the player is told. The extension query of the one list of local commands the UI hook uses as well goes on.
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeTownUpdateSizeCmd(5, { 1, 1, 1 }, false), function(d, s) SIZE_OK = s end)')
+        self.B.send_gui('api.cmd.sendCommand({ __cmd = "debugSetCargo", args = { n = 0 } }, function(d, s) RAW_OK = s end)')
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeCreateIndustryExtendProposalCmd(9, 0, 1), function(d, s) EXT_OK = s end)')
+        self.tick(30)
+        self.assertEqual((len(self.A.applied()), len(self.B.applied())), (1, 1), "nothing of it applied anywhere")
+        self.assertTrue(self.B.L.eval("SIZE_OK == false and RAW_OK == false and EXT_OK == true"), "each script is told")
+        self.assertEqual(int(self.B.L.eval("QUERIES or 0")), 1, "the engine answered the query")
+        self.assertIn("command makeTownUpdateSizeCmd REFUSED: it cannot be replicated", self.B.log())
+        self.assertIn("command (no name: made by no factory this wrap knows) REFUSED", self.B.log())
+        self.assertIn("told the player: Your town update size could not be shared", self.B.log())
+        # a script GUI's guiUpdate may send it in every frame: refused each time, its lines once a session per name and reason (review 2026-10-31).
+        # Owner decision 2026-11-01: an event nobody registered stays this game's own, logged once a session per name in either state.
+        self.B.send_gui('for i = 1, 3 do api.cmd.sendCommand(api.cmd.makeTownUpdateSizeCmd(5, { 1, 1, 1 }, false), function(d, s) if s == false then SIZE_NO = (SIZE_NO or 0) + 1 end end) end')
+        self.B.send_gui('for i = 1, 2 do api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Tutorial", "Step", {})) end')
+        self.B.window('for i = 1, 2 do api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Tutorial", "Step", {})) end')
+        self.tick(4)
+        log = self.B.log()
+        self.assertEqual((int(self.B.L.eval("SIZE_NO or 0")), log.count("command makeTownUpdateSizeCmd REFUSED"), log.count("told the player: Your town update size")), (3, 1, 1))
+        self.assertEqual((self.B.events_seen("Tutorial"), self.A.events_seen("Tutorial")), (4, 0), "applied on the sending game only")
+        self.assertEqual((log.count("event Tutorial/Step sent from the script-GUI state"), log.count("event Tutorial/Step sent from a window")), (1, 1), log)
         # revoked later, granted again later
         self.relay.send(self.B, "permissions", 0, self.relay.ser({"spend": False}))
         self.relay.send(self.B, "permissions", 0, self.relay.ser({"build": True}))
@@ -1141,7 +1218,7 @@ class LockstepTest(unittest.TestCase):
             g.L.execute("""
               ACCOUNT.balance = 5035445200
               local reports, results, refused = {}, {}, {}
-              for n = 1, 40 do reports[n] = { n = n, time = 1000 + n, parts = { time = "old" .. n, balance = "old" }, account = { balance = 38000000, loan = 0 } } end
+              for n = 1, 40 do reports[n] = { n = n, time = 1000 + n, parts = { time = "old" .. n, balance = "old" } } end
               results[1] = { key = "1:1", at = 5, success = true }
               refused[1] = { key = "1:2", from = 1, seq = 2, detail = "stale refusal" }
               STATE:set({ reports = reports, results = results, refused = refused, late = 7, queue = {}, bind = {}, watches = {}, binders = {} })
@@ -1149,7 +1226,7 @@ class LockstepTest(unittest.TestCase):
         self.start()
         self.tick(10, lag_b=True)
         self.relay.pump()
-        heavy = {"constructions", "edges", "nodeConfigs", "townBuildings"}
+        heavy = {"constructions", "edges", "nodeConfigs", "townBuildings", "constructions@ids", "townBuildings@ids"}
         light = {"time", "balance", "loan", "lines", "stations", "names", "vehicles"}
         at = self.relay.future_stamp()
         self.relay.checksum_request(1, at, False)   # no flag: a full round
@@ -1178,9 +1255,9 @@ class LockstepTest(unittest.TestCase):
         (ta, pa), (tb, _) = self.relay.reports[1][0], self.relay.reports[1][1]
         self.assertEqual((ta, tb), (at, at), "both hashed at the requested stamp")
         self.assertEqual(set(pa) - {"stations", "edges", "nodeConfigs", "vehicles", "names", "ids"},
-                         {"time", "balance", "loan", "constructions", "lines", "townBuildings", "townBuildings:90", "townBuildings:91"})
+                         {"time", "balance", "loan", "constructions", "lines", "townBuildings", "townBuildings:90", "townBuildings:91",
+                          "constructions@ids", "townBuildings@ids"})
         self.assertTrue(pa["townBuildings"].startswith("3/") and pa["townBuildings:90"].startswith("2/") and pa["townBuildings:91"].startswith("1/"), pa)
-        self.assertEqual(self.relay.authority[2]["balance"], 5035445200)
         self.assertNotIn("checksum slow", self.B.log(), "a fast checksum says nothing")
         self.assertRegex(self.A.log(), r"checksum slow: total \d+ ms: \w+ \d+")
         self.assertNotIn("stale refusal", "".join(self.A.lines(self.A.from_game)) + "".join(self.B.lines(self.B.from_game)))
@@ -1195,7 +1272,7 @@ class LockstepTest(unittest.TestCase):
         diffs = [
             (None, set()),
             ("ACCOUNT.balance = ACCOUNT.balance + 1000", {"balance"}),   # one account differs: only the balance part
-            ("WORLD[65].TOWN_BUILDING.level = 2", {"balance", "townBuildings", "townBuildings:91"}),   # one building of town 91 grown
+            ("WORLD[65].TOWN_BUILDING.level = 2", {"balance", "townBuildings", "townBuildings:91", "townBuildings@ids"}),   # one building of town 91 grown
         ]
         for n, (change, want) in enumerate(diffs, start=5):
             if change:
@@ -1284,61 +1361,24 @@ class LockstepTest(unittest.TestCase):
         view = str(self.B.ui_view()).split("|")
         self.assertEqual(view[1:], ["host [host], client (you), dave", "client: hello team !"])
 
-    # ---- host authority over the money
+    # ---- money: compared in whole units; a difference is never booked on one game, a lasting one is the host's to resync
 
-    def test_the_host_corrects_money_only_for_a_difference_seen_two_rounds_in_a_row(self):
+    def test_money_is_compared_in_whole_units_and_a_difference_is_never_booked(self):
         self.start()
         self.tick(10, lag_b=True)
         self.relay.pump()
-        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 5000; ACCOUNT.loan = ACCOUNT.loan - 1000")
+        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 0.3; ACCOUNT.loan = ACCOUNT.loan - 0.2")
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
         self.tick(40, lag_b=True)
-        pa, pb = self.relay.reports[1][0][1], self.relay.reports[1][1][1]
-        self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance", "loan"})
-        self.assertEqual(self.relay.authority[1], {"balance": 1000000, "loan": 250000}, "the host's report carries its account")
-        self.relay.send_authority(1)
-        self.tick(6)
-        self.assertEqual(self.B.L.eval("#JOURNAL"), 0, "one round alone may be an action still on its way (replay on peers)")
-        self.relay.checksum_request(2, self.relay.future_stamp(), False)
-        self.tick(40, lag_b=True)
-        # the world moves on before the correction arrives: it is measured against the round, not against now
-        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance - 300")
-        self.relay.send_authority(2)
-        self.tick(6)
-        self.assertEqual(self.B.L.eval("ACCOUNT.balance"), 1000000 - 300, "balance moved by the round's difference (-5000) only")
-        self.assertEqual(self.B.L.eval("ACCOUNT.loan"), 250000)
-        self.assertEqual((self.B.L.eval("JOURNAL[1]"), self.B.L.eval("#JOURNAL")), (-5000, 1), "booked as one journal entry for the delta")
-        self.assertEqual(self.A.L.eval("#JOURNAL"), 0, "the host's own game is never corrected")
-        self.assertEqual(self.B.applied(), [], "a journal entry is not a replicated action")
-        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 300")
-        self.relay.checksum_request(3, self.relay.future_stamp(), False)
-        self.tick(40, lag_b=True)
-        self.assertEqual(self.relay.reports[3][0][1], self.relay.reports[3][1][1], "worlds identical after the correction")
-        self.assertIn("balance corrected by -5000", self.B.log())
-        # Real game: the host sends its values as it reaches a round; a game a little behind had no account of its own for it yet, the
-        # values were thrown away every round, and money never followed. They wait for the round.
-        balance, loan = int(self.B.L.eval("ACCOUNT.balance")), int(self.B.L.eval("ACCOUNT.loan"))
-        for n in (9, 10):
-            self.relay.authority[n] = {"balance": balance + 700, "loan": loan}
-            self.relay.send_authority(n)
-            self.tick(5)
-            self.assertEqual(self.B.L.eval("#JOURNAL"), 1, "nothing to measure against yet, and nothing thrown away")
-            self.assertNotIn("skipped", self.B.log())
+        self.assertEqual(self.relay.reports[1][0][1], self.relay.reports[1][1][1], "a fraction the float sums leave is noise, no difference")
+        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 5000; ACCOUNT.loan = ACCOUNT.loan - 1000")
+        for n in (2, 3):
             self.relay.checksum_request(n, self.relay.future_stamp(), False)
-            self.tick(40)
-        self.assertEqual((self.B.L.eval("JOURNAL[2]"), self.B.L.eval("#JOURNAL")), (700, 2), "applied once the game reached the second round")
-        self.assertIn("balance corrected by 700", self.B.log())
-        # an action replayed on the other game reaches it a lead later: a round in between sees it on one side only, the next round sees
-        # none (real game: correcting the first counted it twice)
-        balance, loan = int(self.B.L.eval("ACCOUNT.balance")), int(self.B.L.eval("ACCOUNT.loan"))
-        for n, extra in ((11, 17000), (12, 0)):
-            self.relay.authority[n] = {"balance": balance + extra, "loan": loan + extra}
-            self.relay.send_authority(n)
-            self.tick(5)
-            self.relay.checksum_request(n, self.relay.future_stamp(), False)
-            self.tick(40)
-        self.assertEqual(self.B.L.eval("#JOURNAL"), 2)
-        self.assertNotIn("corrected by 17000", self.B.log())
+            self.tick(40, lag_b=True)
+            pa, pb = self.relay.reports[n][0][1], self.relay.reports[n][1][1]
+            self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance", "loan"})
+        self.assertEqual((self.A.L.eval("#JOURNAL"), self.B.L.eval("#JOURNAL")), (0, 0), "no game books the difference away")
+        self.assertEqual((self.B.L.eval("ACCOUNT.balance"), self.B.L.eval("ACCOUNT.loan")), (1000000 + 5000.3, 250000 - 1000.2))
 
     # ---- resync: save, load, the start gate
 
@@ -1360,7 +1400,9 @@ class LockstepTest(unittest.TestCase):
         self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 4, "name": "nope", "sha256": "00"}))
         self.relay.send(self.B, "chat", 0, self.relay.ser({"text": "after the load line", "name": "Host"}))
         self.tick(3)
-        self.assertEqual(self.B.log().count("after the load line"), 1)
+        # mod.log names a chat line's sender and length, never its words (review 2026-10-31: the log goes into bug reports)
+        self.assertEqual(self.B.log().count("chat from player 0, %d bytes" % len("after the load line")), 1)
+        self.assertNotIn("after the load line", self.B.log())
         self.assertFalse(self.B.reload_pending())
         self.assertEqual(len(self.relay.replay_failed), 1)
         self.assertEqual(read_text(os.path.join(self.B.dir, "resync_cursor.txt")), "")
@@ -1690,7 +1732,7 @@ class StampedEverywhereTest(LockstepTest):
 
     def test_actions_of_a_pause_are_applied_in_the_hosts_order_on_every_game(self):
         cases = ("two players", "read after the resume", "assignment in the purchase's frame", "assignment a step later",
-                 "the engine throws during a paused apply")
+                 "the engine throws during a paused apply", "queued at the time the game stands at")
         for i, case in enumerate(cases):
             with self.subTest(case=case):
                 if i:
@@ -1783,6 +1825,26 @@ class StampedEverywhereTest(LockstepTest):
         self.assertTrue(any("partly built" in str(p.detail) for p in self.shipped(g, "replay_failed")))
         verdict = [p for p in self.shipped(g, "action_refused") if int(p.seq) == 91]
         self.assertTrue(verdict and verdict[-1].partial is True, verdict)
+
+    def pause_case_5(self, paused_at):
+        # the engine calls the script while the game stands still (STILL: the host log of 2026-10-23 shows the update calls, postUpdate's
+        # are unproven), and the interface's game time is a batch behind the simulation's (a harness model): an item stamped where the
+        # game stands goes to the simulation queue after that step ran. A postUpdate at that step's time runs its work again (review
+        # 2026-10-31), so it is applied there, not a step late (LATE, a repair)
+        g = self.B
+        self.assertEqual(g.time(), paused_at)
+        g.L.execute(self.PAUSE_ITEMS + """
+          STILL = true
+          local get = GUI_ENV.api.engine.getComponent
+          GUI_ENV.api.engine.getComponent = function(e, t)
+            if t == GUI_ENV.api.type.ComponentType.GAME_TIME then return { gameTime = GAME.time - 200 } end
+            return get(e, t)
+          end
+          ROUTE(ITEM(91, NOW, BUY_BODY))
+          GUI_ENV.api.engine.getComponent = get""")
+        self.tick(4)
+        self.assertEqual((g.applied()[-1:], g.time()), (["makeVehicleBuyCmd@%d" % paused_at], paused_at), "at its stamp, still paused")
+        self.assertNotIn("LATE", g.log())
 
 
 class ThreeGamesPauseOrderTest(unittest.TestCase):
@@ -2153,7 +2215,7 @@ class PureTest(unittest.TestCase):
         self.assertTrue(all(10 <= x <= 20 for x in seq1[10:]))
         self.assertNotEqual(K.randomDraw(K.newRandom(L.eval("function() return 1200 end"))), seq1[0], "another step draws other numbers")
 
-    def test_permissions_categories_and_authority_pure(self):
+    def test_permissions_and_categories_pure(self):
         K, L = self.K, self.L
         self.assertEqual([K.categoryOf(n) for n in ("makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd")], ["spend", "build", "other"])
         self.assertEqual([K.categoryOf(n) for n in ("makeBulldozeProposalCmd", "makeRemoveEntityCmd", "makeConstructionCmd", "makeBuyVehicle", "makeSetNameCmd")],
@@ -2166,18 +2228,6 @@ class PureTest(unittest.TestCase):
         self.assertFalse(K.applyPermissions(perms, L.table_from({"build": False})), "no change reported when nothing changed")
         self.assertTrue(K.applyPermissions(perms, L.table_from({"build": True})))
         self.assertTrue(K.permitted(perms, "build"))
-        d = K.authorityDeltas(L.table_from({"balance": 100.4, "loan": 50}), L.table_from({"balance": 200, "loan": 50}))
-        self.assertEqual((d.balance, d.loan), (100, None))
-        eng = L.table_from({"bookJournal": L.eval("function(a) BOOKED = a end"), "adjustLoan": None})
-        own, host = L.table_from({"balance": 1, "loan": 5}), L.table_from({"balance": 11, "loan": 9})
-        applied, failed, measured = K.applyAuthority(eng, own, host)
-        self.assertEqual((applied.balance, applied.loan, len(list(failed.values()))), (None, None, 0), "a first round only measures")
-        self.assertEqual((measured.balance, measured.loan), (10, 4))
-        applied, failed, measured = K.applyAuthority(eng, own, host, measured)
-        self.assertEqual(applied.balance, 10)
-        self.assertEqual(list(failed.values()), ["loan"], "a build without a loan accessor reports it cannot correct the loan")
-        applied, failed, _ = K.applyAuthority(eng, own, host, L.table_from({"balance": 200, "loan": 4}))
-        self.assertEqual(applied.balance, None, "a difference that changed since the round before is not the same one")
 
     def test_the_bar_icon_colour_the_status_line_and_the_notices_follow_the_session(self):
         H, P = self.H, self.parsed

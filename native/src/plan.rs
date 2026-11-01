@@ -775,6 +775,11 @@ fn plan_hold(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
             p.engine =
                 Some(EngineAddrs { command_move: mv.rva, command_destroy: destroy.rva, handle_destroy: handle.rva });
             plan_preview_event(build, image, p);
+            // the game interface's hook is also where a new world begins for the held commands (`Runtime::new_world`): without it
+            // (no row, other bytes, or no emitter hook) nothing gives up a held command at a load, and the log should say so once
+            if !p.has(Feature::PreviewOwner) {
+                p.notes.push("holding runs without a world boundary: the preview_owner hook is not installed, so a command held at a load is not given up (the mod must hold_off first)".into());
+            }
         }
         Err(reason) => skip(p, reason),
     }
@@ -1120,6 +1125,22 @@ mod tests {
         assert_eq!((s.feature, s.name), (Feature::Counters, "apply_command"));
         assert!(s.reason.contains("0x9e33b0") && s.reason.contains("90"), "{}", s.reason);
         assert!(p.report().iter().any(|l| l.starts_with("hooks: SKIPPED apply_command (counters)")));
+        assert!(p.notes.is_empty(), "holding has its world boundary: {:?}", p.notes);
+    }
+
+    /// Review 2026-10-31: without the game interface's hook holding has no world boundary; the log says so instead of nothing.
+    #[test]
+    fn holding_without_the_preview_owner_hook_says_it_has_no_world_boundary() {
+        let b = fixture();
+        let mut img = image_of_40420();
+        img.write(b.preview_owner.as_ref().unwrap().call.rva, &[0x90]);
+        let p = plan(b, cfg(true, true, false), &img);
+        assert!(p.has(Feature::Hold) && !p.has(Feature::PreviewOwner));
+        assert!(
+            p.report().iter().any(|l| l.starts_with("hooks: note: holding runs without a world boundary")),
+            "{:?}",
+            p.report()
+        );
     }
 
     #[test]

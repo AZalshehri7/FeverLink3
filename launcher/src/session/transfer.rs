@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, Scope};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use feverlink3_core::protocol::Frame;
 use feverlink3_core::session::{
@@ -121,6 +121,14 @@ pub(super) struct HostIo<'scope, 'env> {
     round: Option<i32>,
     /// A bug report's bundle being sent.
     report: Option<ReportSend>,
+    /// When the round began here (its Pausing): the save the transfer sends was written after it. Save names restart
+    /// at round 1 every session, so an older `<name>.sav` is another session's world (review 2026-10-31).
+    round_began: Option<(i32, SystemTime)>,
+    /// The SHA-256 of the source player's save the round's file must be (`HostOutput::SourceSave`).
+    uploaded: Option<(i32, String)>,
+    /// The launcher cannot provide this round's save: [`HostIo::pump`] fails the round through the core with this reason
+    /// instead of letting it time out or sending whatever file has the name.
+    failed: Option<(i32, String)>,
 }
 
 impl<'scope, 'env> HostIo<'scope, 'env> {
@@ -130,7 +138,26 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
         shared: &'env Shared,
         save_dirs: &'env [PathBuf],
     ) -> Self {
-        HostIo { scope, net, shared, save_dirs, outboxes: BTreeMap::new(), transfer: None, round: None, report: None }
+        HostIo {
+            scope,
+            net,
+            shared,
+            save_dirs,
+            outboxes: BTreeMap::new(),
+            transfer: None,
+            round: None,
+            report: None,
+            round_began: None,
+            uploaded: None,
+            failed: None,
+        }
+    }
+
+    /// Round `id` began (its first progress, Pausing): the save its transfer sends must be newer than now.
+    pub(super) fn round_began(&mut self, id: i32) {
+        if self.round_began.is_none_or(|(round, _)| round != id) {
+            self.round_began = Some((id, SystemTime::now()));
+        }
     }
 
     /// A transfer is running: the loop should come back soon to seal the next chunks.
@@ -231,39 +258,41 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
     /// it, so that the transfer that follows finds it like the host's own save ([`HostIo::begin_transfer`]).
     pub(super) fn write_source_save(&mut self, id: i32, sha256: &str, bytes: &[u8]) {
         let name = resync::save_name(id);
+        self.uploaded = Some((id, sha256.to_ascii_lowercase()));
         match resync::write_save(self.save_dirs, &name, bytes) {
-            Ok(n) => self.shared.log(format!(
-                "resync {id}: the source player's save ({} bytes, SHA-256 {}) written to {n} folder(s) as {name}.sav",
-                bytes.len(),
-                &sha256[..12.min(sha256.len())]
-            )),
-            Err(e) => self
-                .shared
-                .log(format!("resync {id}: cannot write the source player's save: {e}; the round will time out")),
+            // a folder that missed it cannot send a stale file: only one with the uploaded hash is sent
+            Ok(stored) => {
+                self.shared.log(format!(
+                    "resync {id}: the source player's save ({} bytes, SHA-256 {}) in {} folder(s) as {name}.sav",
+                    bytes.len(),
+                    &sha256[..12.min(sha256.len())],
+                    stored.held
+                ));
+                for line in stored.missed {
+                    self.shared
+                        .log(format!("resync {id}: the source player's save is not in every savegame folder: {line}"));
+                }
+            }
+            Err(e) => self.failed = Some((id, format!("the source player's save cannot be written: {e}"))),
         }
     }
 
-    /// The round entered Transferring: find and hash the save on a thread, then send it ([`HostIo::pump`]).
+    /// The round entered Transferring: find and hash the save on a thread, then send it ([`HostIo::pump`]). Only a file
+    /// written in this round is sent, and the source player's upload only when its hash is the uploaded one.
     pub(super) fn begin_transfer(&mut self, id: i32) {
-        if self.round == Some(id) {
-            return; // the core reports Transferring again when the file is announced
+        if self.round == Some(id) || self.failed.as_ref().is_some_and(|(round, _)| *round == id) {
+            return; // the core reports Transferring again when the file is announced; a failed round sends nothing
         }
         self.abandon("a new round started");
         let (tx, rx) = mpsc::channel();
         let dirs = self.save_dirs.to_vec();
+        let since = self.round_began.filter(|(round, _)| *round == id).map(|(_, at)| at);
+        let expected = self.uploaded.clone().filter(|(round, _)| *round == id).map(|(_, sha)| sha);
         let spawned = thread::Builder::new().name("feverlink3-save-hash".into()).spawn_scoped(self.scope, move || {
-            let name = resync::save_name(id);
-            let outcome = match resync::find_save(&dirs, &name) {
-                None => Err(format!("{name}.sav not found in the savegame folders; the round will time out")),
-                Some(path) => match resync::hash_file(&path) {
-                    Ok((sha, len)) => Ok((path, sha, len)),
-                    Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-                },
-            };
-            let _ = tx.send(outcome);
+            let _ = tx.send(read_save(&dirs, id, since, expected.as_deref()));
         });
         if let Err(e) = spawned {
-            self.shared.log(format!("resync {id}: cannot start the thread that reads the save: {e}"));
+            self.failed = Some((id, format!("cannot start the thread that reads the save: {e}")));
             return;
         }
         self.round = Some(id);
@@ -285,6 +314,11 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
             } else {
                 self.end(t, host);
             }
+        }
+        if let Some((id, why)) = self.failed.take() {
+            self.shared.log(format!("resync {id}: {why}"));
+            let outputs = host.resync_abort(id, &why);
+            host_dispatch(outputs, link, self);
         }
         self.pump_report(host, link);
         let mut receiving: BTreeSet<ConnectionId> = match &self.transfer {
@@ -341,18 +375,18 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
         });
     }
 
-    /// One step of a live transfer. False: it is over (the file could not be read).
+    /// One step of a live transfer. False: it is over (the file could not be read: the round fails, [`HostIo::failed`]).
     fn step(&mut self, t: &mut SaveTransfer, host: &mut HostSession, link: &mut gamelink::Session) -> bool {
         let id = t.id;
         if let Stage::Hashing(rx) = &t.stage {
             let (path, sha, len) = match rx.try_recv() {
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => {
-                    self.shared.log(format!("resync {id}: the thread that reads the save failed"));
+                    self.failed = Some((id, "the thread that reads the save failed".to_owned()));
                     return false;
                 }
                 Ok(Err(why)) => {
-                    self.shared.log(format!("resync {id}: {why}"));
+                    self.failed = Some((id, why));
                     return false;
                 }
                 Ok(Ok(found)) => found,
@@ -411,7 +445,7 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
                     host_dispatch(outputs, link, self);
                 }
                 Err(e) => {
-                    self.shared.log(format!("resync {id}: reading chunk {}: {e}", s.next));
+                    self.failed = Some((id, format!("reading chunk {}: {e}", s.next)));
                     return false;
                 }
             }
@@ -578,7 +612,7 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
                         host_dispatch(outputs, link, self);
                     }
                     Err(e) => {
-                        self.shared.log(format!("resync {id}: reading chunk {index}: {e}"));
+                        self.failed = Some((id, format!("reading chunk {index}: {e}")));
                         return false;
                     }
                 }
@@ -614,6 +648,38 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
     }
 }
 
+/// Finds and hashes round `id`'s save: (path, SHA-256 hex, length), or why it cannot be sent. Refused: a file older than
+/// the round (`since`, another session's world under the same name), and one whose hash is not `expected` (the source
+/// player's upload) when it is known (review 2026-10-31).
+fn read_save(
+    dirs: &[PathBuf],
+    id: i32,
+    since: Option<SystemTime>,
+    expected: Option<&str>,
+) -> Result<(PathBuf, String, u64), String> {
+    let name = resync::save_name(id);
+    let path = resync::find_save(dirs, &name).ok_or_else(|| format!("{name}.sav not found in the savegame folders"))?;
+    if let Some(since) = since {
+        match resync::older_than_round(&path, since) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(format!("{} is older than the round (a save of an earlier session)", path.display()))
+            }
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+    let (sha, len) = resync::hash_file(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if let Some(expected) = expected.filter(|e| *e != sha) {
+        return Err(format!(
+            "{} is not the uploaded save (SHA-256 {}, expected {})",
+            path.display(),
+            &sha[..12.min(sha.len())],
+            &expected[..12.min(expected.len())]
+        ));
+    }
+    Ok((path, sha, len))
+}
+
 /// The writer of one outbox: sends what comes in order until the outbox is dropped. After a failed write the rest is
 /// dropped (the transport closes the connection and says so); once the session stops, chunks are no longer sent, but
 /// what follows them (the host's goodbye) is.
@@ -641,5 +707,29 @@ fn write_in_order(
             Out::Close => net.close(conn),
         }
         items.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn only_this_rounds_save_with_the_uploaded_hash_is_sent() {
+        let t = tempfile::tempdir().unwrap();
+        let dirs = vec![t.path().to_path_buf()];
+        assert!(read_save(&dirs, 1, None, None).unwrap_err().contains("not found"));
+        let path = t.path().join("feverlink3-resync-1.sav");
+        std::fs::write(&path, b"abc").unwrap();
+        let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let begun = SystemTime::now();
+        assert_eq!(read_save(&dirs, 1, Some(begun), Some(sha)).unwrap(), (path.clone(), sha.to_owned(), 3));
+        // an earlier session's save under the same name
+        let later = begun + Duration::from_secs(60);
+        assert!(read_save(&dirs, 1, Some(later), None).unwrap_err().contains("older than the round"));
+        // not the upload the source player sent
+        let other = "0".repeat(64);
+        assert!(read_save(&dirs, 1, Some(begun), Some(&other)).unwrap_err().contains("not the uploaded save"));
     }
 }

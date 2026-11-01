@@ -3039,6 +3039,8 @@ class PureBuildTest(unittest.TestCase):
         -- the other segments the text names (lane connections at the old nodes) exist here; nothing resolves them by place
         local a, b = pt.addedSegments[1].node1.old, pt.removedSegments[1].node1.old
         for _, r in ipairs(P.oldRefs(txt)) do if r.kind == 'edge' and not WORLD[r.id] then ADD_EDGE(r.id, a, b, 0, tmpl) end end
+        -- and the node configurations it removes (review 2026-10-31: a removal of one this game lacks refuses the inject)
+        for _, r in ipairs(P.oldRefs(txt)) do if r.kind == 'nodeConfig' then WORLD[r.id].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = {} }) end end
         local body = { fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, { align = true, cleanup = true, buildings = true, fields = true }, false, true, false }, nativeText = txt }
         local args, why = M.commands.makeWorldBuildProposalCmd.decode(body, { player = 7, canInject = true, traceKey = '0:246', resolve = RESOLVE_KEY })
         if not args then return 'refused: ' .. tostring(why) end

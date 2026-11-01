@@ -708,6 +708,13 @@ impl PlayerSession {
         self.drain()
     }
 
+    /// The launcher could not store save `id` in every savegame folder without an older file of the same name left
+    /// behind: the save counts as not received, so its `ResyncLoad` is refused and this game keeps its world instead of
+    /// loading a stale one (review 2026-10-31).
+    pub fn forget_save(&mut self, id: i32) {
+        self.incoming.forget(id);
+    }
+
     fn receive_chunk(&mut self, plain: &[u8]) {
         let kind = MessageKind::ResyncChunk.into();
         let Some(m) = codec::try_decode::<ResyncChunkMessage>(plain) else {

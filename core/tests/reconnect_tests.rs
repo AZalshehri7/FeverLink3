@@ -397,23 +397,30 @@ fn before_the_start_a_return_starts_no_round() {
     assert_eq!(ResyncState::Idle, n.host.resync_state());
 }
 
+/// A return after the round's save waits for the next round. Before file_ready too: the round's world mod check compared the mods
+/// of the Join the player left with, not those of the Join it came back with (review 2026-11-01: such a return got the world
+/// unchecked, and also started an extra round).
 #[test]
 fn a_return_during_a_round_waits_for_the_next_one_when_the_files_are_moving() {
     let (mut n, ids) = Net::running(2, 1, HostOptions::default());
-    let ticket = n.ticket(ids[0]);
+    let (ticket0, ticket1) = (n.ticket(ids[0]), n.ticket(ids[1]));
     n.host_call(|h| h.start_resync("manual"));
     let pause_at = n.host.state().pause_at.unwrap();
     n.stop_all_at(pause_at);
     let id = n.host.resync_id().unwrap();
     n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
+    n.lose(ids[0]);
+    let a2 = n.connect_resuming("P0", ticket0);
     let save = blob(1000);
     let sha = sha256_hex(&save);
     n.host_call(|h| h.resync_file_ready(id, &sha, 1000));
     n.host_call(|h| h.resync_chunk(id, 0, &save));
+    assert!(n.peer(a2).saves.is_empty(), "back after the mod check: not given this world");
+    assert_eq!(1, n.peer(ids[1]).saves.len(), "checked and still there: it is not made to wait");
 
-    n.lose(ids[0]);
-    let a2 = n.connect_resuming("P0", ticket);
-    assert!(n.peer(a2).saves.is_empty(), "it missed this round's save");
+    n.lose(ids[1]);
+    let b2 = n.connect_resuming("P1", ticket1);
+    assert!(n.peer(b2).saves.is_empty(), "it missed this round's save");
     assert_eq!(Some(id), n.host.resync_id());
     assert!(n.logged("player returned waits for the next resync round"), "{:?}", n.host_log);
 }

@@ -884,11 +884,8 @@ fn checksum_round_completes_when_every_ready_game_reported_and_names_the_differe
 
     let host_parts = parts(&[("money", "1"), ("roads", "r1"), ("vehicles", "v")]);
     let a_parts = parts(&[("money", "2"), ("roads", "r1"), ("vehicles", "v"), ("extra", "e")]);
-    let mut host_report = ChecksumReportMessage::new(req.n, req.at, host_parts);
-    host_report.authority = Some([("balance".to_string(), 1000.0)].into_iter().collect());
-    h.host_game(MessageKind::ChecksumReport, &json(&host_report));
+    h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, host_parts)));
     assert!(h.outcomes.is_empty());
-    assert_eq!(1000.0, h.p(a).last::<AuthorityMessage>(MessageKind::Authority).values["balance"]);
     h.player_game(a, MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, a_parts)));
 
     assert_eq!(1, h.outcomes.len());
@@ -1302,11 +1299,11 @@ fn chat_is_relayed_with_the_senders_name_and_trimmed() {
 #[test]
 fn codec_round_trips_records_and_rejects_garbage() {
     let mut m = ChecksumReportMessage::new(3, 1200, parts(&[("roads", "abc")]));
-    m.authority = Some([("balance".to_string(), -5.5)].into_iter().collect());
+    m.not_ready = vec!["companies".to_string()];
     let back: ChecksumReportMessage = codec::try_decode(&codec::encode(&m)).unwrap();
     assert_eq!(m.n, back.n);
     assert_eq!("abc", back.parts["roads"]);
-    assert_eq!(-5.5, back.authority.unwrap()["balance"]);
+    assert_eq!(vec!["companies"], back.not_ready);
     assert_eq!(None, codec::try_decode::<ChecksumReportMessage>(b"{not json"));
     assert_eq!(None, codec::try_decode::<ChecksumReportMessage>(b"[1,2]"));
     let json = String::from_utf8(codec::encode(&ActionMessage::new(1, 2, "b"))).unwrap();

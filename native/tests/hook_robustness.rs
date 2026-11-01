@@ -17,8 +17,8 @@ use feverlink3_native::build_table::{self, BuildAddrs, Rva};
 use feverlink3_native::counters::{AddSource, AppliedWatch, Audit, Counters, MAX_SITES, WATCH_EXPIRY_MS, WATCH_SLOTS};
 use feverlink3_native::hold::{Action, Admit, HoldConfig, HoldMachine};
 use feverlink3_native::link::{
-    parse_ctl_line, valid_kind_name, AddCounts, CtlMessage, CtlReader, Event, EventWriter, EVENTS_ROTATE_BYTES,
-    MAX_HOLD_KINDS, MAX_LINE, MAX_READ,
+    parse_ctl_line, valid_kind_name, AddCounts, CtlMessage, CtlReader, Event, EventWriter, EVENTS_KEEP_GENERATIONS,
+    EVENTS_ROTATE_BYTES, MAX_HOLD_KINDS, MAX_LINE, MAX_READ,
 };
 use feverlink3_native::plan::{plan, Feature, HookConfig, Image, Step};
 use rand::rngs::StdRng;
@@ -363,11 +363,11 @@ fn the_event_log_stays_bounded_and_a_reopen_goes_on_at_its_end() {
     assert_eq!(EventWriter::open(dir.path()).unwrap().end(), w.end(), "a reopened writer goes on where the log ends");
     // a mod that never reads the log must not fill the disk: the writer goes on in new generations, never refuses
     let big = Event::Error { place: "p".into(), detail: "y".repeat(100_000) };
-    for _ in 0..200 {
+    for _ in 0..500 {
         w.append(std::slice::from_ref(&big)).unwrap();
     }
     let total: u64 = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
-    let bound = (gamelink::KEEP_GENERATIONS + 1) * (EVENTS_ROTATE_BYTES + 200_000);
+    let bound = (EVENTS_KEEP_GENERATIONS + 1) * (EVENTS_ROTATE_BYTES + 200_000);
     assert!(total <= bound, "{total} bytes on disk, bound {bound}");
     assert_eq!(EventWriter::open(dir.path()).unwrap().end(), w.end(), "also across generations");
     assert!(w.append(&[]).is_ok(), "an empty batch is not an error");

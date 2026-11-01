@@ -289,6 +289,40 @@ class CommonLinkTest(unittest.TestCase):
                 self.send(w if n % 2 else w2, "clock", n)
                 rest += self.poll(at_end)
             self.assertEqual(rest, [("clock", n) for n in range(82, 120)])
+            # a reader behind deleted generations (placed at one already gone, never opened) resumes at the OLDEST one still there,
+            # reads every kept line, and counts the gap (review 2026-10-31: it jumped to the newest or stalled)
+            behind = self.C.newReader(base, self.L.eval('{ at = "1:0" }'))
+            kept = int(self.C.newReader(base).gen)
+            first_kept = int(self.C.parse(T.read_text(self.C.genPath(base, kept)).splitlines()[0].split(TAB)[2]).n)
+            got = self.poll(behind) + self.poll(behind)
+            self.assertEqual(got, [("clock", n) for n in range(first_kept, 120)])
+            self.assertEqual(int(behind.lost), 1)
+            # a write that fails is reported in the OS's words, not counted as sent
+            failed = self.L.eval("{ write = function() return nil, 'disk full' end, close = function() return true end }")
+            self.assertEqual(tuple(self.C.writeClose(failed, "x")), (False, "disk full"))
+            # one append that leaves a cut piece (a full disk): not sent, the writer unchanged, and the next line starts on a line of its
+            # own, read whole (glued to the piece, no reader could parse it). One whose close alone fails is in the file whole: sent
+            once = self.L.eval(r'''function(C, how)
+              local io0 = C.IO
+              C.IO = { open = function(path, mode)
+                C.IO = io0
+                local f = io0.open(path, mode)
+                return { seek = function(_, ...) return f:seek(...) end, close = function() f:close() return how ~= "close" or nil, "close failed" end,
+                  write = function(_, s) if how == "cut" then f:write(s:sub(1, 4)) return nil, "No space left on device" end return f:write(s) end }
+              end }
+            end''')
+            ui = self.path("ui_out.log")
+            wu, ru = self.C.newWriter(ui, 1), self.C.newReader(ui)
+            self.send(wu, "cmd", 1)
+            once(self.C, "cut")
+            ok, why = self.C.writerSend(wu, "cmd", self.C.parse("{ n = 2 }"))
+            self.assertEqual((ok, int(wu.lines), int(wu.size)), (False, 1, os.path.getsize(ui) - 4))
+            self.assertIn("No space left on device", why)
+            once(self.C, "close")
+            self.send(wu, "cmd", 3)
+            self.send(wu, "cmd", 4)
+            self.assertEqual(self.poll(ru), [("cmd", 1), ("cmd", 3), ("cmd", 4)])
+            self.assertEqual(int(ru.dropped), 1, "the cut piece ends as a line of its own, dropped")
 
         def opened_after_a_rotate_line():
             base = self.path("ui_in.log")

@@ -17,12 +17,20 @@ static PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 /// one message that explains the crash. Leaked on purpose (a path, once per [`init`]), never freed.
 static PANIC_PATH: AtomicPtr<PathBuf> = AtomicPtr::new(core::ptr::null_mut());
 
-/// The log stops growing at this size, so a hook that logs for every command cannot fill a disk in a long session.
-const MAX_BYTES: u64 = 2 << 20;
+/// The log stops growing at this size, so a hook that logs for every command cannot fill a disk in a long session. Room for a
+/// whole evening: 2 MB filled after two hours of a session between two PCs (2026-10-30), and the last 50 minutes were lost.
+const MAX_BYTES: u64 = 32 << 20;
+
+/// A log written this recently belongs to another game of this PC that is running now (two windows of a test share the
+/// file): it is not set aside under it.
+const IN_USE: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub fn init(path: PathBuf) {
-    // a log that grew large in earlier runs is set aside, so this run starts small and its first lines are kept
-    if fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES / 2) {
+    // every run starts its own log and the run before it stays as native.log.1 (older runs are gone: the files stay bounded,
+    // and a bug report holds this run whole); before, an old log under 1 MB was kept and filled up with this run's lines
+    let in_use =
+        fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age < IN_USE));
+    if !in_use {
         let _ = fs::rename(&path, path.with_extension("log.1"));
     }
     let cell = PATH.get_or_init(|| Mutex::new(None));
@@ -233,7 +241,9 @@ pub fn engine_calls_in_guard() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::sync::Mutex as TestLock;
+    use std::time::{Duration, SystemTime};
 
     /// The log path and the panic hook are process-wide: tests that use them take turns.
     static ONE_AT_A_TIME: TestLock<()> = TestLock::new(());
@@ -264,20 +274,22 @@ mod tests {
     }
 
     #[test]
-    fn a_large_old_log_is_set_aside_at_start() {
+    fn the_last_run_is_set_aside_at_start_unless_another_game_writes_the_log_now() {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
         let d = dir();
         let path = d.path().join("native.log");
-        fs::write(&path, vec![b'o'; (MAX_BYTES / 2) as usize + 1]).unwrap();
+        fs::write(&path, "last run\n").unwrap();
+        let old = SystemTime::now() - IN_USE - Duration::from_secs(5);
+        File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
         init(path.clone());
         line("new run");
         assert_eq!(fs::read_to_string(&path).unwrap(), "new run\n");
-        assert_eq!(fs::metadata(path.with_extension("log.1")).unwrap().len(), MAX_BYTES / 2 + 1);
-        // a small one stays
-        fs::write(&path, "short\n").unwrap();
+        assert_eq!(fs::read_to_string(path.with_extension("log.1")).unwrap(), "last run\n");
+        // just written: the other window's game is running, both write into one log
         init(path.clone());
-        line("again");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "short\nagain\n");
+        line("second window");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new run\nsecond window\n");
+        assert_eq!(fs::read_to_string(path.with_extension("log.1")).unwrap(), "last run\n");
     }
 
     #[test]

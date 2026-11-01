@@ -218,7 +218,7 @@ class ShipFaultTest(S.StrictTest):
             self.assertIn("FAILED on the veto, NOT released", self.B.log())
             self.assertFailedOnB()
             self.assertEqual(self.A.builds_applied(), 0, "the other game dropped it on the veto")
-            self.assertTrue(any("game stayed paused too long" in c[1] for c in self.relay.chats))
+            self.assertTrue(any("stood still too long before the build was due" in c[1] for c in self.relay.chats))
 
         def vetoed():
             # was a release: the build existed on this game only (the vetoing game dropped it) and a resync followed

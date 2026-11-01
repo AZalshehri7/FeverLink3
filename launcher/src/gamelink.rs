@@ -36,7 +36,9 @@
 //! following one costs a reader no file access at all until it happens. A writer with a header (lines a reader that
 //! starts in a generation needs, the native module's `ready`) writes it at the top of the next generation BEFORE the
 //! `rotate` line, and the `rotate` line says how many bytes it holds (`skip`): a reader that came through the earlier
-//! generation starts after it (it read those lines already), one that starts in the new generation reads them.
+//! generation starts after it (it read those lines already), one that starts in the new generation reads them. A reader
+//! whose generation was deleted under it (it fell behind every kept one) goes on at the oldest one still there, never past
+//! kept lines, and reports the gap: what the lost lines mean is its owner's to say ([`oldest_generation_after`]).
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -160,6 +162,22 @@ pub fn newest_generation(base: &Path) -> u64 {
         .and_then(|t| t.trim().parse::<u64>().ok())
         .filter(|g| *g >= 1)
         .unwrap_or(1)
+}
+
+/// Generations before the newest that [`oldest_generation_after`] looks at: far more than any writer keeps (4; the native
+/// events file 32), and a bound on the files it tries when a damaged pointer names a generation that was never written.
+const GENERATION_SCAN: u64 = 1024;
+
+/// The oldest generation of `base` after `gen` whose file is there: where a reader goes on when the file of its own generation
+/// is gone while newer ones exist (deleted under a reader that fell behind, or one placed at a generation already deleted).
+/// Never past a kept generation: a writer deletes the oldest first, and one it could not delete (a reader held it open) is read
+/// too. The lines in between are lost, a gap the reader reports. `None` when no later generation is there: the file is not
+/// written yet, or the folder was cleaned. Every link reader goes by this rule, the mod's too (`readGeneration` in
+/// `feverlink3_link.lua`; review 2026-10-31: the readers here went on at the newest, past the kept generations).
+pub fn oldest_generation_after(base: &Path, gen: u64) -> Option<u64> {
+    let newest = newest_generation(base);
+    let first = gen.saturating_add(1).max(newest.saturating_sub(GENERATION_SCAN));
+    (first..=newest).find(|g| generation_path(base, *g).exists())
 }
 
 /// Where a log ends now: its newest generation and that file's length (0 when it does not exist yet).
@@ -409,6 +427,8 @@ impl Session {
                 break;
             }
         }
+        // a gap in what was read through is lines of an earlier session, dropped anyway: no loss of this one
+        tail.take_lost();
         Ok(Session { dir: dir.to_path_buf(), to_game, tail, id: format!("{:016x}", rand::random::<u64>()), start })
     }
 
@@ -464,6 +484,12 @@ impl Session {
         self.tail.poll()
     }
 
+    /// Gaps in `from_game.log` since the last call: lines the game wrote that were deleted before they were read. See
+    /// [`Tail::take_lost`].
+    pub fn take_lost(&mut self) -> u64 {
+        self.tail.take_lost()
+    }
+
     /// The tail of `from_game.log`, for the blocking variant ([`Tail::spawn`]).
     pub fn into_tail(self) -> Tail {
         self.tail
@@ -515,6 +541,10 @@ pub struct Tail {
     head: Vec<u8>,
     /// The last bytes read, which end at `offset` (up to [`SIGNATURE_BYTES`]).
     mark: Vec<u8>,
+    /// Gaps not yet taken ([`take_lost`](Self::take_lost)): generations deleted before this tail read them.
+    lost: u64,
+    /// A read error that came after lines of the same poll: that poll handed out its lines, the next one returns this.
+    deferred: Option<io::Error>,
 }
 
 impl Tail {
@@ -543,6 +573,8 @@ impl Tail {
             skipping: false,
             head: Vec::new(),
             mark: Vec::new(),
+            lost: 0,
+            deferred: None,
         }
     }
 
@@ -570,14 +602,33 @@ impl Tail {
         Pos { gen: self.gen, offset: self.offset.saturating_sub(self.pending.len() as u64) }
     }
 
+    /// The gaps this tail went over since the last call: each a run of generations deleted before it read them, their lines lost
+    /// (see [`oldest_generation_after`]). What a lost line means is the caller's to say.
+    pub fn take_lost(&mut self) -> u64 {
+        std::mem::take(&mut self.lost)
+    }
+
     /// Reads whatever was appended since the last call and returns the complete lines in file order, through the
     /// generations the log went on to. A file that is not the one read before (shorter, or other bytes where the
     /// remembered ones were) was replaced: reading starts again at its beginning.
+    ///
+    /// An error after lines were read in the same poll (the next generation cannot be opened yet, say) keeps them: they are
+    /// returned, the position is past them, and the error comes with the next poll (review 2026-10-31: it dropped them, and
+    /// lines the position had passed were never read again, with no gap reported).
     pub fn poll(&mut self) -> io::Result<Vec<Line>> {
+        if let Some(e) = self.deferred.take() {
+            return Err(e);
+        }
         let mut out = Vec::new();
         for _ in 0..=MAX_SWITCHES_PER_POLL {
-            if !self.poll_generation(&mut out)? {
-                break;
+            match self.poll_generation(&mut out) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) if out.is_empty() => return Err(e),
+                Err(e) => {
+                    self.deferred = Some(e);
+                    break;
+                }
             }
         }
         Ok(out)
@@ -588,12 +639,13 @@ impl Tail {
         let mut file = match File::open(generation_path(&self.path, self.gen)) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // deleted under a tail that fell far behind: on with the newest generation (what was in between
-                // is gone); otherwise the file may be recreated later with fresh content: start over then
-                let newest = newest_generation(&self.path);
+                // deleted under a tail that fell behind: on at the oldest generation still there, never past kept lines
+                // (oldest_generation_after); what was in between is lost, a gap for the caller. Otherwise the file may be
+                // recreated later with fresh content: start over then
                 self.rewind();
-                if newest > self.gen {
-                    self.gen = newest;
+                if let Some(next) = oldest_generation_after(&self.path, self.gen) {
+                    self.gen = next;
+                    self.lost += 1;
                     return Ok(true);
                 }
                 return Ok(false);
@@ -972,6 +1024,22 @@ clock	1	3
     }
 
     #[test]
+    fn a_read_error_after_lines_of_the_same_poll_keeps_the_lines_and_comes_with_the_next_poll() {
+        // review 2026-10-31: the lines read before the error were dropped while the position had passed them
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("from_game.log");
+        fs::write(&base, format!("{}{}", format_line(&line("a")), rotate_line("1", 2, 0))).unwrap();
+        let next = generation_path(&base, 2);
+        fs::create_dir(&next).unwrap(); // the next generation cannot be read: a folder in its place
+        let mut tail = Tail::new(base.clone());
+        assert_eq!(tail.poll().unwrap(), vec![line("a")]);
+        assert!(tail.poll().is_err(), "the error comes with the next poll");
+        fs::remove_dir(&next).unwrap();
+        fs::write(&next, format_line(&line("b"))).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line("b")]);
+    }
+
+    #[test]
     fn to_game_rotates_and_a_tail_reads_every_line_once_across_generations() {
         let root = TempDir::new().unwrap();
         let mut s = Session::create_under(root.path(), "host").unwrap().with_rotation(300, 3);
@@ -996,6 +1064,7 @@ clock	1	3
             (1..=100).map(|i| format!("payload {i}")).collect::<Vec<_>>(),
             "every line once, in order"
         );
+        assert_eq!(tail.take_lost(), 0, "following the rotations loses nothing: no gap, no repair asked");
         let newest = newest_generation(&base);
         assert!(newest > 3, "it rotated ({newest})");
         assert!(!base.exists() && generation_path(&base, newest - 2).exists(), "three generations are kept");

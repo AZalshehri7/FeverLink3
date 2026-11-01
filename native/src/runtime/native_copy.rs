@@ -75,6 +75,7 @@ impl Runtime {
             base: self.base,
             set: sink.settings,
             build_name: self.build.layout_name(),
+            cons: None,
         };
         nc::run(&ctx, payload, &mut |line| write(line));
         let left = alloc.free_all();

@@ -11,11 +11,10 @@ use super::limits::RateLimiter;
 use super::linkstats::{HostLinkStats, OffsetEstimate};
 use super::lockstep::{JitterBuffer, LeadMeter, Lockstep, PlayerClock};
 use super::messages::{
-    codec, ActionMessage, ActionRefusedMessage, AuthorityMessage, BuildCommitMessage, BuildVetoMessage,
-    ChallengeMessage, ChatMessage, ChecksumReportMessage, ChecksumRequestMessage, ClockMessage, HelloMessage, Hops,
-    JoinMessage, PeerClockMessage, Permissions, PingMessage, PlayerInfo, PlayerJoinedMessage, PlayerLeftMessage,
-    PongMessage, RejectMessage, ReplayFailedMessage, ResumeClaim, ResumeGrant, SaveDoneMessage, SessionState,
-    SpeedRequestMessage, WelcomeMessage,
+    codec, ActionMessage, ActionRefusedMessage, BuildCommitMessage, BuildVetoMessage, ChallengeMessage, ChatMessage,
+    ChecksumReportMessage, ChecksumRequestMessage, ClockMessage, HelloMessage, Hops, JoinMessage, PeerClockMessage,
+    Permissions, PingMessage, PlayerInfo, PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage,
+    ReplayFailedMessage, ResumeClaim, ResumeGrant, SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
 };
 use super::mods::{ModFingerprint, ModTags};
 use super::names::Names;
@@ -374,7 +373,8 @@ pub struct HostSession {
     relayed_stamp_max: Option<i64>,
     /// The stalled games and the promise the host keeps for each (`stall.rs`).
     stalls: BTreeMap<u16, Stall>,
-    /// Players caught up after a drop whose world has not been compared in a checksum round yet: a difference reloads them at once.
+    /// Players caught up after a drop whose world has not been compared in a checksum round yet: a difference in an ordinary part asks
+    /// the policy for a repair at once, without its second round, and the policy's cooldown still holds (`check_caught_up`).
     resume_checks: BTreeSet<u16>,
     /// Games whose world may be PARTLY built since their last load: the engine threw while it applied an action there
     /// (`ActionRefusedMessage::partial`). A repair never takes its world from one of them (`repair_source`); a finished round
@@ -1000,7 +1000,8 @@ impl HostSession {
     /// stalled game from the first moment (`stall.rs`). The host keeps its promise, which follows the games that run, so they run on;
     /// every action it ships is stamped by the host or refused on every game if its stamp lies before that promise (never applied
     /// late); its game catches up (the mod's catch-up, faster batches) and the stall ends when its own promise reaches the host's. Its
-    /// world is compared in the next checksum round it reports: a difference reloads it at once (`resume_checks`).
+    /// world is compared in the next checksum round it reports: a difference in an ordinary part asks the policy for a repair without
+    /// its second round, inside the cooldown it waits for its end (`resume_checks`, `check_caught_up`).
     fn begin_catch_up(&mut self, id: u16) {
         if !self.state.started {
             return;
@@ -1114,6 +1115,11 @@ impl HostSession {
                 // verify round and the session line this player is sent below already carry it)
                 if let Some(m) = codec::try_decode::<HelloMessage>(payload) {
                     self.on_load_hello(from, m.time);
+                }
+                // an outsider that said hello from its own world and that no round takes in (it was not ready at the start, its load
+                // hello came after the round's timeout): the new player's path brings it the session's world (review 2026-10-31)
+                if self.outsiders.contains(&from) && !self.round_takes_in(from) {
+                    self.on_new_player(from, "new player");
                 }
                 // a game that (re)loaded a world makes its promises from it again
                 self.end_stall(from, "it loaded a world");
@@ -1301,13 +1307,8 @@ impl HostSession {
                 // a report that is not the size of a world's hashes is treated like one that does not decode
                 if let Some(m) = codec::try_decode::<ChecksumReportMessage>(payload).filter(ChecksumRounds::acceptable)
                 {
-                    if from == Self::HOST_ID {
-                        if let Some(authority) = m.authority.as_ref().filter(|a| !a.is_empty()) {
-                            let msg = AuthorityMessage { n: m.n, values: authority.clone() };
-                            self.broadcast(MessageKind::Authority, &codec::encode(&msg), Some(Self::HOST_ID));
-                        }
-                    }
-                    if self.players.get(&from).is_some_and(|p| p.ready) {
+                    let expected = self.expected_reporters();
+                    if expected.contains(&from) {
                         if let Some(cost) = m.cost.filter(|c| c.entity_ns > 0) {
                             let costs = self.round_costs.entry(from).or_default();
                             costs.push_back(cost.entity_ns);
@@ -1315,9 +1316,16 @@ impl HostSession {
                                 costs.pop_front();
                             }
                         }
-                        let expected = self.expected_reporters();
                         if let Some(outcome) = self.checksums.report(from, m, &expected) {
                             self.on_checksum_outcome(outcome);
+                        }
+                    } else if self.players.get(&from).is_some_and(|p| p.ready) {
+                        // an outsider during a round (`expected_reporters`): its world is replaced by a load, not compared
+                        if self.dropped_once.insert(format!("outsider-report/{from}")) {
+                            let who = self.name(from);
+                            self.log(format!(
+                                "checksum report from {who} ignored: its world is not the session's while this resync round runs"
+                            ));
                         }
                     } else if self.dropped_once.insert(format!("unready-report/{from}")) {
                         // a game that has not said hello since its last load has no world to compare yet; counted, it could
@@ -1387,10 +1395,22 @@ impl HostSession {
     // ---------------------------------------------------------------- session control (the launcher's host UI)
 
     pub fn start(&mut self) -> Vec<HostOutput> {
+        if self.state.started {
+            // a second Start would make every guest an outsider of a fresh start round (review 2026-10-31)
+            self.log("start ignored: the session has started already".to_owned());
+            return self.drain();
+        }
         let mut times: Vec<i64> = self.clocks.values().map(|c| c.t).collect();
         times.sort_unstable();
         times.dedup();
-        let common = if times.len() == 1 { Some(times[0]) } else { None };
+        // A connected game whose clock is missing (it has not said hello: still loading a world, or its Welcome not processed yet) or
+        // differs from the host's is not in the host's world: counted only by the clocks there are, the host's time alone was the
+        // common one, no round ran, and its later hello brought its own world into the lockstep unmarked (review 2026-10-31).
+        let host_t = self.clocks.get(&Self::HOST_ID).map(|c| c.t);
+        let strangers = host_t.is_some_and(|t| {
+            self.players.keys().any(|id| *id != Self::HOST_ID && self.clocks.get(id).is_none_or(|c| c.t != t))
+        });
+        let common = if times.len() == 1 && !strangers { Some(times[0]) } else { None };
         // A world saved paused starts paused at the save's time, but an action made before the start (the host's gameplay type, chosen at
         // Start) is stamped a lead after it, so it applied only after someone resumed (lab 2026-10-27: the mode four minutes after the
         // start, at the resume). The host decides: every game runs on to one step past the last such stamp at the slowest speed (the
@@ -1422,13 +1442,12 @@ impl HostSession {
             _ => {}
         }
         self.broadcast_session();
-        if times.len() > 1 {
-            // The games report different times, so they are not in the same world: bring everyone into the
+        if times.len() > 1 || strangers {
+            // The games report different times (or one has none yet), so they are not in the same world: bring everyone into the
             // host's world now instead of waiting for the host to ask. The session's world is the host's: until the load
-            // replaces theirs, the other games are outsiders (their clocks hold no pause, `outsiders`).
-            if self.clocks.contains_key(&Self::HOST_ID) {
-                let others: Vec<u16> =
-                    self.players.values().filter(|p| p.ready && p.id != Self::HOST_ID).map(|p| p.id).collect();
+            // replaces theirs, the other games are outsiders (their clocks hold no pause, `outsiders`), ready or not.
+            if host_t.is_some() {
+                let others: Vec<u16> = self.players.keys().copied().filter(|&id| id != Self::HOST_ID).collect();
                 self.outsiders.extend(others);
             }
             self.begin_resync("session start");
@@ -1780,11 +1799,11 @@ impl HostSession {
         let by_lead = Lockstep::round_up_to_step(
             self.max_clock().saturating_add(self.wanted_lead(self.state.speed.max(1))) as f64,
         );
-        // the promises the host keeps for stalled games count like the games' own (stall.rs)
+        // the promises the host keeps for stalled games count like the games' own (stall.rs), of the session's world only
         let promised = self
             .world_clocks()
             .filter_map(|c| c.safe)
-            .chain(self.stalls.values().map(|s| s.proxy))
+            .chain(self.stalls.iter().filter(|(id, _)| !self.outsiders.contains(id)).map(|(_, s)| s.proxy))
             .max()
             .unwrap_or(by_lead);
         by_lead.max(Lockstep::round_up_to_step(promised as f64))
@@ -1932,9 +1951,14 @@ impl HostSession {
         self.broadcast(MessageKind::PlayerLeft, &codec::encode(&left), Some(id));
     }
 
-    /// The games a checksum round waits for: those that said hello since their last load.
+    /// The games a checksum round waits for and compares: those that said hello since their last load. While a resync round runs, not
+    /// the outsiders: a game that was not sent the round's load (a joiner waiting for the next round) said hello from its own world,
+    /// and the verify round failed on it as "games still differ" or "different times" (review 2026-10-31). Outside a round a ready
+    /// outsider (one a failed round did not bring in) is compared on purpose: its difference is what makes the policy repair it, so
+    /// leaving outsiders out always would keep a stuck one out of the session's world for good.
     fn expected_reporters(&self) -> Vec<u16> {
-        self.players.values().filter(|p| p.ready).map(|p| p.id).collect()
+        let round = self.resync.is_some();
+        self.players.values().filter(|p| p.ready && !(round && self.outsiders.contains(&p.id))).map(|p| p.id).collect()
     }
 
     /// Ends a connection by the host's decision and says why. A joined player gets a sealed `Kicked` and loses its

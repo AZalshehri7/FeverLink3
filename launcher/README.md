@@ -196,7 +196,6 @@ and reads; the mapping of the format is described under *File link* below. Direc
 | `player_joined` | PlayerJoined (13) | to game | `0` |
 | `player_left` | PlayerLeft (14) | to game | `0` |
 | `checksum_request` | ChecksumRequest (15) | to game | `0` |
-| `authority` | Authority (16) | to game (players) | `0` |
 | `resync_save` | ResyncSave (17) | to game (host) | `0` |
 | `resync_load` | ResyncLoad (19) | to game | `0` |
 | `permissions` | Permissions (20) | to game (rewritten per player, see "Resync and permissions") | `0` |

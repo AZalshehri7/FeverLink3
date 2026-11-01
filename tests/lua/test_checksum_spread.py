@@ -31,7 +31,7 @@ import test_lockstep as T  # noqa: E402
 STEP = T.STEP
 CHUNK = 200            # L.CHECKSUM_CHUNK
 BUDGET_MS = 30         # L.CHECKSUM_FRAME_BUDGET_MS
-HEAVY = {"constructions", "edges", "nodeConfigs", "townBuildings", "ids"}
+HEAVY = {"constructions", "edges", "nodeConfigs", "townBuildings", "ids", "constructions@ids", "townBuildings@ids"}
 
 # n town buildings in three towns, each with its own construction (the same ids on both games: they come from the savegame)
 POPULATE = """
@@ -163,15 +163,21 @@ class TwoSimulationStatesTest(TwoGames):
         cases = [
             # (what, building i, on host/guest, at step after the stamp (None: before it), change, the parts that differ)
             ("grown on the guest before the stamp", 7, b_only, None, "WORLD[1001 + 2 * I].TOWN_BUILDING.level = 9",
-             {"townBuildings", "townBuildings:91"}),
+             {"townBuildings", "townBuildings:91", "townBuildings@ids"}),
             ("grown on both one step in (as the engine's town growth)", 11, (True, True), 1,
              "WORLD[1001 + 2 * I].TOWN_BUILDING.level = 9; WORLD[1000 + 2 * I].CONSTRUCTION.transf[13] = 7", set()),
             ("changed on the guest in the middle of the round", 12, b_only, 2, "WORLD[1001 + 2 * I].TOWN_BUILDING.depth = 3",
-             {"townBuildings", "townBuildings:90"}),
+             {"townBuildings", "townBuildings:90", "townBuildings@ids"}),
             ("replaced by its town on both: gone when its chunk comes", 21, (True, True), 1,
              "WORLD[1000 + 2 * I] = nil; WORLD[1001 + 2 * I] = nil", set()),
             ("replaced on the guest only", 22, b_only, 1, "WORLD[1000 + 2 * I] = nil; WORLD[1001 + 2 * I] = nil",
-             {"constructions", "townBuildings", "townBuildings:91"}),
+             {"constructions", "townBuildings", "townBuildings:91", "constructions@ids", "townBuildings@ids"}),
+            # the same houses under swapped ids on the guest (a late apply's permutation, review 2026-10-31): only the id parts see it
+            ("two houses with their ids swapped on the guest", 30, b_only, None,
+             "WORLD[1000 + 2 * I].CONSTRUCTION, WORLD[1002 + 2 * I].CONSTRUCTION = WORLD[1002 + 2 * I].CONSTRUCTION, WORLD[1000 + 2 * I].CONSTRUCTION; "
+             "WORLD[1001 + 2 * I].TOWN_BUILDING, WORLD[1003 + 2 * I].TOWN_BUILDING = WORLD[1003 + 2 * I].TOWN_BUILDING, WORLD[1001 + 2 * I].TOWN_BUILDING; "
+             "WORLD[1001 + 2 * I].TOWN_BUILDING.construction, WORLD[1003 + 2 * I].TOWN_BUILDING.construction = 1000 + 2 * I, 1002 + 2 * I",
+             {"constructions@ids", "townBuildings@ids"}),
         ]
         self.start()
         self.tick(5)
@@ -385,14 +391,26 @@ class SpreadRoundPureTest(unittest.TestCase):
         account = function() return 100, 10 end,
         lines = function() return {} end,
         constructionIds = function() local t = {} for i = 1, n do t[i] = i end return t end,
-        construction = function(i) reads = reads + 1; return { file = "c" .. (i % 5) .. ".con", x = i, y = 2 * i, z = 0 } end,
+        -- SWAP[i]: entity i holds what entity SWAP[i] holds elsewhere (ids permuted); TURN[i]: its rotation term; NODE[k]: node k's id
+        construction = function(i) reads = reads + 1; local j = SWAP[i] or i
+          return { file = "c" .. (j % 5) .. ".con", x = j, y = 2 * j, z = 0, ax = TURN[j] or 1, ay = 0 } end,
         streetIds = function() local ed, no = {}, {} for i = 1, n do ed[i] = 10000 + i; no[i] = 20000 + i end return { edges = ed, nodes = no } end,
-        edge = function(i, ctx) reads = reads + 1; return { x0 = i, y0 = 0, x1 = i + 1, y1 = 0, type = "0", objects = {} } end,
+        edge = function(i, ctx) reads = reads + 1
+          -- edges 10013 and 10015 are under 0.1 m long (both ends round to one place): 10013 bent, 10015 a U-turn that reads the same both ways
+          local short = i == 10013 or i == 10015
+          local t1 = i == 10013 and { x = 0, y = 1, z = 0 } or i == 10015 and { x = -1, y = 0, z = 0 } or { x = 1, y = 0, z = 0 }
+          local e = { x0 = i, y0 = 0, z0 = Z[i] or 0, x1 = short and i + 0.01 or i + 1, y1 = 0, z1 = 0, t0 = { x = 1, y = 0, z = 0 }, t1 = t1,
+            n0 = NODE[i] or i, n1 = NODE[i + 1] or (i + 1), type = "0", objects = {} }
+          if FLIP[i] then   -- the same edge stored the other way round: ends, tangents (negated) and nodes swapped
+            e.x0, e.x1, e.z0, e.z1, e.n0, e.n1 = e.x1, e.x0, e.z1, e.z0, e.n1, e.n0
+            e.t0, e.t1 = { x = -e.t1.x, y = -e.t1.y, z = -e.t1.z }, { x = -e.t0.x, y = -e.t0.y, z = -e.t0.z }
+          end
+          return e end,
         nodeConfig = function(i) reads = reads + 1; return { x = i, y = 1, lanes = 2, crosswalks = 0 } end,
         townBuildingIds = function() local t = {} for i = 1, n do t[i] = 30000 + i end return t end,
         townBuilding = function(i) reads = reads + 1; return { town = 1 + i % 4, file = "h.con", x = i, y = i, z = 0, level = LEVEL[i] or 1, depth = 1, parcels = 1, timeBuilt = i } end,
       }
-      LEVEL = LEVEL or {}
+      LEVEL = LEVEL or {}; SWAP = SWAP or {}; TURN = TURN or {}; Z = Z or {}; NODE = NODE or {}; FLIP = FLIP or {}
       return e, function() local r = reads; reads = 0; return r end
     end)"""
 
@@ -431,11 +449,24 @@ class SpreadRoundPureTest(unittest.TestCase):
         self.assertEqual(t, 5000)
         self.assertTrue(r.parts["townBuildings"].startswith("250/"))
         self.assertEqual(len([k for k in r.parts.keys() if str(k).startswith("townBuildings:")]), 4)
-        # one entity that differs is detected in its lane and its town
-        self.L.execute("LEVEL[30007] = 3")
-        r2, _ = self.spread(250, 64)
-        b = {k: v for k, v in r2.parts.items()}
-        self.assertEqual({k for k in a if a[k] != b[k]}, {"townBuildings", "townBuildings:4"})
+        self.assertTrue({"constructions@ids", "edges@ids", "townBuildings@ids"} <= set(a), a)
+        # one entity that differs is detected in its lane, its town and its id part; the same things under swapped ids (constructions
+        # 3 and 4, nodes 10007 and 10008) only in the id part; a turned construction, a raised edge end in the lane; an edge stored the
+        # other way round is the same edge, also one whose ends round to one place
+        cases = [("LEVEL[30007] = 3", {"townBuildings", "townBuildings:4", "townBuildings@ids"}),
+                 ("SWAP[3], SWAP[4] = 4, 3", {"constructions@ids"}),
+                 ("NODE[10007], NODE[10008] = 10008, 10007", {"edges@ids"}),
+                 ("TURN[5] = 0.5", {"constructions", "constructions@ids"}),
+                 ("Z[10009] = 2", {"edges", "edges@ids"}),
+                 ("FLIP[10011] = true", set()),
+                 ("FLIP[10013] = true", set()),
+                 ("FLIP[10015] = true", set())]
+        for change, want in cases:
+            self.L.execute("LEVEL, SWAP, TURN, Z, NODE, FLIP = {}, {}, {}, {}, {}, {}; " + change)
+            r2, _ = self.spread(250, 64)
+            b = {k: v for k, v in r2.parts.items()}
+            self.assertEqual({k for k in a if a[k] != b[k]}, want, change)
+        self.L.execute("LEVEL, SWAP, TURN, Z, NODE, FLIP = {}, {}, {}, {}, {}, {}")
         # in a large world the chunk grows instead of the round
         r3, per_step = self.spread(1000, 10, max_chunks=20)
         self.assertEqual((r3.chunk, len(per_step)), (200, 20))
@@ -445,7 +476,7 @@ class SpreadRoundPureTest(unittest.TestCase):
         r4 = self.K.newChecksumRound(e, self.C.hashValue, False, self.L.table_from({"chunk": 16}))
         while not r4.done:
             self.K.checksumRoundStep(r4)
-        self.assertEqual(r4.parts["edges"], "error")
+        self.assertEqual((r4.parts["edges"], r4.parts["edges@ids"]), ("error", "error"), "not ready, never absent")
         self.assertNotEqual(r4.parts["townBuildings"], "error")
         self.assertIn("boom", r4.errors["edges"])
         # the landing marks of a spread round are its chunk steps; a whole, paused or light round has none

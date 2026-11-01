@@ -44,6 +44,7 @@ pub mod portable;
 pub mod rebuild;
 pub mod scan;
 pub mod search;
+pub mod sidefile;
 pub mod terrain;
 pub mod townseed;
 

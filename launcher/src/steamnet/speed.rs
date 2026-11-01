@@ -94,8 +94,26 @@ pub enum ParNote {
     Tester { id: u64, event: ParEvent },
 }
 
-/// The owner id of the speed test's allowance in the parallel listener.
+/// The owner id of the speed test's allowance in the parallel listener: our own download.
 const SPEED_OWNER: u64 = u64::MAX;
+/// The same for a friend's upload to us; its own id, so ending one never withdraws the other.
+pub(super) const SPEED_RESPONDER: u64 = u64::MAX - 1;
+/// New runs of friends' tests one account gets from us per [`RESPONDER_WINDOW`]: one test of the window, whose longest
+/// series ("all") is four runs. Review 2026-10-31: anyone who knows a Steam ID could keep this PC uploading.
+const RESPONDER_RUNS: usize = 4;
+const RESPONDER_WINDOW: Duration = Duration::from_secs(60);
+
+/// What a friend's run asks of us. A run asks each at most once (its upload, its download, one transport each), so a
+/// repeat is refused: otherwise a reused run id would get around [`RESPONDER_RUNS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ask {
+    Up,
+    Down,
+    DgUp,
+    DgDown,
+    ParUp,
+    ParDown,
+}
 
 /// A finished run.
 #[derive(Debug, Clone)]
@@ -225,6 +243,18 @@ pub(super) struct Incoming {
 /// Speed tests a friend may have us send at once.
 pub(super) const MAX_SENDERS: usize = 2;
 
+impl ProbeState {
+    /// A responder upload ended: its place is free, and its stop (if any) is forgotten.
+    fn sender_ended(&mut self, id: u64, conn: Handle) {
+        if let Some(at) = self.sending.iter().position(|s| *s == (id, conn)) {
+            self.sending.remove(at);
+        }
+        if !self.sending.iter().any(|s| s.0 == id) {
+            self.stopped_ids.remove(&id);
+        }
+    }
+}
+
 /// The transfer ids of a run: the upload's and the download's differ, so a stale datagram of one never counts for the
 /// other.
 fn up_xfer(id: u64) -> u32 {
@@ -287,6 +317,48 @@ impl ProbeService {
         out
     }
 
+    /// Whether we do the work `ask` of a friend's run `id` on `conn` (review 2026-10-31): never while this game
+    /// hosts or plays a session (the uplink belongs to the lockstep), never for an unknown account, at most
+    /// [`RESPONDER_RUNS`] new runs per account a minute (counted from a run's first request), and each [`Ask`] once
+    /// per run. The standalone responder serves every tester: whoever runs it started it for exactly that.
+    pub(super) fn responder_ok(&self, state: &mut ProbeState, conn: Handle, id: u64, ask: Ask, now: Instant) -> bool {
+        if self.serve_all.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        if self.in_session.load(std::sync::atomic::Ordering::Relaxed) {
+            state.events.push("a friend's speed test was turned away: this game is in a session".into());
+            return false;
+        }
+        let Some(remote) = Self::peer_remote(state, conn) else { return false };
+        // the upload's and the download's messages, and the datagram offer, name a run by the same transfer id
+        let key = u64::from(up_xfer(id));
+        // a run's requests all expire with its first one, so alternating kinds never keeps one id alive for good
+        state.responder_runs.retain(|_, runs| {
+            runs.retain(|(_, began, _)| now.saturating_duration_since(*began) < RESPONDER_WINDOW);
+            !runs.is_empty()
+        });
+        let runs = state.responder_runs.entry(remote).or_default();
+        let taken = runs.len();
+        match runs.iter_mut().find(|r| r.0 == key) {
+            Some(run) if run.2.contains(&ask) => {
+                state.events.push("a friend's speed test was turned away: it asked the same twice".into());
+                false
+            }
+            Some(run) => {
+                run.2.push(ask);
+                true
+            }
+            None if taken >= RESPONDER_RUNS => {
+                state.events.push("a friend's speed test was turned away: one test a minute".into());
+                false
+            }
+            None => {
+                runs.push((key, now, vec![ask]));
+                true
+            }
+        }
+    }
+
     fn incoming_matches(state: &ProbeState, conn: Handle, id: u64) -> bool {
         state.incoming.as_ref().is_some_and(|i| {
             i.rx.id == id && (i.conn == conn || (i.remote.is_some() && Self::peer_remote(state, conn) == i.remote))
@@ -303,8 +375,18 @@ impl ProbeService {
             let legacy = self.legacy.load(std::sync::atomic::Ordering::Relaxed);
             match msg {
                 Msg::Up { id, total, chunk, conns } => {
-                    if total > 0 && total <= throughput::MAX_TOTAL && chunk > 0 {
-                        let remote = Self::peer_remote(state, conn);
+                    let remote = Self::peer_remote(state, conn);
+                    // another account's upload in progress is not replaced
+                    let free = state
+                        .incoming
+                        .as_ref()
+                        .is_none_or(|i| i.conn == conn || (i.remote.is_some() && i.remote == remote));
+                    if total > 0
+                        && total <= throughput::MAX_TOTAL
+                        && chunk > 0
+                        && free
+                        && self.responder_ok(state, conn, id, Ask::Up, now)
+                    {
                         state.incoming =
                             Some(Incoming { conn, remote, rx: throughput::Receiver::new(id, total, now), end: None });
                         state
@@ -316,10 +398,22 @@ impl ProbeService {
                     }
                 }
                 Msg::Down { id, total, chunk, conns, rate } => {
-                    if total > 0 && total <= throughput::MAX_TOTAL && state.senders < MAX_SENDERS {
-                        state.senders += 1;
+                    if total > 0
+                        && total <= throughput::MAX_TOTAL
+                        && state.sending.len() < MAX_SENDERS
+                        && self.responder_ok(state, conn, id, Ask::Down, now)
+                    {
+                        state.sending.push((id, conn));
                         let group = Self::group_conns(state, conn, conns);
-                        let asked = (!legacy).then_some(rate).and_then(nz).map(|r| r.min(i32::MAX as u32) as i32);
+                        // never faster than this player's own send rate setting (review 2026-10-31); the standalone
+                        // responder's ladder must climb past it, and its owner started it for that
+                        let most = if self.serve_all.load(std::sync::atomic::Ordering::Relaxed) {
+                            i32::MAX
+                        } else {
+                            self.core.send_rate_setting().max(1)
+                        };
+                        let asked =
+                            (!legacy).then_some(rate).and_then(nz).map(|r| (r.min(i32::MAX as u32) as i32).min(most));
                         if let Some(r) = asked {
                             let got = self.set_rates(&group, r);
                             let notes = format!("test {id}: send rate set to {r} B/s for the test: {}", got.1);
@@ -334,8 +428,12 @@ impl ProbeService {
                     }
                 }
                 Msg::DgDown { id, total } => {
-                    if total > 0 && total <= throughput::MAX_TOTAL && state.senders < MAX_SENDERS {
-                        state.senders += 1;
+                    if total > 0
+                        && total <= throughput::MAX_TOTAL
+                        && state.sending.len() < MAX_SENDERS
+                        && self.responder_ok(state, conn, id, Ask::DgDown, now)
+                    {
+                        state.sending.push((id, conn));
                         actions.push(Action::DgSender { conn, id, total, ours: false });
                         state.events.push(format!(
                             "sending {} MB as datagrams for a friend's speed test",
@@ -344,7 +442,11 @@ impl ProbeService {
                     }
                 }
                 Msg::ParUp { id, total } => {
-                    if total > 0 && total <= throughput::MAX_TOTAL && state.par_in.is_none() && state.incoming.is_none()
+                    if total > 0
+                        && total <= throughput::MAX_TOTAL
+                        && state.par_in.is_none()
+                        && state.incoming.is_none()
+                        && self.responder_ok(state, conn, id, Ask::ParUp, now)
                     {
                         if let (Some(remote), Some(svc)) = (Self::peer_remote(state, conn), self.par_service_unlocked())
                         {
@@ -362,10 +464,10 @@ impl ProbeService {
                                             lock(&me.par_events).push(ParNote::Responder { conn, id, event });
                                         }
                                     }),
-                                    owner: SPEED_OWNER,
+                                    owner: SPEED_RESPONDER,
                                 },
                             );
-                            state.par_in = Some((conn, id));
+                            state.par_in = Some((conn, id, remote));
                             state.events.push("a friend is testing the speed (parallel connections)".into());
                             actions.push(Action::Send(conn, throughput::encode(&Msg::ParReady { id })));
                         }
@@ -378,9 +480,13 @@ impl ProbeService {
                     }
                 }
                 Msg::ParDown { id, total } => {
-                    if total > 0 && total <= throughput::MAX_TOTAL && state.senders < MAX_SENDERS {
+                    if total > 0
+                        && total <= throughput::MAX_TOTAL
+                        && state.sending.len() < MAX_SENDERS
+                        && self.responder_ok(state, conn, id, Ask::ParDown, now)
+                    {
                         if let Some(remote) = Self::peer_remote(state, conn) {
-                            state.senders += 1;
+                            state.sending.push((id, conn));
                             actions.push(Action::ParSender { conn, remote, id, total, ours: false });
                             state.events.push(format!(
                                 "sending {} MB over parallel connections for a friend's speed test",
@@ -401,7 +507,8 @@ impl ProbeService {
                     }
                 }
                 Msg::Stop { id } => {
-                    if !legacy {
+                    // only a run this connection asked us to send: anything else would only grow the set
+                    if !legacy && state.sending.contains(&(id, conn)) {
                         state.stopped_ids.insert(id);
                     }
                 }
@@ -682,13 +789,15 @@ impl ProbeService {
     /// replaced, fails or is capped); the other kind answers a friend, runs to the end, or until the friend says stop.
     fn spawn_sender(&self, conns: Vec<Handle>, id: u64, total: u64, chunk: u64, ours: bool, rate: Option<i32>) {
         let Some(me) = self.me.upgrade() else { return };
+        // the connection that asked (the first of the group)
+        let asker = conns.first().copied().unwrap_or(0);
         let spawned = thread::Builder::new().name("feverlink3-steam-speed".into()).spawn(move || {
             let cancelled = || {
                 let state = lock(&me.state);
                 if ours {
                     !state.speed.as_ref().is_some_and(|r| r.id == id && r.phase == Phase::Upload && !r.up_capped)
                 } else {
-                    state.stopped_ids.contains(&id)
+                    state.stopped_ids.contains(&id) || me.in_session.load(std::sync::atomic::Ordering::Relaxed)
                 }
             };
             let stats = throughput::stream(&me.core, &conns, id, total, chunk, &cancelled);
@@ -704,8 +813,7 @@ impl ProbeService {
                     run.up_stats = Some(stats);
                 }
             } else {
-                state.senders = state.senders.saturating_sub(1);
-                state.stopped_ids.remove(&id);
+                state.sender_ended(id, asker);
                 let mut text = format!(
                     "steam speed test (responder): sent {} MB in {} ms over {} connection(s), peak queue {} KiB, longest wait {} ms{}",
                     stats.sent / throughput::MB,
@@ -727,8 +835,7 @@ impl ProbeService {
             }
         });
         if spawned.is_err() && !ours {
-            let mut state = lock(&self.state);
-            state.senders = state.senders.saturating_sub(1);
+            lock(&self.state).sender_ended(id, asker);
         }
     }
 
@@ -765,7 +872,7 @@ impl ProbeService {
                 if ours {
                     !state.speed.as_ref().is_some_and(|r| r.id == id && !r.par.up_cancel && r.active())
                 } else {
-                    state.stopped_ids.contains(&id)
+                    state.stopped_ids.contains(&id) || me.in_session.load(std::sync::atomic::Ordering::Relaxed)
                 }
             };
             let progress = |p: &par::Progress| {
@@ -801,8 +908,7 @@ impl ProbeService {
                     run.par.up_report = Some((report, Instant::now()));
                 }
             } else {
-                state.senders = state.senders.saturating_sub(1);
-                state.stopped_ids.remove(&id);
+                state.sender_ended(id, conn);
                 let kv: Vec<(String, u64)> = [
                     ("ok", u64::from(report.ok)),
                     ("ms", (report.secs * 1000.0) as u64),
@@ -823,8 +929,16 @@ impl ProbeService {
             }
         });
         if spawned.is_err() && !ours {
-            let mut state = lock(&self.state);
-            state.senders = state.senders.saturating_sub(1);
+            lock(&self.state).sender_ended(id, conn);
+        }
+    }
+
+    /// A friend's parallel upload to us ended: the account's allowance is withdrawn (review 2026-10-31: it stayed for
+    /// good), at the next poll. A late event of an older upload leaves a newer one alone.
+    fn end_par_in(state: &mut ProbeState, conn: Handle, id: u64) {
+        if let Some((_, _, remote)) = state.par_in.filter(|p| p.0 == conn && p.1 == id) {
+            state.par_in = None;
+            state.withdraw.push((remote, SPEED_RESPONDER));
         }
     }
 
@@ -835,7 +949,7 @@ impl ProbeService {
                 ParEvent::Progress { .. } => {}
                 ParEvent::Done { len, secs, lanes_max, path, .. } => {
                     let _ = std::fs::remove_file(&path);
-                    state.par_in = None;
+                    Self::end_par_in(state, conn, id);
                     let kv = vec![
                         ("ok".to_string(), 1),
                         ("bytes".to_string(), len),
@@ -852,7 +966,7 @@ impl ProbeService {
                     );
                 }
                 ParEvent::Failed { why, .. } => {
-                    state.par_in = None;
+                    Self::end_par_in(state, conn, id);
                     let kv = vec![("ok".to_string(), 0)];
                     actions.push(Action::Send(conn, throughput::encode(&Msg::ParRes { id, kv })));
                     self.log(state, format!("steam speed test (responder, parallel): the upload failed: {why}"));
@@ -901,7 +1015,7 @@ impl ProbeService {
                 if ours {
                     !state.speed.as_ref().is_some_and(|r| r.id == id && !r.dg.up_cancel && r.active())
                 } else {
-                    state.stopped_ids.contains(&id)
+                    state.stopped_ids.contains(&id) || me.in_session.load(std::sync::atomic::Ordering::Relaxed)
                 }
             };
             let progress = |bytes: u64| {
@@ -932,8 +1046,7 @@ impl ProbeService {
                     run.dg.up_report = Some((report, Instant::now()));
                 }
             } else {
-                state.senders = state.senders.saturating_sub(1);
-                state.stopped_ids.remove(&id);
+                state.sender_ended(id, conn);
                 let ok = report.state == SenderState::Done;
                 let mut kv = summary.to_kv();
                 kv.push(("ok".into(), u64::from(ok)));
@@ -956,8 +1069,7 @@ impl ProbeService {
             }
         });
         if spawned.is_err() && !ours {
-            let mut state = lock(&self.state);
-            state.senders = state.senders.saturating_sub(1);
+            lock(&self.state).sender_ended(id, conn);
         }
     }
 
@@ -979,8 +1091,11 @@ impl ProbeService {
             });
             if let Some(run) = ours {
                 Some(Role::Tester(run.id))
-            } else if state.dg_in.is_none() && state.incoming.is_none() {
-                state.dg_in = Some(xfer);
+            } else if state.dg_in.is_none()
+                && state.incoming.is_none()
+                && self.responder_ok(state, conn, u64::from(xfer), Ask::DgUp, Instant::now())
+            {
+                state.dg_in = Some((conn, xfer));
                 state.events.push("a friend is testing the speed (datagrams)".into());
                 Some(Role::Responder)
             } else {
@@ -1003,7 +1118,7 @@ impl ProbeService {
                     Role::Tester(id) => {
                         state.speed.as_ref().is_none_or(|r| r.id != id || r.dg.down_cancel || !r.active())
                     }
-                    Role::Responder => false,
+                    Role::Responder => me.in_session.load(std::sync::atomic::Ordering::Relaxed),
                 }
             };
             let progress = |bytes: u64| {
@@ -1054,7 +1169,9 @@ impl ProbeService {
             }
             if matches!(role, Role::Responder) {
                 let mut state = lock(&me.state);
-                state.dg_in = None;
+                if state.dg_in == Some((conn, xfer)) {
+                    state.dg_in = None;
+                }
                 if let Some(dump) = me.core.detailed_status(conn) {
                     for l in dump.lines() {
                         me.log(&mut state, format!("steam speed test (responder) status: {l}"));
@@ -1507,6 +1624,12 @@ impl ProbeService {
         for (h, _) in &run.extras {
             self.core.close(*h);
         }
+        if run.par.down_registered {
+            // our download's allowance for the friend ends with the run (review 2026-10-31: it stayed for good)
+            let target = run.target;
+            state.withdraw.push((target, SPEED_OWNER));
+        }
+        let Some(run) = state.speed.as_mut() else { return };
         if let Some(dump) = self.core.detailed_status(run.conn) {
             for l in dump.lines() {
                 logs.push(format!("steam speed test status (end): {l}"));
@@ -1673,10 +1796,16 @@ impl Probe {
     /// Steps the run and the responder side; called by [`Probe::poll`].
     pub(super) fn drive_speed(&self) {
         let now = Instant::now();
+        self.withdraw_allowances();
         let mut actions = Vec::new();
         {
             let mut guard = lock(&self.service.state);
             let state = &mut *guard;
+            // a friend's upload that sent nothing for as long as a tester waits is over (review 2026-10-31: one
+            // silent peer held it, and so every other account's upload test, until it disconnected)
+            if state.incoming.as_ref().is_some_and(|i| i.rx.idle(now) > throughput::ABORT_AFTER) {
+                state.incoming = None;
+            }
             if let Some(a) = ProbeService::try_upres(state, now, false) {
                 actions.push(a);
             }
@@ -1687,6 +1816,32 @@ impl Probe {
             self.service.step_run(state, now, &mut actions);
         }
         self.service.perform(actions);
+    }
+
+    /// Withdraws the parallel allowances that ended since the last poll. A withdrawal fails the transfer still running
+    /// under it, which sends and waits, so it happens here and not under a lock or on the poller thread. The current
+    /// run's own download allowance is kept (a new run on the same friend set it up again).
+    fn withdraw_allowances(&self) {
+        let ended: Vec<(u64, u64)> = {
+            let mut state = lock(&self.service.state);
+            let keep = state.speed.as_ref().filter(|r| r.active() && r.par.down_registered).map(|r| r.target);
+            // the friend's next parallel upload may already have set its allowance up again on the poller thread
+            let held = state.par_in.map(|p| p.2);
+            std::mem::take(&mut state.withdraw)
+                .into_iter()
+                .filter(|&(remote, owner)| {
+                    !(owner == SPEED_OWNER && keep == Some(remote))
+                        && !(owner == SPEED_RESPONDER && held == Some(remote))
+                })
+                .collect()
+        };
+        if ended.is_empty() {
+            return;
+        }
+        let Some(svc) = lock(&self.service.par_svc).clone() else { return };
+        for (remote, owner) in ended {
+            svc.disallow(remote, owner);
+        }
     }
 
     /// The next run of a series, once the one before it has ended: collects its block.
@@ -1764,6 +1919,35 @@ impl Probe {
     pub fn link_now(&self) -> Option<LinkSnapshot> {
         let conn = lock(&self.service.state).test.as_ref().filter(|t| t.connected).map(|t| t.conn)?;
         self.core.link(conn)
+    }
+
+    /// The controller says whether this game hosts or plays a session (review 2026-10-31). While it does, the probe
+    /// does no work for other players' speed tests and stops what it was doing for them; its own tests still run.
+    pub fn set_in_session(&self, on: bool) {
+        let was = self.service.in_session.swap(on, std::sync::atomic::Ordering::Relaxed);
+        if on && !was {
+            let now = Instant::now();
+            let reply = {
+                let mut state = lock(&self.service.state);
+                if let Some((_, _, remote)) = state.par_in.take() {
+                    state.withdraw.push((remote, SPEED_RESPONDER));
+                }
+                // a friend's reliable upload ends now with what arrived: the answer ends its upload, so its sender
+                // stops instead of filling our downlink in the session
+                if let Some(inc) = state.incoming.as_mut() {
+                    inc.end.get_or_insert(now);
+                }
+                ProbeService::try_upres(&mut state, now, true)
+            };
+            self.service.perform(reply.into_iter().collect());
+        }
+    }
+
+    /// The standalone responder (`feverlink3-speedtest.exe`) serves every tester: no session to protect, no limit per
+    /// account and no clamp to this player's send rate, since its owner started it for exactly that and the rate
+    /// ladder needs many runs in a minute at rates above the setting.
+    pub fn serve_every_tester(&self) {
+        self.service.serve_all.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Makes this probe behave like an older program that ignores the rate request and the stop message (tests).

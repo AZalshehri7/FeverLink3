@@ -45,6 +45,9 @@ pub const EVENTS_FILE: &str = "native_events.log";
 /// The events file starts a new generation at this size: small, because a reloaded mod reads the newest generation
 /// as history.
 pub const EVENTS_ROTATE_BYTES: u64 = 1 << 20;
+/// Generations of the events file kept (the newest included): room for a whole session, which a bug report takes whole
+/// (2026-10-30: a session between two PCs wrote 5 MB and kept only the last 4 generations).
+pub const EVENTS_KEEP_GENERATIONS: u64 = 32;
 /// The `from` column of every event line.
 pub const EVENTS_FROM: &str = "native";
 /// A control line longer than this is thrown away.
@@ -422,8 +425,11 @@ pub struct Poll {
     pub gone: bool,
     /// Records thrown away: longer than [`MAX_LINE`], or not a link record.
     pub discarded: usize,
-    /// A read error (the file is retried on the next poll), or a generation that was deleted before it was read.
+    /// A read error (the file is retried on the next poll).
     pub error: Option<String>,
+    /// Gaps, one text each: generations of a control file deleted before they were read (the reader went on at the oldest one
+    /// still there, `gamelink::oldest_generation_after`). Their lines, orders of the mod, are lost.
+    pub lost: Vec<String>,
     /// Writers that appeared since the link opened, at their first line: `sim.w<id> (from <its from column>)`, for the log.
     pub new_writers: Vec<String>,
 }
@@ -560,16 +566,41 @@ impl CtlReader {
         self.families.iter().map(|f| f.sources.len()).sum()
     }
 
-    /// True when a file is longer than what was consumed (or gone), or the folder may hold a new writer's file: the cheap
-    /// check (a metadata call per writer and one for the folder, no open) that lets a caller on a hot path decide whether
-    /// a [`poll`](Self::poll) is worth it.
+    /// True when a file's length is not what was consumed, a file read before is gone, a file never seen is missing while its
+    /// pointer names a newer generation (deleted before it was opened: the poll goes on at the oldest one still there instead of
+    /// the source stalling), or the folder may hold a new writer's file: the cheap check (a metadata call per writer, one listing
+    /// of the folder, and the pointer file of a source whose file is missing and was never seen) that lets a caller decide
+    /// whether a [`poll`](Self::poll) is worth it.
     pub fn has_news(&self) -> bool {
-        self.folder_news() || self.families.iter().any(|f| f.sources.iter().any(Source::has_news))
+        self.folder_news() || self.families.iter().any(|f| f.sources.iter().any(|s| s.has_news(true)))
     }
 
     pub fn poll(&mut self) -> Poll {
+        let listed = self.folder_news();
+        self.poll_listed(listed)
+    }
+
+    /// [`has_news`](Self::has_news) and [`poll`](Self::poll) for a hot path (the command hook): ONE listing of the folder per
+    /// call, where the pair listed it twice and the discovery a third time (review 2026-10-31). Never fewer: the simulation half
+    /// makes its writer lazily, so a new writer's FIRST line is an order (`inject_next`, `patch_next`) whose command follows in
+    /// the same Lua call; a listing skipped here would leave that order unread for this command (review of 2026-11-01).
+    /// The pointer file of a source whose file is missing and was never seen is not read here (review 2026-10-31: one open per
+    /// such source and command): that source waits for a file not written yet (a cleaned folder, the next generation), which
+    /// the metadata call sees once it is there, or fell behind by every kept generation, which a reader polled every 20 ms
+    /// does not; the service thread's [`has_news`](Self::has_news) still reads it. A new writer's first line is found by the
+    /// listing, never through a pointer. `None` when there is nothing to read.
+    pub fn poll_hot(&mut self) -> Option<Poll> {
+        let listed = self.folder_news();
+        if !listed && !self.families.iter().any(|f| f.sources.iter().any(|s| s.has_news(false))) {
+            return None;
+        }
+        Some(self.poll_listed(listed))
+    }
+
+    /// The poll, with the folder's discovery when a listing found a writer not known yet.
+    fn poll_listed(&mut self, listed: bool) -> Poll {
         let mut out = Poll::default();
-        if self.folder_news() {
+        if listed {
             if let Err(e) = self.discover(false) {
                 out.error = Some(format!("listing the control files: {e}"));
             }
@@ -665,10 +696,13 @@ impl Source {
         self.existed = false;
     }
 
-    fn has_news(&self) -> bool {
+    /// `pointer`: whether a file missing and never seen reads the pointer ([`CtlReader::has_news`]; [`CtlReader::poll_hot`] does not).
+    fn has_news(&self, pointer: bool) -> bool {
         match fs::metadata(self.path()) {
             Ok(m) => m.len() != self.offset,
-            Err(_) => self.existed,
+            // gone, or never there while a newer generation is named: deleted before this source opened it, so the poll goes
+            // on at the oldest one still there instead of this source stalling (the pointer is read only when the file is missing)
+            Err(_) => self.existed || (pointer && gamelink::newest_generation(&self.base) > self.gen),
         }
     }
 
@@ -686,16 +720,22 @@ impl Source {
         let len = match fs::metadata(&path) {
             Ok(m) => m.len(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let newest = gamelink::newest_generation(&self.base);
-                if newest > self.gen {
-                    // deleted under a reader that fell behind by every kept generation: on with the newest (cannot
-                    // happen to a reader polled every 20 ms; said, never silent)
-                    out.error = Some(format!(
-                        "{}: control file {} was deleted before it was read to its end; going on with generation {newest}",
+                if let Some(next) = gamelink::oldest_generation_after(&self.base, self.gen) {
+                    // deleted under a reader that fell behind by every kept generation (not seen with a reader polled every
+                    // 20 ms), or before this source opened it: on at the OLDEST generation still there from its first byte,
+                    // never past kept lines and never past a new writer's first line (review 2026-10-31: it went on at the
+                    // newest). The lines in between are lost: a gap, never silent
+                    let gens = if next > self.gen + 1 {
+                        format!("generations {} to {}", self.gen, next - 1)
+                    } else {
+                        format!("generation {}", self.gen)
+                    };
+                    out.lost.push(format!(
+                        "{}: {gens} of {} deleted before being read; going on at generation {next}",
                         self.name,
-                        path.display()
+                        file_label(&self.base)
                     ));
-                    self.next_generation(gamelink::Rotate { gen: newest, skip: 0 });
+                    self.next_generation(gamelink::Rotate { gen: next, skip: 0 });
                     return true;
                 }
                 if self.existed {
@@ -1364,13 +1404,13 @@ impl EventWriter {
     pub fn open(dir: &Path) -> io::Result<EventWriter> {
         let base = dir.join(EVENTS_FILE);
         let out =
-            gamelink::GenWriter::open(base, EVENTS_FROM)?.with_limits(EVENTS_ROTATE_BYTES, gamelink::KEEP_GENERATIONS);
+            gamelink::GenWriter::open(base, EVENTS_FROM)?.with_limits(EVENTS_ROTATE_BYTES, EVENTS_KEEP_GENERATIONS);
         Ok(EventWriter { out, header: String::new(), iplayer: String::new() })
     }
 
     /// The same writer with another generation size (tests).
     pub fn with_rotation(mut self, rotate_bytes: u64) -> EventWriter {
-        self.out = self.out.with_limits(rotate_bytes, gamelink::KEEP_GENERATIONS);
+        self.out = self.out.with_limits(rotate_bytes, EVENTS_KEEP_GENERATIONS);
         self
     }
 
@@ -1968,6 +2008,18 @@ mod tests {
     }
 
     #[test]
+    fn a_hot_poll_reads_a_new_writers_first_order_at_once() {
+        // the simulation half makes its writer lazily: its first line is an order whose command comes in the same Lua call
+        let dir = TempDir::new("hot-new-writer");
+        append(&writer(dir.path(), GUI, "1"), &rec("ping", "{}"));
+        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
+        assert!(r.poll_hot().is_none(), "nothing new yet");
+        append(&writer(dir.path(), SIM, "2"), &rec("inject_next", "{}"));
+        let p = r.poll_hot().expect("the new writer's order is read by the very next hot poll");
+        assert_eq!(p.lines.iter().map(|l| l.kind.as_str()).collect::<Vec<_>>(), ["inject_next"]);
+    }
+
+    #[test]
     fn a_reader_follows_rotations_without_losing_or_splitting_a_line() {
         let dir = TempDir::new("rotate-follow");
         let base = writer(dir.path(), SIM, "3");
@@ -1980,7 +2032,7 @@ mod tests {
             if i % 5 == 0 || i % 11 == 0 {
                 let p = r.poll();
                 discarded += p.discarded;
-                assert!(p.error.is_none(), "{p:?}");
+                assert!(p.error.is_none() && p.lost.is_empty(), "{p:?}");
                 got.extend(pings(&p));
             }
         }
@@ -1998,6 +2050,62 @@ mod tests {
         assert!(late.poll().lines.is_empty());
         w.append(&rec("ping", "{121}")).unwrap();
         assert_eq!(pings(&late.poll()), ["{121}"]);
+    }
+
+    #[test]
+    fn a_reader_behind_deleted_generations_reads_the_oldest_kept_one_first_and_reports_the_gap() {
+        // review 2026-10-31: a source whose generation was deleted under it went on at the newest, past the kept generations
+        let dir = TempDir::new("rotate-behind");
+        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
+        let n = |i: u64| format!("{{[\"n\"]={i}}}");
+        let first_line = |base: &Path, gen: u64| {
+            let text = fs::read_to_string(gamelink::generation_path(base, gen)).unwrap();
+            gamelink::parse_line(text.lines().next().unwrap()).unwrap().payload
+        };
+        let read_all = |r: &mut CtlReader| {
+            let (mut got, mut lost) = (Vec::new(), Vec::new());
+            while r.has_news() {
+                let p = r.poll();
+                got.extend(pings(&p));
+                lost.extend(p.lost);
+            }
+            (got, lost)
+        };
+        // a writer read up to its line 0, then it writes on past every kept generation before the next poll
+        let sim = writer(dir.path(), SIM, "5");
+        let mut w = gamelink::GenWriter::open(sim.clone(), "1").unwrap().with_limits(150, 3);
+        w.append(&rec("ping", &n(0))).unwrap();
+        assert_eq!(pings(&r.poll()), [n(0)]);
+        for i in 1..=60 {
+            w.append(&rec("ping", &n(i))).unwrap();
+        }
+        let oldest = w.generation() - 2;
+        assert!(!sim.exists() && !gamelink::generation_path(&sim, oldest - 1).exists(), "three generations are kept");
+        let kept = first_line(&sim, oldest);
+        let from = (1..=60).find(|i| n(*i) == kept).unwrap();
+        let (got, lost) = read_all(&mut r);
+        assert_eq!(got, (from..=60).map(n).collect::<Vec<_>>(), "every kept line, the oldest kept generation first");
+        assert_eq!(lost.len(), 1, "{lost:?}");
+        assert!(lost[0].starts_with(&format!("sim.w5: generations 1 to {}", oldest - 1)), "{lost:?}");
+        // a writer first seen after its first generation was deleted (never opened here): its oldest kept generation, not a stall
+        let gui = writer(dir.path(), GUI, "6");
+        let mut g = gamelink::GenWriter::open(gui.clone(), "1").unwrap().with_limits(150, 3);
+        for i in 100..=160 {
+            g.append(&rec("ping", &n(i))).unwrap();
+        }
+        let kept = first_line(&gui, g.generation() - 2);
+        let (got, lost) = read_all(&mut r);
+        assert_eq!((got.first(), got.last(), lost.len()), (Some(&kept), Some(&n(160)), 1), "{lost:?}");
+        // the cheap check sees it too: a source whose generation was deleted before it opened it is news, never a stall
+        let one = dir.path().join("one.log");
+        fs::write(gamelink::generation_path(&one, 3), rec("ping", &n(7))).unwrap();
+        fs::write(gamelink::pointer_path(&one), "3\n").unwrap();
+        let mut single = CtlReader::new(one);
+        assert!(single.poll_hot().is_none(), "the hot poll reads no pointer: that is the service thread's check");
+        assert!(single.has_news());
+        let p = single.poll();
+        assert_eq!((pings(&p), p.lost.len()), (vec![n(7)], 1));
+        assert!(!single.has_news());
     }
 
     #[test]
@@ -2297,7 +2405,7 @@ mod tests {
         // a reader that follows from the first byte, polled now and then while the writer goes through generations
         let mut follower = CtlReader::new(dir.path().join(EVENTS_FILE));
         let mut got = Vec::new();
-        for n in 1..=200 {
+        for n in 1..=2000 {
             w.append(&[Event::Pong { n }]).unwrap();
             if n % 7 == 0 {
                 got.extend(follower.poll().lines);
@@ -2307,7 +2415,7 @@ mod tests {
         let pongs: Vec<String> = got.iter().filter(|l| l.kind == "pong").map(|l| l.payload.clone()).collect();
         assert_eq!(
             pongs,
-            (1..=200).map(|n| format!("{{[\"n\"]={n}}}")).collect::<Vec<_>>(),
+            (1..=2000).map(|n| format!("{{[\"n\"]={n}}}")).collect::<Vec<_>>(),
             "every event exactly once, in order, across the generations"
         );
         assert_eq!(
@@ -2317,12 +2425,12 @@ mod tests {
         );
         assert_eq!(got.iter().filter(|l| l.kind == "timing").count(), 1);
         let newest = gamelink::newest_generation(&dir.path().join(EVENTS_FILE));
-        assert!(newest > gamelink::KEEP_GENERATIONS, "it rotated ({newest})");
+        assert!(newest > EVENTS_KEEP_GENERATIONS, "it rotated ({newest})");
         let files = fs::read_dir(dir.path())
             .unwrap()
             .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "log"))
             .count();
-        assert_eq!(files as u64, gamelink::KEEP_GENERATIONS, "older generations are deleted: the log is bounded");
+        assert_eq!(files as u64, EVENTS_KEEP_GENERATIONS, "older generations are deleted: the log is bounded");
         // a reloaded mod reads the newest generation only, and finds the module's state at its top
         let mut fresh = CtlReader::new(gamelink::generation_path(&dir.path().join(EVENTS_FILE), newest));
         let lines = fresh.poll().lines;

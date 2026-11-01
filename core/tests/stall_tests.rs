@@ -329,3 +329,27 @@ fn a_guest_whose_build_is_still_arriving_in_parts_is_not_stalled_and_its_build_i
     assert_eq!((got.stamp, got.body.len()), (stamp, 1_500_000));
     assert_barrier_exact(&s.n.host_game, s.guest_id());
 }
+
+/// A joiner whose round failed stays an outsider, its own save far ahead. Its promise is of another world: a stalled game's proxy never
+/// follows it, it is never declared stalled itself, and no stamp is pushed to its date (review 2026-10-31).
+#[test]
+fn a_stalls_proxy_never_follows_an_outsiders_promise() {
+    let mut s = Session::new(HostOptions::default());
+    s.play(1.0, true, 4);
+    let joiner = s.n.connect("Joiner");
+    let far = 5_000_000;
+    s.n.send(joiner, MessageKind::Hello, &json(&HelloMessage::new(far)));
+    assert_eq!(ResyncState::Pausing, s.n.host.resync_state());
+    s.n.advance(121.0);
+    s.n.tick();
+    assert_eq!(ResyncState::Idle, s.n.host.resync_state(), "the join round failed: the joiner keeps its own world");
+    s.n.host_call(|h| h.set_speed(4));
+    let lead = s.lead();
+    s.n.send(joiner, MessageKind::Clock, &clock(far, 4, lead));
+    s.play(5.0, false, 4);
+    let stalled = &s.n.host.state().stalled;
+    assert!(stalled.contains(&s.guest_id()), "{:?}", s.n.host_log);
+    assert!(!stalled.contains(&s.n.id(joiner)), "an outsider is never waited for, so never stalled");
+    let proxy = s.guest_lines().last().and_then(|p| p.safe).unwrap();
+    assert!(proxy < far && s.n.host.future_stamp() < far, "proxy {proxy}, stamp {}", s.n.host.future_stamp());
+}

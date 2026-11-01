@@ -6,6 +6,41 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.12 (2026-11-01)
+
+### In short
+- New: after an update FeverLink3 shows what changed, once, in a small window like this one. The "What's new" button in the FeverLink3 window opens it again.
+- Bug reports now hold the logs of your whole session, so a problem from early in the evening can still be traced.
+- A build that FeverLink3 could not share now says so, instead of "the world changed before its turn".
+- Many fixes from a full review of the code: bug reports keep player names and chat private, a short connection drop no longer reloads every game, and two possible crashes are closed.
+
+### Added
+- What's new: the first time a new FeverLink3 version runs, a small window lists what changed in it (the short notes of this changelog), with a link to the full changelog. It shows once per version; the "What's new in <version>" button in the FeverLink3 window opens it again.
+
+### Fixed
+- Bug reports hold the whole session: every log of the game run, the whole id-order trace (before: only its last 8 MB) and up to 16 sync detail files. A report still stays under 24 MB, so it can be attached to a GitHub issue; only a very long session is cut, from its start.
+- The native module's log no longer fills up in a long session: each game start begins a new log and keeps the one of the run before (before, it stopped at 2 MB, after about two hours of play, and the rest of the evening was missing from bug reports). The module's event log keeps the whole session too.
+- A build that FeverLink3 could not copy exactly (for example a track pattern placed on its own) told you "the world changed before its turn. Try again"; it now says that FeverLink3 could not copy it. Nothing is built on any game in either case, so the worlds stay the same.
+- Bug reports: a name with an accented or non-Latin letter right before a digit no longer makes the report fail; player names are taken out of the zip and chat messages are no longer written to the logs; long sessions with several players now fit the zip; a report made after a crash holds the logs of the session that crashed (FeverLink3 keeps the previous run's logs in `live\previous`).
+- A possible crash when a sync or a load from the menu came while a build was still waiting for its turn: the waiting build is now dropped safely and the games repair.
+- A game could close when another player rebuilt or bulldozed a junction whose settings differed between the games. That build is now refused on that game, and the games repair.
+- When FeverLink3 cannot place the exact copy of a build on a game and that game builds its own version, the games now notice that they differ and repair, and the builder is told the copy may be incomplete (before: "built after all"). A vehicle, line or company action refused on only one game is now repaired the same way.
+- A player who reconnects after a short drop no longer makes every game reload when only vehicles or money differ. A player who was still loading when the host pressed Start is now brought into the host's world. A player joining during a sync no longer makes that sync fail, and pressing Start twice no longer pauses the session.
+- A failed sync no longer loads an old world from an earlier session, and the sync saves of earlier sessions are deleted from your savegame folder (and the game's load list) when a session starts.
+- Steam: while you host or play a session, your game no longer uploads data for other players' speed tests, and nobody can tie up your connection with repeated speed tests or extra connections.
+- The What's new window is no longer skipped for a version when it fails to open.
+- Save and quit (after an update) closes the game only once it has found a new, readable save of your world; an older save of the same name or a damaged file no longer counts. If the save did not work, the game stays open and tells you to save your world yourself.
+- A player who joins while a sync is running, or drops and comes back during it, now gets the same check of the world's mods as any other joiner (after the world was saved, they join with the next sync).
+- An action that FeverLink3 could not hand on to the session (a build, a terrain, tree or rock change, a script's build, an autosave) is no longer applied on your game alone. A game, its FeverLink3 controller or its native module that fell behind in reading the session's messages no longer stops reading or jumps past messages that are still there, and when messages it missed were already deleted it asks for a sync. The FeverLink3 controller no longer loses the game's messages it read just before a file read error.
+- In a session, a window command that FeverLink3 cannot share (for example from the debug panel, another mod's window or a game-script window) is refused with a notice instead of being applied on your game alone.
+- A build made while the game is paused is no longer cancelled, or followed by a needless sync, when another player sits in the pause menu for a while; it is applied on every game once the session goes on. A build made just before a pause is no longer cancelled after 20 seconds of pause. When one game could not make a build that the others made, that game asks for a sync, also minutes later. The same now happens when FeverLink3's native module drops one of your builds on its own (also when it never got the order to build it), or gives it back early because it stopped working (before, the worlds stayed different until the next check). A build you make just before opening the pause menu, or while your game freezes for a moment, is no longer cancelled on your game alone when you come back after the others already have it: it is built at its time once your game catches up.
+- Placing a station or depot where town buildings have to be moved no longer fails on every game with your tool told the build failed: every game builds it as your own tool made it.
+- On a game whose simulation runs its scripts in several parts (for example without FeverLink3's game patches), actions and sync checks are no longer applied a step late, which caused needless repairs.
+- Sync checks now notice when the same roads, buildings or houses carry swapped ids on one game, and when a bridge height, a curve or a building's rotation differs; such a world is repaired by the usual sync.
+- Safety: a damaged build from another player is refused before your game copies it, instead of possibly crashing the game.
+- The session folder no longer fills up in a long session: the native module keeps only its newest diagnostic files, and each build's text files are deleted once the build is applied (a refused build's text is kept among the newest diagnostic files) (one evening left about 285 MB).
+- Money is no longer corrected behind your back: the host used to book a difference in balance or loan on the other games. Now a money difference that shows in two checks in a row is repaired by a sync, like any other difference between the worlds, and differences of less than one unit of money no longer count.
+
 ## 0.2.11 (2026-10-30)
 
 ### In short
@@ -33,7 +68,7 @@ Fixes for problems found while playing between two PCs, and the start of compani
 
 ### Known issues
 - Bulldozing two pieces of the same road within a second of each other once made the game report an error on both PCs and sync everyone (seen once in 0.2.9 between two PCs); nothing was lost. Not reproduced in the lab yet.
-- In our tests since 2026-10-28 the game crashed when the lab picked the tree brush in the landscaping menu; 0.2.9 crashes the same way, so it is not caused by this version (the cause is not known; two mod.io mods updated that day). Tell us if it happens to you.
+- In our tests since 2026-10-28 the game crashed when the tree brush was picked in the landscaping menu; 0.2.9 crashes the same way, so it is not caused by this version (the cause is not known; two mod.io mods updated that day). Tell us if it happens to you.
 
 ## 0.2.9 (2026-10-27)
 

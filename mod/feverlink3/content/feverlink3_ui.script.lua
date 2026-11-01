@@ -31,6 +31,13 @@ if not okK or type(Hook) ~= "table" then
 	Hook = nil
 end
 
+-- The in-game "What's new" of this version (owner, 2026-10-30): made from the version's section of docs/CHANGELOG.md when the
+-- release package is built (tools/release/src/whatsnew.rs: { version, url, groups = { { title, items } } }). A build without it
+-- (a developer's install of the working tree) shows nothing.
+local okW, WN = pcall(ug_require, "feverlink3_whatsnew.lua")
+if not okW then okW, WN = pcall(ug_require, "feverlink3::/feverlink3_whatsnew.lua") end
+if not okW or type(WN) ~= "table" or type(WN.version) ~= "string" or type(WN.groups) ~= "table" then WN = nil end
+
 local log = C.logger("ui")
 local M = {}
 -- rev counts changes of ctl or model; every recipe re-renders when it differs from what it drew
@@ -38,6 +45,38 @@ local U = { model = nil, outbox = nil, ctl = nil, cmd = nil, rev = 0 }
 
 local CTL_STATUS = "ctl_status.txt"
 local CTL_CMD = "ctl_cmd.log"
+
+-- The version whose notes this player has seen, in %LOCALAPPDATA%\FeverLink3 next to the live folder: the controller clears the
+-- live folder at every start, this file stays. Without a folder or file access the notes show once a game run.
+local function whatsNewPath()
+	local parent = C.DIR and C.DIR:match("^(.*[\\/])[^\\/]+[\\/]?$")
+	return parent and (parent .. "whats_new_seen.txt") or nil
+end
+
+-- True while this version's notes have not been shown yet. The version is written down only once the window was really added
+-- (whatsNewShown): written before, a failed open lost the notes for this version for good (review 2026-10-31).
+local function whatsNewDue()
+	if not WN or U.whatsNewDone then return false end
+	local p = whatsNewPath()
+	if not (p and C.IO) then return true end
+	local seen = (C.readFile(p) or ""):match("^%s*(%S+)")
+	if seen == WN.version then U.whatsNewDone = true; return false end
+	return true
+end
+
+-- The automatic open's outcome: shown = the notes are seen (the version written down); a failure is tried again on the next tick, at
+-- most WHATS_NEW_TRIES times a game run, so a window the game keeps refusing does not fill the log (the next game run tries again).
+local WHATS_NEW_TRIES = 3
+local function whatsNewShown(shown)
+	if not shown then
+		U.whatsNewTries = (U.whatsNewTries or 0) + 1
+		if U.whatsNewTries >= WHATS_NEW_TRIES then U.whatsNewDone = true end
+		return
+	end
+	U.whatsNewDone = true
+	local p = whatsNewPath()
+	if p and C.IO then C.writeFile(p, WN.version .. "\n") end
+end
 
 local function poll()
 	local seen = U.model and U.model.version or nil
@@ -476,6 +515,42 @@ local function setup(react, builtin, X)
 		return box(V, { fixedColumn(POP_W, rows) })
 	end)
 
+	-- ---- "What's new in <version>": the notes of the version this game runs (WN), a window of its own with Close
+	local WhatsNew = react.RegisterWrapperRecipe("FeverLink3WhatsNew", builtin.Window, function(wp)
+		wrapChars = WINDOW_CHARS
+		local rows = {}
+		for _, g in ipairs(WN.groups) do
+			if type(g.title) == "string" and g.title ~= "" then rows[#rows + 1] = text(g.title, nil, nil, "font-scale-title-3") end
+			for _, item in ipairs(type(g.items) == "table" and g.items or {}) do rows[#rows + 1] = text("- " .. tostring(item)) end
+			rows[#rows + 1] = gap()
+		end
+		-- the address on a line of its own and never wrapped: its 55 characters are one word over WINDOW_CHARS, so wrapLines cut
+		-- it mid-word (lab 2026-10-31, "CHANGELOG.htm" / "l"); the window holds 62 a line, so one TextView shows it whole
+		rows[#rows + 1] = text("Everything that changed:")
+		rows[#rows + 1] = builtin.TextView{ meta = { class = "font-scale-title-4" }, text = tostring(WN.url) }
+		rows[#rows + 1] = gap()
+		rows[#rows + 1] = button("Close", function() wp.onClose() end, "primary")
+		return builtin.Window{
+			title = "What's new in FeverLink3 " .. WN.version,
+			id = "window.feverlink3.whatsnew",
+			initialX = 0.36,
+			initialY = 0.18,
+			movable = true,
+			closable = true,
+			onClose = wp.onClose,
+			content = fixedColumn(WIDTH, rows),
+		}
+	end)
+	local function openWhatsNew()
+		local api = windowApi()
+		if not (WN and api) then return end
+		local okO, err = pcall(function()
+			api.addSingletonWindow(WhatsNew, { onClose = function() api.removeAllWindows(WhatsNew) end })
+		end)
+		if okO then log("what's new " .. WN.version .. " shown") else log("cannot open What's new: " .. tostring(err)) end
+		return okO
+	end
+
 	-- ---- the window
 	local Window = react.RegisterWrapperRecipe("FeverLink3Window", builtin.Window, function(wp)
 		useLive(true)
@@ -817,6 +892,11 @@ local function setup(react, builtin, X)
 				button("Not now", function() command("dismiss_invite", {}) end),
 			}))
 		end
+		-- the notes of this version, again (they open by themselves once after an update)
+		if WN then
+			add(gap())
+			add(button("What's new in " .. WN.version, openWhatsNew))
+		end
 		-- developer test button (FEVERLINK3_DEV=1 only): runs dev_click.lua from inside a click, where commands may be sent.
 		-- The first row, so that its place in the window does not depend on what the window shows.
 		if Hook and Hook.dev then
@@ -897,11 +977,20 @@ local function setup(react, builtin, X)
 					if key ~= tick:old() then tick:set(key) end
 					-- a sync round beginning, a new join request (host) or a Steam invite (friend) opens the window
 					local syncing = ctl ~= nil and ctl.sync ~= nil
-					if syncing and not U.syncShown then pcall(openWindow) end
+					if syncing and not U.syncShown then
+						pcall(openWindow)
+						-- this game may reload in this round: the hook's counts are written before the load takes them (Hook.tallyOut)
+						if Hook and Hook.tallyOut then pcall(Hook.tallyOut, "a sync round began") end
+					end
 					U.syncShown = syncing
 					local asks = Hud.askCount(ctl)
 					if asks > (U.asksShown or 0) then pcall(openWindow) end
 					U.asksShown = asks
+					-- the first time this version runs (a new player too): its notes, a few seconds into the loaded world
+					if WN and not U.whatsNewDone and U.firstSeen and C.clock() - U.firstSeen > 5 and whatsNewDue() then
+						local okW, shown = pcall(openWhatsNew)
+						whatsNewShown(okW and shown == true)
+					end
 				end, 0.5)
 			end)
 		end

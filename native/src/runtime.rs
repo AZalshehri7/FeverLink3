@@ -110,6 +110,8 @@ pub struct Runtime {
     rebuild: OnceLock<portable::Sink>,
     /// The input-level text of every held build command, for the mod (`input.rs`).
     input: crate::input::InputOut,
+    /// The diagnostic side files of injections, each kind kept to its newest few (review 2026-10-31).
+    side_files: crate::sidefile::Bounded,
     /// `FEVERLINK3_NATIVE_INJECT`: the originator's full portable text of every held command (`native_text_<id>.txt`), and the receiver's order.
     text: crate::input::InputOut,
     /// The originator's refusal of a held command's text before it is shipped (`native_refused_<id>.txt`, the reason): every receiver
@@ -148,6 +150,11 @@ pub struct Runtime {
     /// Those computed arguments compared with a real tool preview of the same interface: OWNER_UNCHECKED, OWNER_EQUAL, or
     /// OWNER_DIFFERENT (then they are not used until the next interface).
     preview_owner_check: AtomicU8,
+    /// The world held commands belong to: counts the game interfaces made (`new_world`). A held command of an earlier one leaves the
+    /// machine without the engine (`drop_old_world`).
+    world: AtomicU64,
+    /// A release into another command list than the Add's that triggered it was logged (`take_due_here`, once per run).
+    list_differs_said: AtomicBool,
     /// What went wrong in a way that may let this game differ from the others (`failsafe.rs`), until the service thread writes it.
     faults: crate::failsafe::Faults,
     /// Service-thread rounds in a row that panicked.
@@ -243,6 +250,7 @@ impl Runtime {
             native_copy: OnceLock::new(),
             patch: Default::default(),
             input: crate::input::InputOut::default(),
+            side_files: crate::sidefile::Bounded::default(),
             text: crate::input::InputOut::with_prefix("native_text_"),
             refused_text: crate::input::InputOut::with_prefix("native_refused_"),
             inject: Default::default(),
@@ -257,6 +265,8 @@ impl Runtime {
             preview_holding: AtomicBool::new(false),
             preview_owner: Mutex::new(None),
             preview_owner_check: AtomicU8::new(OWNER_UNCHECKED),
+            world: AtomicU64::new(0),
+            list_differs_said: AtomicBool::new(false),
             faults: crate::failsafe::Faults::new(),
             pump_panics: AtomicU64::new(0),
         }
@@ -590,6 +600,7 @@ impl Runtime {
     /// Called by the hook where a new game interface makes its builder-preview listener: `captures` points at the lambda's three
     /// captures (guarded reads; nothing of the game is called).
     pub fn note_preview_owner(&self, captures: usize) {
+        self.new_world();
         let read = |i: usize| crate::memguard::word(captures.wrapping_add(8 * i));
         let (Some(ui), Some(y), Some(z)) = (read(0), read(1), read(2)) else {
             self.say("preview: a game interface was made, but its builder-preview listener's captures could not be read: a held command before its first tool preview gets no preview of its own");
@@ -600,6 +611,85 @@ impl Runtime {
         self.say(&format!(
             "preview: game interface {ui:#x} made (its builder-preview listener noted): a held command gets its own preview from it also before the first tool preview of this world"
         ));
+    }
+
+    /// A new game interface is being made (`UI::CGameUI::CGameUI`, once per loaded world: a resync load, a load from the menu): what was
+    /// taken from the last one is of a world that is gone (review 2026-10-31). The held commands keep that world's list and
+    /// tool callbacks: they leave the machine at its next lock without the engine (`drop_old_world`); the cached preview arguments and
+    /// the last interface's listener captures point into its objects: dropped now. The boundary is this constructor, not
+    /// `CGame::StartGameSim`: its hook is part of holding (planned with the emitter's, `plan::plan_preview_owner`) while StartGameSim's
+    /// is only there with the interface player (`FEVERLINK3_INTERFACE_PLAYER`), and the tools whose callbacks a held command keeps
+    /// belong to the interface it makes; no tool of the new world can send a command before it. Nothing of the game is called.
+    pub fn new_world(&self) {
+        let world = self.world.fetch_add(1, AcqRel) + 1;
+        *lock(&self.preview_args) = None;
+        *lock(&self.preview_owner) = None;
+        self.preview_owner_check.store(OWNER_UNCHECKED, Relaxed);
+        self.say(&format!(
+            "hold: world {world} begins (a new game interface): held commands of earlier ones are given up"
+        ));
+    }
+
+    /// Takes every held command of an earlier world ([`Runtime::new_world`]) out of the machine without the engine: never released into
+    /// that world's command list, never failed or completed through its tools' callbacks (a use after free); only this module's copy is
+    /// freed ([`engine::abandon`]). A repair fault names those that were still to be released: only that release would have applied
+    /// their builds on this game. The others (failed, cancelled, deferred, completed, or already given back by holding off) get a log
+    /// line only: their builds were not going to be applied through them anyway, and after a resync load (the session ended them with
+    /// fail or hold_off before the load, review 2026-10-31) a fault would only send replay_failed and could start a second resync.
+    /// Calls nothing of the game.
+    fn drop_old_world(&self, machine: &mut HoldMachine<Box<Held>>) {
+        let world = self.world.load(Acquire);
+        let old = machine.take_out(|held| held.world() != world);
+        if old.is_empty() {
+            return;
+        }
+        let (mut lost, mut ended) = (Vec::new(), Vec::new());
+        for (id, to_release, held) in old {
+            engine::abandon(held);
+            if to_release {
+                lost.push(id)
+            } else {
+                ended.push(id)
+            }
+        }
+        if !ended.is_empty() {
+            self.say(&format!(
+                "hold: {} held command(s) of an earlier world that were not to be released given up without the engine (ids {ended:?})",
+                ended.len()
+            ));
+        }
+        if !lost.is_empty() {
+            self.fault(
+                "hold (world change)",
+                crate::failsafe::Action::Repair,
+                format!(
+                    "{} held command(s) of an earlier world still to be released given up without the engine (ids {lost:?}): their builds are not applied on this game",
+                    lost.len()
+                ),
+            );
+        }
+    }
+
+    /// What leaves the machine at the `Add` on `list` ([`HoldMachine::take_due`]), after the held commands of an earlier world left
+    /// without the engine ([`Runtime::drop_old_world`]): the world boundary is the rule. A release whose own list is not this `Add`'s
+    /// is only said, once per run, and still added to its own list: that every Add of one world, the mod's nop trigger among them, uses
+    /// the same command list is not yet seen in the real game (review 2026-10-31), and refusing on it would lose every release such a
+    /// command triggers. Calls nothing of the game.
+    fn take_due_here(&self, machine: &mut HoldMachine<Box<Held>>, list: *mut u8, now: u64) -> Vec<Action<Box<Held>>> {
+        self.drop_old_world(machine);
+        let due = machine.take_due(self.game_time(), now);
+        let other = due.iter().find_map(|action| match action {
+            Action::Release { id, handle, .. } if handle.list() != list => Some((*id, handle.list())),
+            _ => None,
+        });
+        if let Some((id, held_list)) = other {
+            if !self.list_differs_said.swap(true, Relaxed) {
+                self.say(&format!(
+                    "hold: held command {id} is released into its own command list {held_list:p} at an Add on list {list:p} (said once)"
+                ));
+            }
+        }
+        due
     }
 
     /// The emitter's first five arguments as the newest game interface's listener computes them (`build_table::PreviewOwnerSite`).
@@ -934,6 +1024,16 @@ impl Runtime {
         if let Some(e) = poll.error {
             machine.error("ctl", e, now);
         }
+        if !poll.lost.is_empty() {
+            // Lines of a control file were deleted before this module read them: orders of the mod (a peer's build to inject, a
+            // held command's release, ...) this game never carried out while the others did, a certain loss. A repair fault: the
+            // mod asks the host for the repair, as it does when its own reader loses lines of to_game.log (review 2026-10-31).
+            self.fault(
+                "control link",
+                crate::failsafe::Action::Repair,
+                format!("control lines were lost: {}", poll.lost.join("; ")),
+            );
+        }
         if poll.gone {
             self.terrain_share(false);
             // the session folder was cleaned (the session is over): the interface acts as the savegame's player again
@@ -997,10 +1097,7 @@ impl Runtime {
         // arms the orders it finds there), and giving up here meant the mod's own command could pass while its order sat in the file.
         let mut guard = lock(&self.reader);
         let Some(reader) = guard.as_mut() else { return };
-        if !reader.has_news() {
-            return;
-        }
-        let mut poll = reader.poll();
+        let Some(mut poll) = reader.poll_hot() else { return };
         self.arm_orders(&mut poll, now);
         drop(guard);
         lock(&self.ctl_backlog).push(poll);
@@ -1015,6 +1112,8 @@ impl Runtime {
         let mut events = {
             let mut machine = lock(&self.machine);
             self.ingest(&mut machine, now);
+            // a world change: what is held of the last world leaves now, before its age or a silence could make it due
+            self.drop_old_world(&mut machine);
             // an order of a deferred command that no command will use: the command fails now (tool callback fired), not after 30 s
             for held in self.inject.take_failed(now) {
                 self.say(&format!(
@@ -1033,6 +1132,7 @@ impl Runtime {
         self.terrain_expire(now);
         self.assets_expire(now);
         events.extend(self.inject.drain_events(now));
+        self.inject_drop_inputs(&events);
         for id in self.watch.expire(now) {
             events.push(Event::Error {
                 place: "applied".into(),
@@ -1304,7 +1404,7 @@ impl Runtime {
         };
         // the mod writes `release` and then sends a command to get here: look at the file now, do not wait for the pump
         self.ingest(&mut machine, now);
-        plan.due = machine.take_due(self.game_time(), now);
+        plan.due = self.take_due_here(&mut machine, args.list, now);
         let own = script_any && self.own_send.take(now);
         let script = script_build && !own;
 
@@ -1326,8 +1426,9 @@ impl Runtime {
                     plan.passed = Some("the hold ring is full");
                 }
                 if admit == Admit::Off && tool.is_some() {
-                    machine.tool_while_silent(kind, now); // a tool at work while the mod is silent: not a pause menu
-                    plan.due.extend(machine.take_due(self.game_time(), now)); // given back before this command passes
+                    // a tool at work while the mod is silent: not a pause menu; what is held goes back before this command passes
+                    machine.tool_while_silent(kind, now);
+                    plan.due.extend(self.take_due_here(&mut machine, args.list, now));
                 }
                 // SAFETY: only readable memory is read; the capture takes the same payload pointer along.
                 if let (Admit::Hold, Some(payload)) = (admit, unsafe { engine::payload_of(args.cmd) }) {
@@ -1385,7 +1486,8 @@ impl Runtime {
         // SAFETY: as the caller guarantees.
         let held = unsafe { engine::capture(&engine, args) };
         let mut held_id = None;
-        if let Some(held) = held {
+        if let Some(mut held) = held {
+            held.set_world(self.world.load(Acquire)); // a field write: nothing between the capture and the hold can fail
             let (done, payload) = (held.done_ok(), held.payload());
             match machine.hold_with(kind, rva, done, flags, held, plan.now) {
                 Ok(id) => {
@@ -2126,6 +2228,46 @@ mod tests {
         assert!(kinds(dir.path()).contains(&"dropped".to_string()));
     }
 
+    /// Review 2026-10-31: a held command outlived its world (a resync load, a load from the menu) and the next Add released it
+    /// into the dead command list or failed it through the destroyed tool's callback. A new game interface gives up what is held without
+    /// the engine; only the one still to be released is a fault (the failed one's build was not going to be applied through it).
+    #[test]
+    fn held_commands_of_an_earlier_world_leave_without_the_engine() {
+        let dir = TempDir::new("rt-world");
+        let rt = runtime(Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let (mut a, mut b) = (Call::new(52, 10), Call::new(52, 11));
+        unsafe { rt.on_add(a.args(), at(SITE_A)) };
+        unsafe { rt.on_add(b.args(), at(SITE_A)) };
+        // the mod's verdicts were written before the load: one release, one fail
+        ctl(dir.path(), "release\t1\t{[\"at\"]=0,[\"id\"]=1}\nfail\t1\t{[\"id\"]=2}\n");
+        rt.note_preview_args([1, 2, 3, 4, 5]); // a tool preview of the old world, kept while holding is on
+        assert!(rt.preview_args.lock().unwrap().is_some());
+        let captures = [0u64; 3]; // the next world's game interface makes its listener
+        rt.note_preview_owner(captures.as_ptr() as usize);
+        let mut nop = Call::new(27, 50);
+        unsafe { rt.on_add(nop.args(), at(0x999)) };
+        assert_eq!(
+            calls(),
+            ["add kind 27 tag 50"],
+            "neither added nor destroyed nor its callback fired: only the new command"
+        );
+        rt.pump();
+        assert_eq!(faults(dir.path()), ["hold (world change) repair"], "one fault, for the release only");
+        assert!(rt.preview_args.lock().unwrap().is_none(), "the old world's preview arguments are dropped");
+
+        // the new world holds and releases as before (each test call has its own list: a release goes into the one it was taken from)
+        let mut c = Call::new(52, 12);
+        unsafe { rt.on_add(c.args(), at(SITE_A)) };
+        ctl(dir.path(), "release\t1\t{[\"at\"]=0,[\"id\"]=3}\n");
+        let mut next = Call::new(27, 51);
+        unsafe { rt.on_add(next.args(), at(0x999)) };
+        assert_eq!(calls(), ["add kind 52 tag 12", "destroy command true", "add kind 27 tag 51"]);
+        rt.pump();
+        assert_eq!(faults(dir.path()), ["hold (world change) repair"]);
+    }
+
     #[test]
     fn the_control_file_disappearing_fails_what_the_mod_never_decided_on() {
         let dir = TempDir::new("rt-gone");
@@ -2138,6 +2280,21 @@ mod tests {
         let mut nop = Call::new(27, 50);
         unsafe { rt.on_add(nop.args(), at(0x999)) };
         assert_eq!(calls(), ["destroy command true", "add kind 27 tag 50"], "never added");
+    }
+
+    #[test]
+    fn control_lines_deleted_before_they_were_read_are_a_repair_fault() {
+        let dir = TempDir::new("rt-lost");
+        let rt = runtime(Some(dir.path()));
+        ctl(dir.path(), "hold_off\t1\t{}\n");
+        rt.pump();
+        // the writer went on past every kept generation before the module read on: generation 1 is gone, 3 the oldest left
+        let base = ctl_path(dir.path());
+        std::fs::remove_file(&base).unwrap();
+        std::fs::write(feverlink3_launcher::gamelink::generation_path(&base, 3), "hold_off\t1\t{}\n").unwrap();
+        std::fs::write(feverlink3_launcher::gamelink::pointer_path(&base), "3\n").unwrap();
+        rt.pump();
+        assert_eq!(faults(dir.path()), ["control link repair"], "lost orders ask for the repair");
     }
 
     #[test]

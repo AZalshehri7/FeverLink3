@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use super::{Controller, State};
 use crate::guard;
-use crate::report::{self, redact::Redactor, BundleInfo, BundlePlayer, Sources};
+use crate::report::{self, redact, redact::Redactor, BundleInfo, BundlePlayer, Sources};
 use crate::session::{Command, ReportEvent, SessionHandle};
 
 /// How long a player who asked waits for the host's bundle before it makes a report of its own logs instead: the host waits
@@ -307,7 +307,6 @@ impl Controller {
     fn local_report(&mut self, note: &str, why: Option<&str>) {
         let report = local_report_id();
         let job = self.part_job(&report, &format!("{report}-salt-{}", rand::random::<u64>()));
-        let name = self.default_name.clone();
         let note = note.to_owned();
         let missing = why.map(str::to_owned);
         let dirs = self.reporter.save_dirs();
@@ -319,18 +318,25 @@ impl Controller {
                 Ok(p) => p,
                 Err(e) => return Done::Failed(format!("the logs could not be packed: {e}")),
             };
+            // the bundle's report.txt names no player (it is not redacted): this game, the others (review 2026-10-31)
             let mut players =
-                vec![BundlePlayer { slot: 1, name: name.clone(), host: false, part: Some(part), missing: None }];
+                vec![BundlePlayer { slot: 1, who: "this game".into(), host: false, part: Some(part), missing: None }];
             if let Some(why) = missing {
                 players.push(BundlePlayer {
                     slot: 2,
-                    name: "the other players".into(),
+                    who: "the other players".into(),
                     host: false,
                     part: None,
                     missing: Some(why),
                 });
             }
-            let info = BundleInfo { report: report.clone(), created_unix: now_unix(), asked_by: name, note, players };
+            let info = BundleInfo {
+                report: report.clone(),
+                created_unix: now_unix(),
+                asked_by: "this game".into(),
+                note,
+                players,
+            };
             save_for_player(&info, &dirs)
         });
     }
@@ -339,10 +345,26 @@ impl Controller {
     fn part_job(&self, report: &str, salt: &str) -> PartJob {
         let user_dirs = self.user_dirs();
         let own_steam_id = self.steam.as_ref().and_then(|p| p.report().steam_id);
+        // the session's player names are masked as %PLAYER<id>% (the same id in every game's part), and in every state every
+        // name this run has seen (players who left, ended or failed sessions, invites and join requests): the red icon's and
+        // the start screen's reports come after the session. This game's own name is %PLAYER% when no roster had it. The
+        // names are often Steam or real names (review 2026-10-31).
+        let roster = match &self.state {
+            State::Hosting(h) => h.handle.status().roster,
+            State::Joined { handle } => handle.status().roster,
+            _ => Vec::new(),
+        };
+        let mut players: Vec<(String, String)> =
+            roster.into_iter().map(|e| (e.name, redact::player_mask(e.id))).collect();
+        players.extend(self.seen.iter().map(|(id, name)| {
+            (name.clone(), id.map_or_else(|| redact::REQUESTER_MASK.to_owned(), redact::player_mask))
+        }));
+        players.push((self.default_name.clone(), redact::PLAYER_MASK.to_owned()));
+        players.extend(previous_players(&self.dir));
         PartJob {
             sources: Sources { live_dir: self.dir.clone(), user_dirs: user_dirs.clone() },
             info: self.report_info(report),
-            redactor: Redactor::new(report::user_names(), salt, report::accounts_of(&user_dirs)),
+            redactor: Redactor::new(report::user_names(), salt, report::accounts_of(&user_dirs)).with_players(&players),
             own_steam_id,
         }
     }
@@ -422,9 +444,10 @@ impl Controller {
             .parts
             .into_iter()
             .enumerate()
+            // `player #<id>`, the id the parts' %PLAYER<id>% have: the bundle's report.txt is not redacted (review 2026-10-31)
             .map(|(i, p)| BundlePlayer {
                 slot: i + 1,
-                name: p.name,
+                who: format!("player #{}", p.player),
                 host: p.player == HostSession::HOST_ID,
                 part: p.bytes,
                 missing: p.missing,
@@ -433,7 +456,7 @@ impl Controller {
         let info = BundleInfo {
             report: ask.report.clone(),
             created_unix: now_unix(),
-            asked_by: ask.by_name.clone(),
+            asked_by: format!("player #{}", ask.by),
             note: collected.note,
             players,
         };
@@ -583,6 +606,33 @@ fn session_lines(handle: &SessionHandle, transport: &str) -> Vec<String> {
         last(" differs in ").unwrap_or_else(|| "none in the last 500 lines".into())
     ));
     lines
+}
+
+/// The players of the run before this one, from the status it left in `previous\` (every name that run saw, and its last
+/// roster), as `(name, %PREVPLAYER<id>%)`: a report after a crash holds that run's logs, and its players are in no roster now.
+/// Their own label, as ids restart with every session.
+fn previous_players(live_dir: &std::path::Path) -> Vec<(String, String)> {
+    let path = live_dir.join(report::PREVIOUS_DIR).join(super::STATUS_FILE);
+    let Some(status) = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| crate::luatext::lua_to_json(text.trim()))
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return Vec::new();
+    };
+    let lists =
+        ["seenPlayers", "players"].map(|k| status.get(k).and_then(Value::as_array).cloned().unwrap_or_default());
+    let mut names: Vec<(String, String)> = lists
+        .iter()
+        .flatten()
+        .filter_map(|p| {
+            let id = p.get("id").and_then(Value::as_u64).and_then(|id| u16::try_from(id).ok());
+            let mask = id.map_or_else(|| redact::REQUESTER_MASK.to_owned(), redact::previous_player_mask);
+            Some((p.get("name")?.as_str()?.to_owned(), mask))
+        })
+        .collect();
+    names.extend(status.get("name").and_then(Value::as_str).map(|n| (n.to_owned(), redact::PLAYER_MASK.to_owned())));
+    names
 }
 
 /// The newest `.sav` in the save folders and when it was written: the world most likely loaded (the game does not tell the

@@ -389,6 +389,13 @@ class IdentityTest(unittest.TestCase):
         self.write("id=1\nname=Old\nrole=player\n")
         self.assertTrue(self.poll(), "an identity without a session line (an older writer) still starts one")
         self.assertEqual((self.C.SESSION, self.C.SESSION_START, self.C.GEN), ("", None, 3))
+        # review 2026-10-31: a `role=` inside the player's name is the name, never the role, also while the real role line is unwritten
+        self.write("session=dd\nstart=2:42\nid=4\nname=Pat role=idle\nrole=pla")
+        self.assertTrue(self.poll(), "an incomplete file changes nothing, whatever the name holds")
+        self.assertEqual((self.C.ROLE, self.C.SESSION), ("player", ""))
+        self.write("session=dd\nstart=2:42\nid=4\nname=Pat role=idle\r\nrole=player\r\n")
+        self.assertTrue(self.poll())
+        self.assertEqual((self.C.ROLE, self.C.SESSION, self.C.PLAYER_NAME, self.C.PLAYER_ID, self.C.GEN), ("player", "dd", "Pat role=idle", 4, 4))
 
 
 if __name__ == "__main__":

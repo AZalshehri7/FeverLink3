@@ -123,7 +123,8 @@ impl RefundFns {
 }
 
 /// The side file of an inject order with refund entries (`native_refund_<key>.txt`, written by the mod before the order): one line
-/// per entry, `entity<TAB>key<TAB>rev0<TAB>rev1<TAB>rev2<TAB>value`, this game's own entity ids.
+/// per entry, `entity<TAB>key<TAB>rev0<TAB>rev1<TAB>rev2<TAB>value`, this game's own entity ids. Deleted once the order is answered,
+/// refused or not (`Runtime::inject_drop_inputs`).
 pub fn file_name(key: u64) -> String {
     format!("native_refund_{key}.txt")
 }

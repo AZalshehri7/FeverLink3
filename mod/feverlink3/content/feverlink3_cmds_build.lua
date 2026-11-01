@@ -3658,8 +3658,12 @@ local function portableReplay(rec, text, R, f, tkey)
 	return args
 end
 
--- The components that make an entity of each kind the text names (Portable.oldRefs).
-local REF_COMPS = { node = { "BASE_NODE" }, edge = { "BASE_EDGE" }, edgeObject = { "EDGE_OBJECT" }, construction = { "CONSTRUCTION" } }
+-- The components that make an entity of each kind the text names (Portable.oldRefs). A node configuration the text removes must be
+-- there: the same rule guardProposal applies to the record path's removals (Engine.h:323, BaseNodeConfig, the sweep crash 2026-10-13).
+-- The inject path cannot drop the entry (the text is the originator's exact build), so a game without it refuses the build from its own
+-- world and the host compares the verdicts (review 2026-10-31: nodeConfigs can differ between games until the resync repairs them).
+local REF_COMPS = { node = { "BASE_NODE" }, nodeConfig = { "BASE_NODE_CONFIG" }, edge = { "BASE_EDGE" }, edgeObject = { "EDGE_OBJECT" },
+	construction = { "CONSTRUCTION" } }
 local REF_POS_TOL = 0.25   -- metres: a named entity must be where the originator's print says (two node ends of a station piece lie 2 m apart)
 
 -- Before the native module injects the engine's Proposal built from the originator's text: every existing entity the text names must be,
@@ -3674,7 +3678,7 @@ local REF_POS_TOL = 0.25   -- metres: a named entity must be where the originato
 
 -- where entity `id` of `kind` is in this world: a flat list of numbers (nil when it cannot be read)
 local function refPrint(kind, id)
-	if kind == "node" then
+	if kind == "node" or kind == "nodeConfig" then   -- a node configuration is printed by its node's position
 		local p = A.nodePos(id)
 		return p and { p.x, p.y, p.z } or nil
 	elseif kind == "edge" or kind == "edgeObject" then
@@ -3737,7 +3741,7 @@ function M.checkInjectRefs(text, prints)
 		-- as node1; the host's engine built it, its own self-check refused it and the friend's game refused it, both worlds with node 89384 at
 		-- the same place, the printed one). Only a record without prints (an older version) is checked by the text's positions, the one place
 		-- evidence it has; it may then refuse such a build (fail closed).
-		if r.kind == "node" and r.pos and type(prints) ~= "table" then
+		if (r.kind == "node" or r.kind == "nodeConfig") and r.pos and type(prints) ~= "table" then
 			local q = A.nodePos(r.id)
 			if q then
 				local d = sqrt((q.x - r.pos.x) ^ 2 + (q.y - r.pos.y) ^ 2 + (q.z - r.pos.z) ^ 2)

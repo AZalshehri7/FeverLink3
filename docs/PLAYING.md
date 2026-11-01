@@ -126,10 +126,10 @@ Companies are saved with the world; a player is known by the name they play unde
 
 Press **Report a problem**: it is in the pop-up of the bar icon while the icon is red, at the bottom of the window's **Players** tab during a session, and under **Troubleshooting** on the start screen. If someone else's report is still being made, the window says so: that report reaches the player who asked for it. Type a line about what you were doing, if you like. In a session the host collects the logs of every player (up to a minute; the other players see a notice that their logs were sent to the host) and you get one zip, `FeverLink3-report-<date>-<id>.zip`, on your Desktop (or in `Documents\FeverLink3\reports`). Its folder opens, and so does a GitHub page with the bug report form filled in: drag the zip onto it and say what happened. Nothing is sent anywhere by itself. What the zip holds and what is taken out of it: [Privacy](site/privacy.html). This was used over Steam with a friend.
 
-If the button does not work, send the maintainer these files instead (they hold no personal data besides your Windows user name and folder names):
+If the button does not work, send the maintainer these files instead (they hold no personal data besides your Windows user name, folder names and the players' names; nothing is taken out of them):
 
 - `%LOCALAPPDATA%\FeverLink3\native.log`
-- `%LOCALAPPDATA%\FeverLink3\live\mod.log` and `ctl_status.txt`
+- `%LOCALAPPDATA%\FeverLink3\live\mod.log` and `ctl_status.txt`; after the game crashed and was started again, the crashed session's are in `live\previous`
 - the game's own log, in Steam's folder: `userdata\<number>\3493540\local\crash_dump\stdout.txt`
 
 Paste `%LOCALAPPDATA%\FeverLink3` into the Explorer address bar to open the folder.

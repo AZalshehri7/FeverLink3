@@ -113,6 +113,46 @@ fn three_orders_of_one_step_are_each_used_by_their_own_command_in_any_order_and_
     inject::TEST_FNS.with(|f| f.set(None));
 }
 
+/// The mod writes `native_inject_<key>.txt` (and `native_refund_<key>.txt`) for every order: once the order is answered (taken and
+/// carried out or refused, or refused without a command) both leave the session folder, the text of one refused after a command
+/// took it under the bounded diagnostic name; an order still waiting keeps its own.
+#[test]
+fn an_answered_orders_input_files_are_deleted_and_a_waiting_orders_stay() {
+    let dir = TempDir::new("rt-queue-inputs");
+    let rt = runtime(Some(dir.path()));
+    rt.enable_native_inject(settings());
+    stand_ins();
+    let text = |key| dir.path().join(crate::inject::inject_file_name(key));
+    let refund = |key| dir.path().join(crate::refund::file_name(key));
+    for (key, x) in [(5u64, 100f32), (6, 200.0), (7, 300.0)] {
+        std::fs::write(text(key), road_text(x)).unwrap();
+    }
+    std::fs::write(refund(5), "50215\t-1\t3\t11\t0\t3143\n").unwrap();
+    ctl(
+        dir.path(),
+        "inject_next\t1\t{[\"key\"]=5,[\"refund\"]=1}\ninject_next\t1\t{[\"key\"]=6}\ninject_next\t1\t{[\"key\"]=7}\n",
+    );
+    rt.pump();
+    assert_eq!(rt.inject.waiting_count(), 3);
+    assert!(text(5).exists() && refund(5).exists(), "a waiting order's files stay: its command reads them");
+    // 5 is taken by its own command (and refused: this test's layout is not the game's); 6's send ends without a command of it
+    let (mut a, _na) = road(100.0);
+    apply(&rt, &mut a);
+    ctl(dir.path(), "send_done\t1\t{[\"key\"]=6}\n");
+    rt.pump();
+    assert_eq!(refusals(dir.path()).iter().map(|(k, _)| *k).collect::<Vec<_>>(), [5, 6]);
+    assert!(!text(5).exists() && !refund(5).exists() && !text(6).exists(), "the answered orders' files are gone");
+    let kept = |key| dir.path().join(crate::inject::refused_text_file_name(key));
+    assert_eq!(
+        std::fs::read_to_string(kept(5)).unwrap(),
+        road_text(100.0),
+        "the text of 5, refused after its command took it"
+    );
+    assert!(!kept(6).exists(), "6 was refused without a command: nothing to diagnose in its text");
+    assert!(text(7).exists() && rt.inject.waiting_count() == 1, "the order still waiting keeps its text");
+    inject::TEST_FNS.with(|f| f.set(None));
+}
+
 #[test]
 fn two_orders_of_the_same_place_are_used_in_the_order_the_mod_wrote_them() {
     let dir = TempDir::new("rt-queue-same-place");

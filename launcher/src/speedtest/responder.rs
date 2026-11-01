@@ -20,6 +20,8 @@ pub fn new_events<'a>(before: &[String], now: &'a [String]) -> &'a [String] {
 /// `Ok(Some(text))` when it could not start.
 pub fn run_responder(env: &mut Env<'_>, core: &CoreRef, log: &mut dyn FnMut(&str)) -> Result<Option<String>, Stop> {
     let mut probe = Probe::on(core.clone());
+    // whoever starts this program offers to answer tests: the game's limits per account and rate do not apply
+    probe.serve_every_tester();
     env.say("Starting Steam networking...");
     let own = match wait_ready(env, &mut probe, core)? {
         Ok(id) => id,

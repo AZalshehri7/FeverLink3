@@ -106,13 +106,23 @@ function Link.install(C)
 
 	-- ---------------------------------------------------------------- files
 
+	-- Writes `text` to the open file `f` and closes it: true, or false and why. Both results count (review 2026-10-31): a
+	-- full disk fails the write or the close, and a line reported written that is not there is an action this game applies alone.
+	-- A failed f:write or f:close RETURNS nil, its message and errno, so under pcall the OS's message (a full disk named as such) is the
+	-- third value; only a raise puts it second.
+	function C.writeClose(f, text)
+		local okW, rW, mW = pcall(f.write, f, text)
+		local okC, rC, mC = pcall(f.close, f)
+		if okW and rW and okC and rC then return true end
+		if not (okW and rW) then return false, tostring((okW and mW or rW) or "write failed") end
+		return false, tostring((okC and mC or rC) or "close failed")
+	end
+
 	function C.appendFile(path, text)
 		if not C.IO then return false end
 		local f = C.IO.open(path, "ab")
 		if not f then return false end
-		f:write(text)
-		f:close()
-		return true
+		return (C.writeClose(f, text))
 	end
 
 	-- Replaces the file's content (snapshots, cursors): not for the append-only link files.
@@ -120,9 +130,7 @@ function Link.install(C)
 		if not C.IO then return false end
 		local f = C.IO.open(path, "wb")
 		if not f then return false end
-		f:write(text)
-		f:close()
-		return true
+		return (C.writeClose(f, text))
 	end
 
 	function C.readFile(path)
@@ -154,9 +162,7 @@ function Link.install(C)
 			f:close()
 			return "over"
 		end
-		f:write(text)
-		f:close()
-		return true
+		return (C.writeClose(f, text))
 	end
 
 	-- A handle opened for appending and kept: the caller never closes it (world.lock, the presence sign of a world's script).
@@ -255,7 +261,7 @@ function Link.install(C)
 		return { gen = r.gen, offset = r.consumed }
 	end
 
-	-- On to generation `gen` (the one a `rotate` line named, or the newest after a deletion), after its first `skip` bytes.
+	-- On to generation `gen` (the one a `rotate` line named, or the oldest one still there after a deletion), after its first `skip` bytes.
 	function C.readerNext(r, gen, skip)
 		if r.f then pcall(function() r.f:close() end) r.f = nil end
 		r.gen, r.path, r.consumed, r.partial, r.head, r.nextGen, r.nextSkip, r.skipping =
@@ -312,15 +318,21 @@ function Link.install(C)
 		if not f then
 			f = C.IO.open(r.path, "rb")
 			if not f then
-				-- a file that was there and is gone: deleted under a reader that fell behind every kept generation (on with the newest),
+				-- the reader's generation is gone while newer ones exist: deleted under a reader that fell behind (or one placed at a
+				-- generation already deleted). On at the OLDEST generation still there, never past kept lines, whether or not this reader
+				-- saw the file (review 2026-10-31: it jumped to the newest, or stalled when it had never opened it). The lines
+				-- of the deleted generations are lost: r.lost counts the gaps, and the caller says each one (the bridge's X.readerGap).
+				local newest = C.newestGen(r.base or r.path)
+				for g = (r.gen or 1) + 1, newest do
+					if C.fileSize(C.genPath(r.base or r.path, g)) then
+						r.seen, r.lost = false, (r.lost or 0) + 1
+						C.readerNext(r, g, 0)
+						return {}, true
+					end
+				end
 				-- or the folder was cleaned (a new file starts from its first byte)
 				if r.seen then
 					r.seen = false
-					local newest = C.newestGen(r.base or r.path)
-					if newest > (r.gen or 1) then
-						C.readerNext(r, newest, 0)
-						return {}, true
-					end
 					r.consumed, r.partial, r.head, r.skipping = 0, "", nil, false
 				end
 				return {}, false
@@ -384,18 +396,35 @@ function Link.install(C)
 		local g = C.newestGen(path)
 		local w = { base = path, gen = g, path = C.genPath(path, g), from = from, lines = 0, failed = 0,
 			rotate = opts.rotate or C.ROTATE_BYTES, keep = opts.keep or C.KEEP_GENERATIONS }
-		w.size = C.fileSize(w.path) or 0
+		local size, last = tailState(w.path)
+		w.size = size or 0
+		-- a file that ends in a cut line (a write that failed before this writer was made: a reloaded script's) is cut for it too
+		if w.size > 0 and last ~= NL then w.cut = true end
 		return w
+	end
+
+	-- After a write of `line` to the writer's file (`size` bytes before it) that reported a failure: true when the line is there whole
+	-- anyway (only the close failed): every reader reads it, so it was sent, and its action applies here too, under its number.
+	-- Otherwise false; a line cut by the failure (a full disk took part of it), or one the size cannot tell, sets w.cut: the writer's
+	-- next line starts with a newline, so the cut bytes end as one line no reader can parse (dropped) instead of being glued to that
+	-- next line, which every reader would then drop too while this game applies it (review 2026-10-31). An empty line is skipped.
+	local function landedAnyway(w, size, line)
+		local now = C.fileSize(w.path)
+		if now == size + #line then return true end
+		if now == nil or now > size then w.cut = true end
+		return false
 	end
 
 	-- Ends the writer's generation with a `rotate` line and goes on in the next (the pointer is written, the generation `keep`
 	-- back is deleted). False when the `rotate` line could not be written: the writer stays where it is.
 	function C.writerRotate(w)
 		local nextG = w.gen + 1
-		if not C.appendFile(w.path, C.formatLine(C.ROTATE_KIND, w.from, C.serialize({ gen = nextG, skip = 0 }))) then return false end
+		local size = C.fileSize(w.path) or 0
+		local line = (w.cut and NL or "") .. C.formatLine(C.ROTATE_KIND, w.from, C.serialize({ gen = nextG, skip = 0 }))
+		if not (C.appendFile(w.path, line) or landedAnyway(w, size, line)) then return false end
 		C.writeFile(C.genPointer(w.base), C.integerText(nextG) .. NL)
 		if nextG > w.keep then pcall(C.remove, C.genPath(w.base, nextG - w.keep)) end
-		w.gen, w.path, w.size = nextG, C.genPath(w.base, nextG), 0
+		w.gen, w.path, w.size, w.cut = nextG, C.genPath(w.base, nextG), 0, nil
 		return true
 	end
 
@@ -415,7 +444,7 @@ function Link.install(C)
 			local g = C.newestGen(w.base)
 			if g > w.gen then
 				f:close()
-				w.gen, w.path = g, C.genPath(w.base, g)
+				w.gen, w.path, w.cut = g, C.genPath(w.base, g), nil   -- a cut line of this writer's is in the old file
 				f = C.IO.open(w.path, "ab")
 				size = f and f:seek("end") or 0
 			end
@@ -427,11 +456,16 @@ function Link.install(C)
 			size = f and f:seek("end") or 0
 		end
 		if f then
-			local line = C.formatLine(kind, w.from, text)
-			f:write(line)
-			f:close()
-			w.size, w.lines = size + #line, w.lines + 1
-			return true
+			-- a line that did not land is not sent: false, so the caller refuses the action instead of applying it here alone;
+			-- after a cut line (w.cut) it starts on a line of its own (landedAnyway)
+			local line = (w.cut and NL or "") .. C.formatLine(kind, w.from, text)
+			local okW, eW = C.writeClose(f, line)
+			if okW or landedAnyway(w, size, line) then
+				w.size, w.lines, w.cut = size + #line, w.lines + 1, nil
+				return true
+			end
+			w.failed = w.failed + 1
+			return false, "cannot write to " .. w.path .. ": " .. tostring(eW)
 		end
 		w.failed = w.failed + 1
 		return false, "cannot append to " .. w.path
@@ -456,7 +490,7 @@ function Link.install(C)
 				(okT and tonumber(t) or 0) % 1048576, ownCount)
 			local path = family .. ".w" .. id .. ".log"
 			if not C.fileSize(path) then
-				w.base, w.gen, w.path, w.size, w.id = path, 1, path, 0, id
+				w.base, w.gen, w.path, w.size, w.id, w.cut = path, 1, path, 0, id, nil
 				return w
 			end
 		end

@@ -196,6 +196,8 @@ end
 -- run 2026-10-14, rail-crash: a track's start node 50395 was an edge on the forked host, `it != components.end()`, BaseNode, the game
 -- stopped). What kind each member names (by its path, element indices left out); a member not listed is not checked (frozenNodes hold
 -- indices, the player members are the player and may hold residue, the sets and hashes are not entity references the rebuild reads).
+-- A node configuration removal is its own kind (review 2026-10-31): the engine removes the node's BaseNodeConfig, and a node without one
+-- aborts the game (Engine.h:323, the record path's guardProposal), so a node alone is not enough there.
 local REF_KINDS = {
 	["proposal.addedNodes.entity"] = "node",
 	["proposal.removedNodes.entity"] = "node",
@@ -204,7 +206,7 @@ local REF_KINDS = {
 	["proposal.removedSegments.node0"] = "node",
 	["proposal.removedSegments.node1"] = "node",
 	["proposal.nodeConfigsToAdd.entity"] = "node",
-	["proposal.nodeConfigsToRemove"] = "node",
+	["proposal.nodeConfigsToRemove"] = "nodeConfig",
 	["proposal.addedSegments.entity"] = "edge",
 	["proposal.removedSegments.entity"] = "edge",
 	["proposal.nodeConfigsToAdd.laneConnections.segment0"] = "edge",

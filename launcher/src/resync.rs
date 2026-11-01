@@ -8,7 +8,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use feverlink3_core::session::{codec, Permissions, ResyncLimits};
 use sha2::{Digest, Sha256};
@@ -65,31 +65,147 @@ pub fn read_chunk(path: &Path, len: u64, index: u32) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// What [`write_save`] or [`copy_save`] did: how many folders hold this round's save, and one line per folder that
+/// does not (for the log). A folder in `missed` has lost its older file of the name unless its line says otherwise.
+#[derive(Debug)]
+pub struct Stored {
+    pub held: usize,
+    pub missed: Vec<String>,
+}
+
 /// Writes the received save as `<name>.sav` into every folder (created when missing), through a temporary file
-/// and a rename so the game never sees half a save. Returns how many folders got it.
-pub fn write_save(dirs: &[PathBuf], name: &str, bytes: &[u8]) -> io::Result<usize> {
-    let mut written = 0;
-    let mut last_error = None;
+/// and a rename so the game never sees half a save. Ok when at least one folder holds it; fails only when none does,
+/// so the load that names it would open nothing or an older file. A folder that cannot get it loses its older file of
+/// that name: names restart at round 1 every session, so a stale `<name>.sav` would be another session's world (review
+/// 2026-10-31).
+pub fn write_save(dirs: &[PathBuf], name: &str, bytes: &[u8]) -> io::Result<Stored> {
+    let expected = (hex(&Sha256::digest(bytes)), bytes.len() as u64);
+    let stored = store_in(dirs, name, 0, &|| Ok(expected.clone()), &|tmp| {
+        let mut f = File::create(tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    });
+    if stored.held == 0 {
+        let why = if stored.missed.is_empty() {
+            "no savegame folder to write to".to_owned()
+        } else {
+            stored.missed.join("; ")
+        };
+        return Err(io::Error::other(why));
+    }
+    Ok(stored)
+}
+
+/// As [`write_save`] from a file already on disk (a save received over parallel connections, which lands in the first
+/// folder) into the other folders `dirs`. `src` itself counts as a folder holding the save, so a copy that fails
+/// everywhere else still leaves the round loadable from the first folder.
+pub fn copy_save(src: &Path, dirs: &[PathBuf], name: &str) -> Stored {
+    // hashed only when a folder already has a file of the same size (see `holds_same`)
+    let expected = std::cell::OnceCell::new();
+    let expected =
+        || expected.get_or_init(|| hash_file(src).map_err(|e| e.to_string())).clone().map_err(io::Error::other);
+    store_in(dirs, name, 1, &expected, &|tmp| fs::copy(src, tmp).map(|_| ()))
+}
+
+/// Whether `save` already holds exactly the bytes being stored (`expected` gives their SHA-256 and length). Two game
+/// windows on one PC share a savegame folder, and the host's game may be loading that very file while the player's
+/// launcher stores it: such a file is this round's save, not a stale one, even when it cannot be replaced.
+fn holds_same(save: &Path, expected: &dyn Fn() -> io::Result<(String, u64)>) -> bool {
+    let Ok(len) = fs::metadata(save).map(|m| m.len()) else { return false };
+    matches!(expected(), Ok((sha, want)) if want == len && hash_file(save).is_ok_and(|(h, _)| h == sha))
+}
+
+/// The files the game writes next to `<name>.sav` (its script and preview images). They describe that save, so they go
+/// when an older file of the name is replaced or removed (`is_resync_file` lists the same tails).
+const COMPANIONS: [&str; 3] = [".sav.lua", ".sav.jpg", ".sav.png"];
+
+/// Puts `<name>.sav` into every folder: `fill` writes the temporary file, a rename makes it the save. `held` counts
+/// folders that hold it already. See [`write_save`].
+fn store_in(
+    dirs: &[PathBuf],
+    name: &str,
+    held: usize,
+    expected: &dyn Fn() -> io::Result<(String, u64)>,
+    fill: &dyn Fn(&Path) -> io::Result<()>,
+) -> Stored {
+    let mut stored = Stored { held, missed: Vec::new() };
     for dir in dirs {
-        let result = (|| {
-            fs::create_dir_all(dir)?;
-            let tmp = dir.join(format!("{name}.sav.tmp"));
-            let mut f = File::create(&tmp)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
-            drop(f);
-            fs::rename(&tmp, dir.join(format!("{name}.sav")))
-        })();
+        let save = dir.join(format!("{name}.sav"));
+        // a folder that has these bytes already is left as it is, companions included: they belong to this save
+        if holds_same(&save, expected) {
+            stored.held += 1;
+            continue;
+        }
+        let older = save.exists();
+        let tmp = dir.join(format!("{name}.sav.tmp"));
+        let result = fs::create_dir_all(dir).and_then(|()| fill(&tmp)).and_then(|()| fs::rename(&tmp, &save));
+        if older {
+            for tail in COMPANIONS {
+                let _ = fs::remove_file(dir.join(format!("{name}{tail}")));
+            }
+        }
         match result {
-            Ok(()) => written += 1,
-            Err(e) => last_error = Some(e),
+            Ok(()) => stored.held += 1,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                let line = match older.then(|| fs::remove_file(&save)) {
+                    Some(Err(kept)) => format!(
+                        "{} is an older file of that name and could not be replaced ({e}) or removed ({kept}); a game that loads from this folder may open it",
+                        save.display()
+                    ),
+                    _ => format!("{}: {e}", dir.display()),
+                };
+                stored.missed.push(line);
+            }
         }
     }
-    match (written, last_error) {
-        (0, Some(e)) => Err(e),
-        (0, None) => Err(io::Error::new(io::ErrorKind::NotFound, "no savegame folder to write to")),
-        (n, _) => Ok(n),
+    stored
+}
+
+/// How long a resync file stays before [`prune_saves`] deletes it. Another session on this PC (a second game window)
+/// may still be sending or loading its round's file; a round takes at most its save, transfer and load timeouts (well
+/// under an hour), so a file older than this belongs to no running round.
+pub const PRUNE_AGE: Duration = Duration::from_secs(3600);
+
+/// Whether `file` is one of FeverLink3's own resync files: exactly `feverlink3-resync-<digits>.sav`, or that name with
+/// our temporary suffix (`.tmp`, `.part`) or a companion file the game writes next to a save (`.lua`, `.jpg`, `.png`).
+/// Nothing else in a savegame folder matches, so the player's own saves are never touched.
+pub fn is_resync_file(file: &str) -> bool {
+    let Some((digits, tail)) = file.strip_prefix("feverlink3-resync-").and_then(|rest| rest.split_once(".sav")) else {
+        return false;
+    };
+    !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && matches!(tail, "" | ".tmp" | ".part" | ".lua" | ".jpg" | ".png")
+}
+
+/// Deletes the resync files ([`is_resync_file`]) last changed more than `older_than` before `now` from the folders. A
+/// session start does this: the files of earlier sessions (one save per round, often 100 MB and more) were never deleted
+/// and filled every Steam account's savegame folder and the game's load list (review 2026-10-31). Returns how many went.
+pub fn prune_saves(dirs: &[PathBuf], older_than: Duration, now: SystemTime) -> usize {
+    let mut removed = 0;
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let named = entry.file_name().to_str().is_some_and(is_resync_file);
+            if !named || !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(now);
+            let old = now.duration_since(modified).is_ok_and(|age| age > older_than);
+            if old && fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
     }
+    removed
+}
+
+/// Whether the file was last changed before `since`, with a margin for file systems that keep coarse times (FAT: 2 s):
+/// a file the game saved in this round is never older than the round.
+pub fn older_than_round(path: &Path, since: SystemTime) -> io::Result<bool> {
+    let modified = fs::metadata(path)?.modified()?;
+    Ok(modified + Duration::from_secs(2) < since)
 }
 
 /// What the mod reads for one player: `{build, bulldoze, spend, other}` as booleans, from the host's
@@ -175,11 +291,93 @@ mod tests {
     fn write_save_creates_folders_and_leaves_no_temp_file() {
         let t = tmp();
         let (a, b) = (t.path().join("u1").join("save"), t.path().join("u2").join("save"));
-        assert_eq!(write_save(&[a.clone(), b.clone()], "n", b"bytes").unwrap(), 2);
+        assert_eq!(write_save(&[a.clone(), b.clone()], "n", b"bytes").unwrap().held, 2);
         assert_eq!(fs::read(a.join("n.sav")).unwrap(), b"bytes");
         assert_eq!(fs::read(b.join("n.sav")).unwrap(), b"bytes");
         assert!(!a.join("n.sav.tmp").exists());
         assert!(write_save(&[], "n", b"x").is_err());
+    }
+
+    #[test]
+    fn a_folder_that_cannot_take_the_save_loses_its_older_one() {
+        let t = tmp();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("n.sav"), b"an earlier session's world").unwrap();
+        fs::write(b.join("n.sav"), b"another earlier world").unwrap();
+        fs::write(b.join("n.sav.lua"), b"that world's script").unwrap();
+        // the temporary file cannot be made in `a`: the write fails there
+        fs::create_dir_all(a.join("n.sav.tmp")).unwrap();
+        let stored = write_save(&[a.clone(), b.clone()], "n", b"new").unwrap();
+        assert_eq!((stored.held, stored.missed.len()), (1, 1));
+        assert!(!a.join("n.sav").exists(), "no stale save is left under the round's name");
+        assert_eq!(fs::read(b.join("n.sav")).unwrap(), b"new");
+        assert!(!b.join("n.sav.lua").exists(), "the replaced save's companion goes with it");
+        assert!(write_save(std::slice::from_ref(&a), "n", b"new").is_err());
+        // a copy from the first folder counts that folder: failing in every other one still leaves the round loadable
+        fs::write(a.join("n.sav"), b"stale").unwrap();
+        let copied = copy_save(&b.join("n.sav"), std::slice::from_ref(&a), "n");
+        assert_eq!((copied.held, copied.missed.len()), (1, 1));
+        assert!(!a.join("n.sav").exists());
+        assert_eq!(copy_save(&b.join("n.sav"), &[], "n").held, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_save_counts_only_when_it_holds_the_same_bytes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let t = tmp();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("n.sav"), b"round").unwrap();
+        fs::write(a.join("n.sav.lua"), b"its script").unwrap();
+        // a game loading the file (a second window on this PC) opened it without delete sharing: it cannot be replaced
+        let _game = File::options().read(true).share_mode(1).open(a.join("n.sav")).unwrap();
+        assert!(fs::remove_file(a.join("n.sav")).is_err(), "the test file is locked");
+        let stored = write_save(std::slice::from_ref(&a), "n", b"round").unwrap();
+        assert_eq!((stored.held, stored.missed.len()), (1, 0));
+        assert!(a.join("n.sav.lua").exists(), "this save's companion stays");
+        // a locked file with other bytes is stale: no folder holds the round alone, and with another folder it is named
+        assert!(write_save(std::slice::from_ref(&a), "n", b"other").is_err());
+        let stored = write_save(&[a.clone(), b.clone()], "n", b"other").unwrap();
+        assert_eq!(stored.held, 1);
+        assert!(stored.missed[0].contains("could not be replaced"), "{:?}", stored.missed);
+    }
+
+    #[test]
+    fn only_old_resync_files_are_pruned() {
+        assert!(is_resync_file("feverlink3-resync-12.sav"));
+        assert!(is_resync_file("feverlink3-resync-1.sav.part"));
+        assert!(is_resync_file("feverlink3-resync-1.sav.lua"));
+        for other in [
+            "feverlink3-resync-.sav",
+            "feverlink3-resync-1a.sav",
+            "feverlink3-resync-1.save",
+            "feverlink3-resync-1.sav.bak",
+            "my feverlink3-resync-1.sav",
+            "autosave.sav",
+        ] {
+            assert!(!is_resync_file(other), "{other}");
+        }
+        let t = tmp();
+        let dir = t.path().join("save");
+        fs::create_dir_all(&dir).unwrap();
+        let keep = ["autosave.sav", "feverlink3-resync-1.save", "feverlink3-resync-3.sav"];
+        for f in ["feverlink3-resync-1.sav", "feverlink3-resync-1.sav.lua", keep[0], keep[1], keep[2]] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        fs::create_dir_all(dir.join("feverlink3-resync-2.sav")).unwrap();
+        let now = SystemTime::now() + 2 * PRUNE_AGE;
+        // feverlink3-resync-3.sav is recent: another session on this PC may still use it
+        let recent = File::options().write(true).open(dir.join(keep[2])).unwrap();
+        recent.set_modified(now).unwrap();
+        assert_eq!(prune_saves(&[dir.clone(), t.path().join("missing")], PRUNE_AGE, now), 2);
+        for f in keep {
+            assert!(dir.join(f).exists(), "{f} is kept");
+        }
+        assert!(dir.join("feverlink3-resync-2.sav").is_dir(), "a folder is never removed");
+        assert!(!dir.join("feverlink3-resync-1.sav").exists());
     }
 
     #[test]

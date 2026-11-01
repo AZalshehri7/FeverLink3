@@ -50,7 +50,7 @@ How each is used by the game, and what the mod does about it. "Query" = changes 
 | `system.streetSystem.getNodeStreetSegments`, `getNodeTrackSegments` | Query: the segments at a node. | `node` | **Used** to find a segment from its end node | Used (the game's own entity windows call them). |
 | `system.streetSystem.getNode2SegmentMap`, `getEdgeForEdgeObject` | Queries (MPFever). | | Fallback node scan; the segment carrying an object | Used as fallbacks. |
 | `system.stationGroupSystem.getStationGroup` | Query: the group of a station. | `station` | Keys for the station groups of a built station | Used. |
-| `api.gui.construction.getRefundableEntities`, `updateRefundableEntities`, `provideDustWheneverPossible` | Refund list after a bridge swap; the dust cloud. | | none | Not replicated (money is corrected by host authority). |
+| `api.gui.construction.getRefundableEntities`, `updateRefundableEntities`, `provideDustWheneverPossible` | Refund list after a bridge swap; the dust cloud. | | none | Not replicated (a lasting money difference is repaired by a sync). |
 
 ### The tools (`Builtin.Type.ConstructionAction.*`)
 

@@ -18,6 +18,8 @@ pub struct Inputs {
     pub guide: PathBuf,
     pub license: PathBuf,
     pub notices: PathBuf,
+    /// docs/CHANGELOG.md: the version's section becomes the in-game "What's new" (whatsnew.rs)
+    pub changelog: PathBuf,
 }
 
 impl Inputs {
@@ -30,6 +32,7 @@ impl Inputs {
             guide: root.join("docs/PLAYING.md"),
             license: root.join("LICENSE"),
             notices: root.join("THIRD_PARTY_NOTICES.md"),
+            changelog: root.join("docs/CHANGELOG.md"),
         }
     }
 }
@@ -84,12 +87,24 @@ pub fn package_with(inputs: &Inputs, version: &str, out: &Path, layout: Layout) 
         ("LICENSE".into(), read(&inputs.license)?),
         ("THIRD_PARTY_NOTICES.md".into(), read(&inputs.notices)?),
     ];
-    match layout {
-        Layout::Overlay => collect_dir(&inputs.mod_dir, "mods/release/feverlink3", &mut files)?,
+    let mod_prefix = match layout {
+        Layout::Overlay => "mods/release/feverlink3",
         Layout::Portable => {
             files.push(("feverlink3.exe".into(), read(&inputs.exe)?));
-            collect_dir(&inputs.mod_dir, "mod/feverlink3", &mut files)?;
+            "mod/feverlink3"
         }
+    };
+    collect_dir(&inputs.mod_dir, mod_prefix, &mut files)?;
+    // the in-game "What's new" of this version, made from its changelog section (a copy in the mod folder is replaced)
+    let changelog = String::from_utf8(read(&inputs.changelog)?).map_err(|e| format!("docs/CHANGELOG.md: {e}"))?;
+    let notes_path = format!("{mod_prefix}/{}", crate::whatsnew::FILE);
+    files.retain(|(rel, _)| rel != &notes_path);
+    files.push((notes_path, crate::whatsnew::lua(&changelog, version)?.into_bytes()));
+    // the game loads only the mod files its `_content.json` lists (lab 2026-10-30: "Could not find file
+    // feverlink3::/feverlink3_whatsnew.lua" with the file in place and unlisted)
+    let index = format!("{mod_prefix}/_content.json");
+    if let Some((_, data)) = files.iter_mut().find(|(rel, _)| rel == &index) {
+        *data = crate::whatsnew::listed(data)?;
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -146,6 +161,7 @@ mod tests {
         w("docs/PLAYING.md", "guide");
         w("LICENSE", "mit");
         w("THIRD_PARTY_NOTICES.md", "notices");
+        w("docs/CHANGELOG.md", "# Changelog\n\n## 1.2.3 (2026-11-01)\n\n### Fixed\n- A fix.\n");
         w("mod/feverlink3/mod.json", "{}");
         w("mod/feverlink3/content/b.lua", "b");
         w("mod/feverlink3/content/a.lua", "a");
@@ -196,9 +212,17 @@ mod tests {
             "FeverLink3-1.2.3/LICENSE",
             "FeverLink3-1.2.3/mods/release/feverlink3/mod.json",
             "FeverLink3-1.2.3/mods/release/feverlink3/content/a.lua",
+            "FeverLink3-1.2.3/mods/release/feverlink3/content/feverlink3_whatsnew.lua",
         ] {
             assert!(names.iter().any(|n| n == want), "missing {want}");
         }
+        let mut notes = String::new();
+        archive
+            .by_name("FeverLink3-1.2.3/mods/release/feverlink3/content/feverlink3_whatsnew.lua")
+            .unwrap()
+            .read_to_string(&mut notes)
+            .unwrap();
+        assert!(notes.contains("version = \"1.2.3\"") && notes.contains("\"A fix.\""), "{notes}");
         assert!(!names.iter().any(|n| n.ends_with(".exe")), "no program in the overlay zip: {names:?}");
         assert!(!names.iter().any(|n| n.contains("/mod/")), "the mod sits under mods/release only");
         assert_eq!(b1.manifest.files.len(), names.len());

@@ -9,13 +9,16 @@ use sha2::{Digest, Sha256};
 pub const MIN_JOIN_CODE_CHARS: usize = 42;
 
 /// A name to take out of a text: the name itself, or its 8.3 short form (`EXAMPL~1`), which Windows shows for
-/// long user folder names in `%TEMP%` and other environment variables.
-struct UserPattern {
+/// long user folder names in `%TEMP%` and other environment variables. Each pattern carries what stands for it (`%USER%` for
+/// the Windows user, `%PLAYER<id>%` for a player of the session).
+#[derive(Debug, Clone)]
+struct NamePattern {
     name: Vec<char>,
     short_form: bool,
+    with: String,
 }
 
-impl UserPattern {
+impl NamePattern {
     /// The length in characters of the match at `at`, when there is one that starts and ends on a word boundary
     /// (so that `Ann` is found in `C:\Users\Ann\Desktop` but not in `Annual`).
     fn match_len(&self, chars: &[char], at: usize) -> Option<usize> {
@@ -46,24 +49,25 @@ fn same_letter(a: char, b: char) -> bool {
     a == b || a.to_lowercase().eq(b.to_lowercase())
 }
 
-/// The patterns for the names, longest first so that a long name wins over a short one inside it.
-fn user_patterns(names: &[String]) -> Vec<UserPattern> {
-    let mut patterns: Vec<UserPattern> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+/// Adds the patterns for `names`, each standing for `with`: the name and (`short_forms`: the Windows user's folder) its 8.3
+/// short form. A name already there (any case) is skipped, so the first replacement given for a name wins.
+fn add_patterns(patterns: &mut Vec<NamePattern>, names: &[String], with: &str, short_forms: bool) {
     for raw in names {
-        let name = raw.trim();
-        if name.is_empty() || seen.contains(&name.to_lowercase()) {
+        let name: Vec<char> = raw.trim().chars().collect();
+        let known = patterns.iter().any(|p| {
+            !p.short_form && p.name.len() == name.len() && p.name.iter().zip(&name).all(|(a, b)| same_letter(*a, *b))
+        });
+        if name.is_empty() || known {
             continue;
         }
-        seen.push(name.to_lowercase());
-        patterns.push(UserPattern { name: name.chars().collect(), short_form: false });
-        let short: Vec<char> = name.chars().filter(char::is_ascii_alphanumeric).take(6).collect();
-        if short.len() == 6 {
-            patterns.push(UserPattern { name: short, short_form: true });
+        let short: Vec<char> = name.iter().copied().filter(char::is_ascii_alphanumeric).take(6).collect();
+        patterns.push(NamePattern { name, short_form: false, with: with.to_owned() });
+        if short_forms && short.len() == 6 {
+            patterns.push(NamePattern { name: short, short_form: true, with: with.to_owned() });
         }
     }
+    // longest first, so that a long name wins over a short one inside it (stable: an equal length keeps the order given)
     patterns.sort_by_key(|p| std::cmp::Reverse(p.name.len()));
-    patterns
 }
 
 /// `text` with the Windows user name (and its short form) replaced by `<user>`, case-insensitively.
@@ -73,7 +77,13 @@ pub fn redact_user(text: &str, names: &[String]) -> String {
 
 /// As [`redact_user`] with another replacement (a bug report writes `%USER%`, which reads as the folder it stands for).
 pub fn redact_user_as(text: &str, names: &[String], with: &str) -> String {
-    let patterns = user_patterns(names);
+    let mut patterns = Vec::new();
+    add_patterns(&mut patterns, names, with, true);
+    redact_names(text, &patterns)
+}
+
+/// `text` with every whole-word match of `patterns` (longest first) replaced by that pattern's own replacement.
+fn redact_names(text: &str, patterns: &[NamePattern]) -> String {
     if patterns.is_empty() {
         return text.to_owned();
     }
@@ -82,9 +92,9 @@ pub fn redact_user_as(text: &str, names: &[String], with: &str) -> String {
     let mut at = 0;
     while let Some(&c) = chars.get(at) {
         let starts_word = at == 0 || chars.get(at - 1).is_none_or(|p| !p.is_alphanumeric());
-        match starts_word.then(|| patterns.iter().find_map(|p| p.match_len(&chars, at))).flatten() {
-            Some(len) => {
-                out.push_str(with);
+        match starts_word.then(|| patterns.iter().find_map(|p| Some((p.match_len(&chars, at)?, p)))).flatten() {
+            Some((len, p)) => {
+                out.push_str(&p.with);
                 at += len;
             }
             None => {
@@ -95,6 +105,27 @@ pub fn redact_user_as(text: &str, names: &[String], with: &str) -> String {
     }
     out
 }
+
+/// What stands for player `id` of the session in a bug report.
+pub fn player_mask(id: u16) -> String {
+    format!("%PLAYER{id}%")
+}
+/// What stands for this game's own player name when it is in no roster (outside a session).
+pub const PLAYER_MASK: &str = "%PLAYER%";
+/// What stands for a player of the run before this one: ids restart with every session, so `%PLAYER1%` of the earlier run's
+/// logs can be another person than this run's `%PLAYER1%` (review 2026-10-31).
+pub fn previous_player_mask(id: u16) -> String {
+    format!("%PREVPLAYER{id}%")
+}
+/// What stands for a name that asked to join (a join request's name or Steam name) and had no player id when it was seen.
+pub const REQUESTER_MASK: &str = "%REQUESTER%";
+/// Player names that stay because they are words of the masks or of every log (any case): a player called `Steam`, `ipv4` or
+/// `user` would rewrite the `<ipv4>` masks, the words the logs are read by and, before, the `steam-<hex>` tags the bundle maps
+/// to `player-N` (review 2026-10-31). A name without a letter stays too: it would rewrite numbers.
+const LOG_WORDS: &[&str] = &["steam", "player", "user", "host", "ipv4", "ipv6", "join", "code", "removed"];
+/// Shorter player names stay: a name of one or two letters (`Al`, `x`) would mask ordinary words and units all over the logs,
+/// which costs the report more than the little such a name says about anyone (review 2026-10-31).
+pub const PLAYER_NAME_MIN_CHARS: usize = 3;
 
 /// `text` with every join code taken out. A join code is the credential of a session (whoever has it can join), and
 /// a diagnostics text is made to be pasted into chats. Candidates are runs of base32 letters; only a run that
@@ -137,10 +168,12 @@ pub const IPV6_MASK: &str = "<ipv6>";
 ///   Each part names its own game's tag, and the host's bundle turns those into `player-N`;
 /// - a Steam account number (the `userdata\<n>` folder name, the game's `userId`) becomes [`ACCOUNT_MASK`];
 /// - IPv4 and IPv6 addresses are masked, except loopback and the unspecified address, which say nothing about anyone;
-/// - the Windows user name (in paths, and anywhere else as a whole word) becomes `%USER%`.
+/// - the Windows user name (in paths, and anywhere else as a whole word) becomes `%USER%`;
+/// - the session's player names (whole words, any case) become `%PLAYER<id>%` ([`Redactor::with_players`]): they are often
+///   Steam or real names, and the zip is attached to a public GitHub page (review 2026-10-31).
 #[derive(Debug, Clone)]
 pub struct Redactor {
-    user_names: Vec<String>,
+    names: Vec<NamePattern>,
     salt: String,
     accounts: Vec<String>,
 }
@@ -150,7 +183,24 @@ impl Redactor {
     pub fn new(user_names: Vec<String>, salt: &str, accounts: Vec<String>) -> Redactor {
         let accounts =
             accounts.into_iter().filter(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit())).collect();
-        Redactor { user_names, salt: salt.to_owned(), accounts }
+        let mut names = Vec::new();
+        add_patterns(&mut names, &user_names, "%USER%", true);
+        Redactor { names, salt: salt.to_owned(), accounts }
+    }
+
+    /// The session's players to take out as well: `(name, what stands for it)`, e.g. `("Pat", "%PLAYER2%")`. No 8.3 short form
+    /// (that is a folder name's) and no name shorter than [`PLAYER_NAME_MIN_CHARS`]; a name that is also the Windows user's
+    /// keeps `%USER%`.
+    pub fn with_players(mut self, players: &[(String, String)]) -> Redactor {
+        for (name, with) in players {
+            let name_ok = name.trim().chars().count() >= PLAYER_NAME_MIN_CHARS
+                && name.chars().any(char::is_alphabetic)
+                && !LOG_WORDS.iter().any(|w| w.eq_ignore_ascii_case(name.trim()));
+            if name_ok {
+                add_patterns(&mut self.names, std::slice::from_ref(name), with, false);
+            }
+        }
+        self
     }
 
     /// The tag that stands for Steam ID `id` in this report.
@@ -165,13 +215,15 @@ impl Redactor {
     }
 
     /// `text` with everything personal taken out (the list above). Join codes go first: a code with a replaced piece inside
-    /// would no longer be recognised.
+    /// would no longer be recognised. The addresses next: a name of hex letters (`Ace`, `Dad`) masked inside an IPv6 address
+    /// would keep the rest of the address from being recognised. The names before the numbers, so that a name never touches
+    /// a `steam-<hex>` tag (review 2026-10-31).
     pub fn text(&self, text: &str) -> String {
         let t = redact_join_codes(text);
-        let t = self.numbers(&t);
         let t = redact_ipv4(&t);
         let t = redact_ipv6(&t);
-        redact_user_as(&t, &self.user_names, "%USER%")
+        let t = redact_names(&t, &self.names);
+        self.numbers(&t)
     }
 
     /// Steam IDs and account numbers: every maximal run of digits is looked at once.
@@ -200,10 +252,14 @@ impl Redactor {
     }
 }
 
-/// `text` ends in `userdata\` or `userdata/` (any case): the number that follows is a Steam account.
+/// `text` ends in `userdata\` or `userdata/` (any case): the number that follows is a Steam account. Bytes, not a `str` slice: a
+/// slice 8 bytes back can end inside a multi-byte character (`...é7`) and panicked, which failed the whole part (review
+/// 2026-10-31).
 fn ends_with_userdata(text: &str) -> bool {
-    let tail = text.get(text.len().saturating_sub(9)..).unwrap_or("");
-    tail.len() == 9 && tail[..8].eq_ignore_ascii_case("userdata") && matches!(tail.as_bytes()[8], b'\\' | b'/')
+    let b = text.as_bytes();
+    b.len() >= 9
+        && b[b.len() - 9..b.len() - 1].eq_ignore_ascii_case(b"userdata")
+        && matches!(b[b.len() - 1], b'\\' | b'/')
 }
 
 /// `text` with every dotted IPv4 address but loopback (`127.x`) and `0.0.0.0` masked: four numbers of at most 255 with no digit
@@ -321,6 +377,45 @@ mod tests {
         assert_eq!(r#""userId": "%STEAMACCOUNT%""#, a.text(r#""userId": "123456789""#));
         assert_eq!("UserData/%STEAMACCOUNT%/x", a.text("UserData/987654321/x"), "another account of the PC too");
         assert_eq!("t=1234567890 x123456789", a.text("t=1234567890 x123456789"), "only the whole number");
+    }
+
+    #[test]
+    fn multi_byte_characters_right_before_digits_are_redacted_without_a_panic() {
+        // 2-, 3- and 4-byte characters before a run of digits, with 9 bytes or more before it (review 2026-10-31: `...é7`
+        // panicked when the byte 9 back was a character's start)
+        let a = r();
+        for keep in [
+            "player Ren\u{e9}7 joined",
+            "station \u{99c5}2",
+            "\u{99c5}\u{99c5}\u{99c5}2",
+            "train \u{1f682}12345",
+            "ab\u{1f682}9",
+        ] {
+            assert_eq!(keep, a.text(keep));
+            assert_eq!(keep, a.numbers(keep));
+        }
+        assert_eq!("\u{e9}userdata/%STEAMACCOUNT%", a.text("\u{e9}userdata/42"));
+    }
+
+    #[test]
+    fn the_players_names_are_masked_as_whole_words_with_their_own_ids() {
+        let players = [
+            ("Pat".to_owned(), player_mask(2)),
+            ("Big Jo".to_owned(), player_mask(0)),
+            ("Al".to_owned(), player_mask(3)),
+            ("ann".to_owned(), player_mask(4)),
+        ];
+        let a = r().with_players(&players);
+        assert_eq!(
+            "%PLAYER2% joined; %PLAYER0% (host) said hi to %PLAYER2%, Patty stays",
+            a.text("Pat joined; big jo (host) said hi to PAT, Patty stays")
+        );
+        assert_eq!("Al stays: too short to mask", a.text("Al stays: too short to mask"));
+        // a name that is a log or mask word stays (the tags and masks stay intact), and so does a name of digits
+        let words = r().with_players(&[("Steam".into(), player_mask(5)), ("1234".into(), player_mask(6))]);
+        let tag = words.steam_tag(76561190000000007);
+        assert_eq!(format!("Steam {tag} at <ipv4> 1234"), words.text("Steam 76561190000000007 at 10.1.2.3 1234"));
+        assert_eq!("C:\\Users\\%USER%", a.text("C:\\Users\\Ann"), "the Windows user's name keeps %USER%");
     }
 
     #[test]

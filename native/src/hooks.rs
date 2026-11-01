@@ -173,6 +173,7 @@ static PREVIEW_OWNER_CALLEE: AtomicUsize = AtomicUsize::new(0);
 /// The call `std::function(lambda)` at `0x64cb41` in `UI::CGameUI::CGameUI` (once per loaded world, `build_table::PreviewOwnerSite`),
 /// reached through a thunk: `captures` points at the builder-preview listener's three captures, which are kept
 /// ([`Runtime::note_preview_owner`], guarded reads only); then the real constructor (a leaf that copies them) runs with both arguments.
+/// It is also the world boundary of held commands ([`Runtime::new_world`], review 2026-10-31).
 unsafe extern "system-unwind" fn preview_owner_hook(function: u64, captures: u64) -> u64 {
     let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::PREVIEW_OWNER_HOOK);
     let callee = PREVIEW_OWNER_CALLEE.load(Ordering::Acquire);
@@ -1047,6 +1048,15 @@ unsafe extern "system-unwind" fn autosave_hook(gameui: u64, arg2: u64, arg3: u64
     unsafe { original(gameui, arg2, arg3, arg4) }
 }
 
+/// Ends the module's own AutoSave call (`autosave::State::own_call`) when the call returns or unwinds, as [`ClearGrowthTime`] does.
+struct OwnAutosave;
+
+impl Drop for OwnAutosave {
+    fn drop(&mut self) {
+        crate::autosave::STATE.own_call(false);
+    }
+}
+
 /// `CGameUI`'s per-frame update (0x65ecd0, vtable slot 52, the thread the game's own autosave decision runs on; it reads `rcx`, `rdx`
 /// and `r8`, the frame's microseconds): before it, the mod's `autosave {now}` runs the original AutoSave with this `CGameUI`, unless
 /// a save is under way (AutoSave's own assert would end the game). Both real functions run in this plain frame, outside any guard.
@@ -1063,10 +1073,12 @@ unsafe extern "system-unwind" fn gameui_step_hook(gameui: u64, arg2: u64, arg3: 
     type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
     if due == Some(true) && autosave != 0 {
         crate::autosave::STATE.own_call(true);
+        // ended on every way out: an exception from AutoSave left the flag set before, and the game's own timer then saved again for the
+        // rest of the run (review 2026-10-31)
+        let _own = OwnAutosave;
         // SAFETY: the trampoline of AutoSave, called as the game calls it (0x65f87a: `mov rcx, rsi`, this CGameUI) on its thread.
         let autosave: Original = unsafe { core::mem::transmute(autosave) };
         unsafe { autosave(gameui, 0, 0, 0) };
-        crate::autosave::STATE.own_call(false);
     }
     // SAFETY: the trampoline of the detoured function; it takes these three register slots (the fourth is passed through unread).
     let original: Original = unsafe { core::mem::transmute(original) };

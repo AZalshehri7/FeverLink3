@@ -132,7 +132,6 @@ impl ChecksumRounds {
             && report.parts.iter().all(|(k, v)| text_ok(k) && text_ok(v))
             && report.not_ready.len() <= Self::MAX_PARTS
             && report.not_ready.iter().all(text_ok)
-            && report.authority.as_ref().is_none_or(|a| a.len() <= Self::MAX_PARTS && a.keys().all(text_ok))
     }
 
     /// Samples within the bounds; a report whose samples are not loses them, never the report (they are only for the log).

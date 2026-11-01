@@ -343,6 +343,11 @@ impl Receiver {
         }
     }
 
+    /// How long nothing has arrived (since the last chunk, or since the start).
+    pub fn idle(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last)
+    }
+
     /// First chunk to last chunk, in ms.
     pub fn span_ms(&self) -> u64 {
         self.first.map_or(0, |f| self.last.saturating_duration_since(f).as_millis() as u64)

@@ -40,16 +40,31 @@ pub struct ChecksumPolicy {
 impl ChecksumPolicy {
     /// Parts that drift without anyone doing anything (the engine is not bit-exact for them); `script:*` too.
     pub const DRIFT_PARTS: [&'static str; 5] = ["vehicles", "onboard", "persons", "stocks", "nodeConfigs"];
-    /// Corrected through Authority, never a reason to reload. The lanes the script reports are `balance` and `loan`
-    /// (`money` is the older name); a rule written for "money" alone let a difference of 180 in `balance` reload the world.
+    /// The savegame player's account (hashed in whole money units by the games): ordinary parts, so a difference in two checks in a
+    /// row is repaired by a resync like any other fork (owner decision 2026-11-01, review 2026-10-31: the host's money authority,
+    /// which booked the difference as journal entries on one game, hid the cause and is gone). Real sessions 2026-10-21/23: money
+    /// differed only in rounds where ids or edges differed too, never in a round where the worlds matched. A float sum at a .5
+    /// boundary can still round differently for one round, which two rounds in a row do not count; for the same reason the check
+    /// of a player who caught up after a drop leaves them to the policy's second round.
+    pub const MONEY_PARTS: [&'static str; 2] = ["balance", "loan"];
     /// Lanes that cost much game thread time in a big world (the sum of one component read per edge, node, construction and town
     /// building): a running full round reads them spread over the steps, and a light round leaves them out. Every regular round is
     /// full by default since 2026-10-18 (`HostOptions::full_checksum_every`); light rounds remain for the lab switch and for an
     /// older host. `townBuildings:<town>` is the per-town part of `townBuildings`.
     /// `ids` (the entity ids of edges, constructions and town buildings) is heavy too, and an ordinary part: ids that differ mean a build
-    /// was applied at another step on one game, which the stamp rule should never let happen; the repair is a resync.
-    pub const HEAVY_PARTS: [&'static str; 5] = ["edges", "constructions", "nodeConfigs", "townBuildings", "ids"];
-    pub const MONEY_PARTS: [&'static str; 3] = ["money", "balance", "loan"];
+    /// was applied at another step on one game, which the stamp rule should never let happen; the repair is a resync. `<lane>@ids`
+    /// (review 2026-10-31) binds each id of that lane to the entity it names (an edge's also to its node ids), read with the lane, so the
+    /// same entities under swapped ids differ, which `ids` (a hash of the sorted id sets) cannot see; ordinary like `ids`.
+    pub const HEAVY_PARTS: [&'static str; 8] = [
+        "edges",
+        "constructions",
+        "nodeConfigs",
+        "townBuildings",
+        "ids",
+        "edges@ids",
+        "constructions@ids",
+        "townBuildings@ids",
+    ];
 
     pub fn new(config: ChecksumPolicyConfig) -> Self {
         Self { config, ..Self::default() }
@@ -102,28 +117,20 @@ impl ChecksumPolicy {
         Self::HEAVY_PARTS.contains(&part) || part.starts_with("townBuildings:")
     }
 
-    pub fn is_money_part(part: &str) -> bool {
-        Self::MONEY_PARTS.contains(&part)
-    }
-
     pub fn is_drift_part(part: &str) -> bool {
         Self::DRIFT_PARTS.contains(&part) || part.starts_with("script:")
     }
 
+    pub fn is_money_part(part: &str) -> bool {
+        Self::MONEY_PARTS.contains(&part)
+    }
+
     /// The lanes of one checksum round for a log line: each name, with what happens to it when it is not an ordinary
-    /// part ("stations, vehicles (drift), money (corrected)").
+    /// part ("stations, vehicles (drift)").
     pub fn describe_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
         let named: Vec<String> = parts
             .into_iter()
-            .map(|p| {
-                if Self::is_money_part(p) {
-                    format!("{p} (corrected)")
-                } else if Self::is_drift_part(p) {
-                    format!("{p} (drift)")
-                } else {
-                    p.to_owned()
-                }
-            })
+            .map(|p| if Self::is_drift_part(p) { format!("{p} (drift)") } else { p.to_owned() })
             .collect();
         named.join(", ")
     }
@@ -138,8 +145,7 @@ impl ChecksumPolicy {
             // sampled at different sim times (coarse steps at x3/x4): neither a match nor a desync; streaks stay as they are
             return None;
         }
-        let parts: BTreeSet<String> =
-            outcome.differing_parts().filter(|p| !Self::is_money_part(p)).map(str::to_owned).collect();
+        let parts: BTreeSet<String> = outcome.differing_parts().map(str::to_owned).collect();
         let drift: BTreeSet<String> = parts.iter().filter(|p| Self::is_drift_part(p)).cloned().collect();
         let other: BTreeSet<String> = parts.iter().filter(|p| !Self::is_drift_part(p)).cloned().collect();
 
@@ -185,8 +191,8 @@ impl ChecksumPolicy {
         match reason {
             Some(reason) => self.decide(now, reason),
             None => {
-                // a full round in which every part was measured and only money (corrected in place) differs proves the worlds
-                // match: a repair still waiting for the cooldown is not needed any more
+                // a full round in which every part was measured and none differs proves the worlds match: a repair still
+                // waiting for the cooldown is not needed any more
                 if outcome.full && outcome.ready() && parts.is_empty() {
                     self.pending = None;
                 }
@@ -204,6 +210,12 @@ impl ChecksumPolicy {
     /// soon as the cooldown is over.
     pub fn on_verdicts_differ(&mut self, now: f64, key: &str) -> Option<String> {
         self.decide(now, format!("verdicts of {key} differ"))
+    }
+
+    /// A player caught up after a drop and an ordinary part of its world differs in its first compared round: resync at once, or
+    /// as soon as the cooldown is over (review 2026-10-31: the catch-up check started its repair inside the cooldown).
+    pub fn on_resume_differs(&mut self, now: f64, who: &str) -> Option<String> {
+        self.decide(now, format!("{who}'s world differs after catching up"))
     }
 
     /// The repair that waited for the cooldown, once the cooldown is over (call it regularly while no resync runs). `None` while

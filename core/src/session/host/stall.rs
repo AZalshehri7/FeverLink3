@@ -49,14 +49,24 @@ pub(super) struct Stall {
 }
 
 impl HostSession {
-    /// The promise the host can keep for a stalled game now: the furthest promise of the games that run.
+    /// The promise the host can keep for a stalled game now: the furthest promise of the games that run in the session's world.
     pub(super) fn proxy_target(&self) -> Option<i64> {
-        self.clocks.iter().filter(|(id, _)| !self.stalls.contains_key(id)).filter_map(|(_, c)| c.safe).max()
+        self.running_world_clocks().filter_map(|c| c.safe).max()
     }
 
-    /// The furthest clock of the games that run.
+    /// The furthest clock of the games that run in the session's world.
     fn furthest_running_clock(&self) -> Option<i64> {
-        self.clocks.iter().filter(|(id, _)| !self.stalls.contains_key(id)).map(|(_, c)| c.t).max()
+        self.running_world_clocks().map(|c| c.t).max()
+    }
+
+    /// The clocks of the games that run (not stalled) in the session's world. An outsider's promise is of its own world (a failed
+    /// join round can leave its save a year ahead): followed, the proxy took that date, and every stamp of `future_stamp` with it,
+    /// and the stalled game's own promise could never reach it, so its stall never ended (review 2026-10-31).
+    fn running_world_clocks(&self) -> impl Iterator<Item = &PlayerClock> {
+        self.clocks
+            .iter()
+            .filter(|(id, _)| !self.stalls.contains_key(id) && !self.outsiders.contains(id))
+            .map(|(_, c)| c)
     }
 
     /// The proxy line of stalled game `id` to every other game.
@@ -86,7 +96,10 @@ impl HostSession {
         {
             return;
         }
-        let ready: Vec<u16> = self.players.values().filter(|p| p.ready).map(|p| p.id).collect();
+        // an outsider is never waited for (its clock holds no barrier), so it is neither a game heard from nor one to stall: a proxy
+        // made from its own promise would stamp every game at its world's date (review 2026-10-31)
+        let ready: Vec<u16> =
+            self.players.values().filter(|p| p.ready && !self.outsiders.contains(&p.id)).map(|p| p.id).collect();
         // a game still sending a message in parts is not silent: its clock lines are queued behind that message on its connection
         // (one ordered stream), and its action stamped before the proxy would be refused on every game (a 3 MB build takes some 3 s
         // at the 1 MB/s of one Steam connection)

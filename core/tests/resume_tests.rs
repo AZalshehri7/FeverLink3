@@ -122,6 +122,8 @@ fn a_world_that_differs_after_catching_up_is_repaired_at_once() {
     assert_ne!(ResyncState::Idle, n.host.resync_state(), "the repair starts at once, not after a second round");
 }
 
+/// Only a drift lane and the balance differ: no reload of every game at once (review 2026-10-31). The vehicles have the policy's drift
+/// window, and money can round differently for one round, so it waits for the policy's second round.
 #[test]
 fn a_matching_world_after_catching_up_is_left_alone() {
     let (mut n, ids) = Net::running(1, 1, HostOptions::default());
@@ -130,15 +132,17 @@ fn a_matching_world_after_catching_up_is_left_alone() {
     let a2 = n.reconnect(a);
     n.host_call(HostSession::request_checksum);
     let req: ChecksumRequestMessage = n.peer(a2).last(MessageKind::ChecksumRequest);
-    for c in [None, Some(a2)] {
-        let report = json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "1")])));
+    for (c, v) in [(None, "1"), (Some(a2), "2")] {
+        let report =
+            json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "1"), ("vehicles", v), ("balance", v)])));
         match c {
             None => n.host_send(MessageKind::ChecksumReport, &report),
             Some(c) => n.send(c, MessageKind::ChecksumReport, &report),
         }
     }
-    assert!(n.logged("caught up and the worlds match"), "{:?}", n.host_log);
+    assert!(n.logged("caught up and the worlds match apart from"), "{:?}", n.host_log);
     assert_eq!(ResyncState::Idle, n.host.resync_state());
+    assert!(!n.events.iter().any(|e| matches!(e, HostOutput::ResyncRequested { .. })), "{:?}", n.host_log);
 }
 
 #[test]

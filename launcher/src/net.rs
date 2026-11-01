@@ -78,14 +78,14 @@ impl Default for NetLimits {
 
 /// How the reader of one connection treats what arrives: the part of [`NetLimits`] a reader needs.
 #[derive(Debug, Clone, Copy)]
-struct ReadPolicy {
-    first_frame: usize,
-    frames_per_second: u32,
-    bytes_per_second: u32,
+pub(crate) struct ReadPolicy {
+    pub(crate) first_frame: usize,
+    pub(crate) frames_per_second: u32,
+    pub(crate) bytes_per_second: u32,
 }
 
 impl ReadPolicy {
-    fn of(limits: &NetLimits) -> Self {
+    pub(crate) fn of(limits: &NetLimits) -> Self {
         Self {
             first_frame: limits.first_frame,
             frames_per_second: limits.frames_per_second,
@@ -101,7 +101,7 @@ impl ReadPolicy {
 
 /// Token bucket over frames and bytes. [`Throttle::admit`] says how long to wait before the next frame is passed on.
 #[derive(Debug)]
-struct Throttle {
+pub(crate) struct Throttle {
     frames: f64,
     bytes: f64,
     frame_rate: f64,
@@ -111,9 +111,9 @@ struct Throttle {
 
 impl Throttle {
     /// The longest a single frame is made to wait: a throttled peer is slowed, not frozen.
-    const MAX_WAIT: Duration = Duration::from_secs(1);
+    pub(crate) const MAX_WAIT: Duration = Duration::from_secs(1);
 
-    fn new(policy: &ReadPolicy, now: Instant) -> Option<Throttle> {
+    pub(crate) fn new(policy: &ReadPolicy, now: Instant) -> Option<Throttle> {
         if policy.frames_per_second == 0 && policy.bytes_per_second == 0 {
             return None;
         }
@@ -122,7 +122,7 @@ impl Throttle {
         Some(Throttle { frames: 2.0 * frame_rate, bytes: 2.0 * byte_rate, frame_rate, byte_rate, last: now })
     }
 
-    fn admit(&mut self, frame_bytes: usize, now: Instant) -> Duration {
+    pub(crate) fn admit(&mut self, frame_bytes: usize, now: Instant) -> Duration {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = now;
         let mut wait = 0.0f64;

@@ -10,6 +10,7 @@
 mod manifest;
 mod package;
 mod sign;
+mod whatsnew;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

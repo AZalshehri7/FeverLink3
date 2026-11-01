@@ -29,9 +29,13 @@ T.MSG = {
 	build_not_allowed = { "warn",
 		"Your build was cancelled: the host has not given you permission to build.",
 		"{who}'s build was cancelled: the host has not given them permission to build." },
-	-- a build that waited too long in a paused game
+	-- for 20 s while the session ran, the game the build was made in went on with its frames but its game time did not reach the build's
+	-- stamp (it could not keep up; the others wait at its promise, before the stamp): cancelled on every game before the native module's
+	-- age limit fails it on that game alone. A pause of the whole session does not count, nor a gap of 10 s or more without a frame (its
+	-- pause menu, a freeze: the others run on and apply the build, and that game releases it at the stamp when it catches up). Bridge
+	-- heldWatchdog.
 	build_paused_too_long = { "warn",
-		"{whose} build was cancelled because the game stayed paused too long. Build it again once the game runs." },
+		"{whose} build was cancelled because the game it was made in stood still too long before the build was due (it could not keep up). Build it again." },
 	-- another game could not build it: cancelled everywhere
 	build_refused_elsewhere = { "warn",
 		"{whose} build was cancelled because it could not be built in {who}'s game ({cause}). Nothing was built. Try again." },
@@ -54,6 +58,9 @@ T.MSG = {
 	-- refused at its turn because FeverLink3 could not remake it exactly as the game made it (not a world change: trying again fails the same way)
 	build_not_remade = { "warn",
 		"Your {thing} could not be built: FeverLink3 could not copy it exactly as your game made it, so it was not built anywhere. This is a FeverLink3 problem, not a change in the world." },
+	-- applied as FeverLink3's own rebuild (the placeholder), not as the exact copy of what this player's game made (X.tellRefused)
+	build_not_copied = { "warn",
+		"Your {thing} could not be copied exactly as your game made it: FeverLink3 built its own copy of it, which may be incomplete. This is a FeverLink3 problem, not a change in the world." },
 	-- an action this game made while it was catching up, refused by the host on every game
 	action_undone_catching_up = { "warn",
 		"Something you did while your game was catching up could not be shared and was undone. Please do it again." },
@@ -103,8 +110,8 @@ T.MSG = {
 T.REPORT = {
 	button = "Report a problem",
 	note = "What were you doing? (optional)",
-	explain = "Makes one zip with the logs of every player in this session (Steam IDs, user names and addresses " ..
-		"removed) and opens a GitHub page to attach it to. Nothing is sent anywhere by itself.",
+	explain = "Makes one zip with the logs of every player in this session (Steam IDs, player and Windows user names, " ..
+		"chat and addresses removed) and opens a GitHub page to attach it to. Nothing is sent anywhere by itself.",
 	contents = "The zip holds:",
 }
 
@@ -132,7 +139,9 @@ T.UPDATE = {
 	quitNote = "Saves your world as feverlink3-restart and closes the game. Start the game again from Steam, " ..
 		"then load feverlink3-restart (Continue or Load Game).",
 	saving = "Saving your world. The game closes when it is done.",
-	quitFailed = "Save and quit did not work: {reason}. Restart the game to finish.",
+	-- the game stays open (review 2026-10-31): the player saves by hand before closing it
+	quitFailed = "Save and quit did not work: {reason}. The game stays open: save your world yourself " ..
+		"(Esc, then Save), then restart the game to finish.",
 }
 
 -- Why another game could not build it ({cause}), from the technical reason (which stays in the log).

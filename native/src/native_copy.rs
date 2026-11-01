@@ -110,6 +110,10 @@ pub struct Ctx<'a> {
     pub base: usize,
     pub set: Settings,
     pub build_name: &'a str,
+    /// The engine's `ConstructionEntity` functions (the verified set of the asset brush, `assets::Engine`): only the injection of a text
+    /// whose constructions are some, not all, of the script command's conversion calls them (`inject::build_verified`: the element's copy
+    /// constructor and the vector's insert). `None` where they were not verified: such a text is refused.
+    pub cons: Option<&'a dyn crate::assets::Engine>,
 }
 
 // ---- the dry pass
@@ -162,6 +166,44 @@ unsafe extern "system-unwind" fn dry_copy(d: *mut u8, s: *const u8) -> *mut u8 {
     d
 }
 
+/// The stand-ins for the engine's `ConstructionEntity` functions in the dry pass: the vector insert puts the old elements' bytes and a
+/// byte copy of the new one into a new block of the dry pass's arena and points the vector at it, the copy constructor copies the
+/// element's bytes. What they make is read through the dry pass's reader like the engine's, so the code after them (the frozen node
+/// lists, the proof) runs on the same shapes. The injection calls nothing else of the set.
+struct DryElements<'a> {
+    arena: &'a rebuild::Arena,
+    mem: &'a dyn Mem,
+}
+
+impl crate::assets::Engine for DryElements<'_> {
+    unsafe fn ctor(&self, _at: *mut u8) {}
+    unsafe fn dtor(&self, _at: *mut u8) {}
+    unsafe fn copy(&self, dst: *mut u8, src: *const u8) {
+        if let Some(b) = self.mem.read(src as usize, crate::assets::ENTITY) {
+            self.arena.write(dst as usize, &b);
+        }
+    }
+    unsafe fn insert(&self, vec: *mut u8, _at: *mut u8, val: *const u8) {
+        const E: usize = crate::assets::ENTITY;
+        // SAFETY: `vec` is a vector of the dry pass's own scratch Proposal (the trait's contract): 24 readable and writable bytes.
+        let t = unsafe { core::ptr::read_unaligned(vec as *const [u64; 3]) };
+        let (b, e) = (t[0] as usize, t[1] as usize);
+        let n = if b != 0 && e >= b { (e - b) / E } else { 0 };
+        if n >= 4096 {
+            return; // not a list this stand-in made (it starts from an empty one): left as it is, the count check refuses it
+        }
+        let mut bytes = if n > 0 { self.mem.read(b, n * E).unwrap_or_else(|| vec![0; n * E]) } else { Vec::new() };
+        bytes.extend(self.mem.read(val as usize, E).unwrap_or_else(|| vec![0; E]));
+        let at = self.arena.add(&bytes);
+        let end = (at + bytes.len()) as u64;
+        // SAFETY: as above.
+        unsafe { core::ptr::write_unaligned(vec as *mut [u64; 3], [at as u64, end, end]) };
+    }
+    unsafe fn resize(&self, _vec: *mut u8, _n: usize) {}
+    unsafe fn push(&self, _vec: *mut u8, _val: *mut u8) {}
+    unsafe fn assign(&self, _vec: *mut u8, _first: *const u8, _n: usize) {}
+}
+
 /// Drops every write into live memory (the real pass makes them).
 pub struct DryPoke;
 
@@ -196,7 +238,8 @@ pub fn dry_pass(
     DRY_READER.with(|r| r.set(Some(reader)));
     let _clear = Clear;
     let fns = ProposalFns { ctor: dry_ctor, dtor: dry_dtor, copy: dry_copy, assign: dry_copy };
-    let ctx = Ctx { fns, alloc: &arena, mem: &mem, base, set, build_name };
+    let cons = DryElements { arena: &arena, mem: &mem };
+    let ctx = Ctx { fns, alloc: &arena, mem: &mem, base, set, build_name, cons: Some(&cons) };
     crate::log::guarded(site, || f(&ctx)).ok_or_else(|| {
         format!(
             "{site}: our own code panicked on this text (a bug of the module, the PANIC line in native.log says where); refused before any call into the game"
@@ -775,6 +818,7 @@ mod tests {
             base: BASE,
             set: settings(),
             build_name: "40420",
+            cons: None,
         };
         let mut said: Vec<String> = Vec::new();
         let text = run(&ctx, at, &mut |l| said.push(l.to_string()));
@@ -810,6 +854,7 @@ mod tests {
             base: BASE,
             set: settings(),
             build_name: "40420",
+            cons: None,
         };
         let text = run(&ctx, at, &mut |_| {});
         WORLD.with(|w| w.set(core::ptr::null()));
@@ -833,6 +878,7 @@ mod tests {
             base: BASE,
             set: settings(),
             build_name: "40420",
+            cons: None,
         };
         let text = run(&ctx, 0x5555_0000, &mut |_| {});
         assert!(text.starts_with("REFUSED"), "{text}");
@@ -872,6 +918,7 @@ mod tests {
                 base: 0x7ff7_1400_0000,
                 set: Settings { typed: true, ..settings() },
                 build_name: "40420",
+                cons: None,
             };
             let text = run(&ctx, at, &mut |_| {});
             WORLD.with(|w| w.set(core::ptr::null()));
@@ -910,6 +957,7 @@ mod tests {
             base: BASE,
             set: settings(),
             build_name: "40420",
+            cons: None,
         };
         let text = run(&ctx, at, &mut |_| {});
         WORLD.with(|w| w.set(core::ptr::null()));

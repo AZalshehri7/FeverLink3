@@ -369,13 +369,6 @@ fn is_true(v: &bool) -> bool {
     *v
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthorityMessage {
-    pub n: i32,
-    pub values: BTreeMap<String, f64>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResyncSaveMessage {
@@ -502,8 +495,6 @@ pub struct ChecksumReportMessage {
     pub n: i32,
     pub time: i64,
     pub parts: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority: Option<BTreeMap<String, f64>>,
     /// Parts this game could not hash for this round (its registry not read from the loaded state yet, a lane that failed):
     /// unknown, not different. They are not in `parts`; the host does not compare them in this round.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -549,7 +540,7 @@ pub struct ChecksumCost {
 
 impl ChecksumReportMessage {
     pub fn new(n: i32, time: i64, parts: BTreeMap<String, String>) -> Self {
-        Self { n, time, parts, authority: None, not_ready: Vec::new(), cost: None, samples: BTreeMap::new() }
+        Self { n, time, parts, not_ready: Vec::new(), cost: None, samples: BTreeMap::new() }
     }
 }
 

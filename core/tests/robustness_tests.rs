@@ -210,7 +210,6 @@ const KEYS: &[&str] = &[
     "allowed",
     "text",
     "parts",
-    "authority",
     "ok",
     "build",
     "bulldoze",
@@ -529,7 +528,6 @@ fn decode_every_message_type(bytes: &[u8]) {
         PlayerLeftMessage,
         PeerClockMessage,
         ChecksumRequestMessage,
-        AuthorityMessage,
         ResyncSaveMessage,
         ResyncChunkMessage,
         ResyncLoadMessage,
@@ -669,10 +667,6 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             chunk: rr.gen(),
             detail: rr.gen(),
         });
-        round_trip(AuthorityMessage {
-            n: rr.gen(),
-            values: (0..rr.gen_range(0..4)).map(|_| (random_text(rr, 8), finite_f64(rr))).collect(),
-        });
         round_trip(ResyncSaveMessage { id: rr.gen(), name: random_text(rr, 20) });
         round_trip(ResyncChunkMessage {
             id: rr.gen(),
@@ -698,9 +692,6 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             n: rr.gen(),
             time: rr.gen(),
             parts: text_map(rr),
-            authority: rr
-                .gen_bool(0.5)
-                .then(|| (0..rr.gen_range(0..4)).map(|_| (random_text(rr, 8), finite_f64(rr))).collect()),
             not_ready: (0..rr.gen_range(0..3)).map(|_| random_text(rr, 8)).collect(),
             samples: BTreeMap::new(),
             cost: rr.gen_bool(0.5).then(|| ChecksumCost {
@@ -1042,7 +1033,6 @@ fn a_player_survives_a_hostile_host() {
         MessageKind::PlayerJoined,
         MessageKind::PlayerLeft,
         MessageKind::ChecksumRequest,
-        MessageKind::Authority,
         MessageKind::ResyncSave,
         MessageKind::ResyncChunk,
         MessageKind::ResyncLoad,

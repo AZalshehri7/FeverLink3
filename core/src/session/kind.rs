@@ -14,7 +14,7 @@ pub enum MessageKind {
     PlayerJoined = 13,
     PlayerLeft = 14,
     ChecksumRequest = 15,
-    Authority = 16,
+    // 16 was Authority (the host's money values, booked by the players): removed 2026-11-01, a money difference is resynced
     ResyncSave = 17,
     ResyncChunk = 18,
     ResyncLoad = 19,
@@ -70,7 +70,7 @@ pub enum MessageKind {
 
 impl MessageKind {
     /// What a player may send. The host drops anything else, so a player can never pass itself off as the host
-    /// (session state, checksum requests, authority values, resynchronisation).
+    /// (session state, checksum requests, resynchronisation).
     pub const FROM_PLAYER: [MessageKind; 17] = [
         MessageKind::Hello,
         MessageKind::Clock,
@@ -104,7 +104,6 @@ impl MessageKind {
             13 => PlayerJoined,
             14 => PlayerLeft,
             15 => ChecksumRequest,
-            16 => Authority,
             17 => ResyncSave,
             18 => ResyncChunk,
             19 => ResyncLoad,

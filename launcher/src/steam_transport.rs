@@ -41,7 +41,7 @@ use feverlink3_core::crypto::SessionKey;
 use crate::gamelink;
 use crate::net::{
     BulkSendJob, BulkSendResult, BulkSender, ClientTransport, ConnectContext, HostTransport, LinkInfo, NetEvent,
-    ParContext, ParJob, ParProgress, ParSender,
+    NetLimits, ParContext, ParJob, ParProgress, ParSender, ReadPolicy, Throttle,
 };
 use crate::session::{self, par_note, HostConfig, PlayerConfig, SessionHandle};
 use crate::steamnet::bulk::{Limits, Receiver as BulkReceiver};
@@ -132,13 +132,14 @@ fn encode(frame: &Frame) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The frame a received Steam message holds. `Err` says what is wrong with a message that is not exactly one frame.
-fn decode(data: &[u8]) -> Result<Frame, String> {
-    let limit = FrameCodec::LENGTH_FIELD_SIZE + FrameCodec::MAX_FRAME_LENGTH;
+/// The frame a received Steam message holds, of at most `max_length` bytes (header included). `Err` says what is
+/// wrong with a message that is not exactly one such frame.
+fn decode(data: &[u8], max_length: usize) -> Result<Frame, String> {
+    let limit = FrameCodec::LENGTH_FIELD_SIZE + max_length.min(FrameCodec::MAX_FRAME_LENGTH);
     if data.len() > limit {
         return Err(format!("message of {} bytes exceeds the frame limit of {limit} bytes", data.len()));
     }
-    match FrameCodec::try_decode(data) {
+    match FrameCodec::try_decode_limited(data, max_length) {
         Ok(Some((frame, used))) if used == data.len() => Ok(frame),
         Ok(Some((_, used))) => Err(format!("{} bytes follow the frame in one message", data.len() - used)),
         Ok(None) => Err(format!("message of {} bytes is shorter than the frame it announces", data.len())),
@@ -165,6 +166,10 @@ struct Link {
     reason: Mutex<Option<String>>,
     /// The other side's Steam ID when Steam said (0: unknown); parallel bulk connections go to it.
     remote: AtomicU64,
+    /// A frame has come in: until then only a handshake-sized one is taken (host side).
+    delivered: AtomicBool,
+    /// The host's frame budget of this connection (`None`: no limit, the client side).
+    throttle: Mutex<Option<Throttle>>,
 }
 
 impl Link {
@@ -175,6 +180,8 @@ impl Link {
             closed: AtomicBool::new(false),
             reason: Mutex::new(None),
             remote: AtomicU64::new(0),
+            delivered: AtomicBool::new(false),
+            throttle: Mutex::new(None),
         })
     }
 
@@ -220,8 +227,19 @@ struct HostShared {
     links: Mutex<HostLinks>,
     next_id: AtomicU64,
     max_connections: usize,
+    /// The TCP host's limits for what it has not asked for (review 2026-10-31): connections per account (Steam's
+    /// authenticated ID stands for the address), the first frame's size and the frames per second.
+    limits: NetLimits,
     /// Routes the bulk datagrams (the acks of a save being sent) to their transfers.
     hub: Arc<Hub>,
+}
+
+impl HostShared {
+    /// The TCP host's read policy, without its byte rate: Steam's own send rate already paces the bytes, and a
+    /// connection's frames cannot be slowed here, only counted.
+    fn read_policy(&self) -> ReadPolicy {
+        ReadPolicy { bytes_per_second: 0, ..ReadPolicy::of(&self.limits) }
+    }
 }
 
 impl Owner for HostShared {
@@ -231,11 +249,14 @@ impl Owner for HostShared {
         }
         let link = {
             let mut links = lock(&self.links);
-            if links.by_handle.len() >= self.max_connections {
+            let account = remote.unwrap_or(0);
+            let same_account = links.by_handle.values().filter(|l| l.remote.load(Ordering::Acquire) == account).count();
+            if links.by_handle.len() >= self.max_connections || same_account >= self.limits.max_per_address {
                 None
             } else {
                 let link = Link::new(self.next_id.fetch_add(1, Ordering::Relaxed), handle);
-                link.remote.store(remote.unwrap_or(0), Ordering::Release);
+                link.remote.store(account, Ordering::Release);
+                *lock(&link.throttle) = Throttle::new(&self.read_policy(), Instant::now());
                 links.by_handle.insert(handle, Arc::clone(&link));
                 links.by_conn.insert(link.conn, Arc::clone(&link));
                 Some(link)
@@ -259,8 +280,19 @@ impl Owner for HostShared {
         if link.is_closed() {
             return;
         }
-        match decode(data) {
+        // the only frame a stranger can usefully send first is a Join of a few hundred bytes, as on TCP
+        let max_length =
+            if link.delivered.load(Ordering::Acquire) { FrameCodec::MAX_FRAME_LENGTH } else { self.limits.first_frame };
+        match decode(data, max_length) {
             Ok(frame) => {
+                link.delivered.store(true, Ordering::Release);
+                // the poller thread must not wait, so the TCP host's slowing is not possible here: a peer still over
+                // its budget after the longest wait the TCP host would make it take is flooding, and is closed
+                let wait =
+                    lock(&link.throttle).as_mut().map_or(Duration::ZERO, |t| t.admit(data.len(), Instant::now()));
+                if wait >= Throttle::MAX_WAIT {
+                    return link.close(&self.core, "the peer sends frames faster than a player does");
+                }
                 if self.tx.send(NetEvent::Frame { conn: link.conn, frame }).is_err() {
                     link.close(&self.core, "session ended");
                 }
@@ -328,6 +360,7 @@ impl SteamHostNet {
             links: Mutex::new(HostLinks::default()),
             next_id: AtomicU64::new(1),
             max_connections,
+            limits: NetLimits::default(),
             hub: Hub::new(),
         });
         let owner: Arc<dyn Owner> = shared.clone();
@@ -528,7 +561,8 @@ impl Owner for ClientShared {
         if link.is_closed() {
             return;
         }
-        match decode(data) {
+        // what a host sends is the protocol's business (a savegame is megabytes)
+        match decode(data, FrameCodec::MAX_FRAME_LENGTH) {
             Ok(frame) => {
                 if self.tx.send(NetEvent::Frame { conn: self.conn, frame }).is_err() {
                     link.close(&self.core, "session ended");
@@ -1171,6 +1205,9 @@ mod tests {
     #[test]
     fn the_biggest_frames_cross_whole_and_one_byte_more_is_refused_without_closing() {
         let (host, guest) = pair();
+        // the first frame must be handshake-sized (the Join); the big ones follow it
+        guest.net.send(&frame(30, b"join")).expect("guest send");
+        assert_eq!(next_frame(&host.rx, 1).body, b"join");
         // a chunk-sized frame, and the biggest one a Steam message holds
         let chunk_body = vec![0x5Au8; largest_chunk_frame() - FrameCodec::LENGTH_FIELD_SIZE - FrameHeader::SIZE];
         let max_body = vec![0xA5u8; MAX_MESSAGE - FrameCodec::LENGTH_FIELD_SIZE - FrameHeader::SIZE];
@@ -1202,6 +1239,9 @@ mod tests {
     fn violation(bytes: &[u8], to_host: bool) -> String {
         let (host, guest) = pair();
         let (machine, handle) = if to_host {
+            // past the first frame, so the protocol's own limits are the ones tested
+            guest.net.send(&frame(30, b"join")).expect("guest send");
+            assert_eq!(next_frame(&host.rx, 1).body, b"join");
             (&host.machine, host.machine.connections()[0])
         } else {
             (&guest.machine, guest.machine.connections()[0])
@@ -1250,7 +1290,9 @@ mod tests {
         assert!(matches!(next(&a.rx), NetEvent::Opened { .. }) && matches!(next(&b.rx), NetEvent::Opened { .. }));
         let handles = host.machine.connections();
         host.machine.inject(handles[0], b"not a frame at all");
-        assert!(next_closed(&host.rx, 1).contains("exceeds the 1048576 byte limit"));
+        // as a first message its length field is held to a handshake's size
+        let reason = next_closed(&host.rx, 1);
+        assert!(reason.contains(&format!("exceeds the {} byte limit", FrameCodec::HANDSHAKE_MAX_LENGTH)), "{reason}");
         next_closed(&a.rx, 7);
         b.net.send(&frame(30, b"still here")).expect("send");
         assert_eq!(next_frame(&host.rx, 2).body, b"still here");
@@ -1410,6 +1452,53 @@ mod tests {
     }
 
     #[test]
+    fn one_account_gets_the_tcp_hosts_per_address_share_starts_small_and_cannot_flood() {
+        // review 2026-10-31: the Steam host had none of the TCP host's limits
+        let host = host();
+        let per_account = NetLimits::default().max_per_address;
+        let machine = FakeMachine::new();
+        let core = machine.core();
+        let (tx, rx) = mpsc::channel();
+        let nets: Vec<SteamClientNet> = (0..=per_account as u64)
+            .map(|i| connect_to(&core.handle(), host.endpoint(), 100 + i, tx.clone()).expect("connect"))
+            .collect();
+        for i in 0..=per_account as u64 {
+            assert!(matches!(next(&rx), NetEvent::Opened { conn, .. } if conn == 100 + i));
+        }
+        // the one over the share gets through Steam's handshake and is then closed by the host, unseen by the session
+        assert!(next_closed(&rx, 100 + per_account as u64).contains("closed by the other side"));
+        for conn in 1..=per_account as u64 {
+            assert!(matches!(next(&host.rx), NetEvent::Opened { conn: c, .. } if c == conn));
+        }
+        quiet(&host.rx);
+        assert_eq!(host.net.connection_count(), per_account);
+        drop(nets);
+        for _ in 0..per_account {
+            assert!(matches!(next(&host.rx), NetEvent::Closed { .. }));
+        }
+
+        // another account: a first frame bigger than a handshake closes it
+        let big = guest_of(&host, 7);
+        let conn = per_account as u64 + 1;
+        assert!(matches!(next(&host.rx), NetEvent::Opened { conn: c, .. } if c == conn));
+        big.net.send(&frame(30, &vec![0u8; FrameCodec::HANDSHAKE_MAX_LENGTH])).expect("send");
+        assert!(next_closed(&host.rx, conn).contains("exceeds the frame limit"));
+
+        // and one that floods tiny frames far past a player's pace is closed
+        let flood = guest_of(&host, 8);
+        let conn = conn + 1;
+        assert!(matches!(next(&host.rx), NetEvent::Opened { conn: c, .. } if c == conn));
+        let reason = loop {
+            let _ = flood.net.send(&frame(30, b"x"));
+            if let Ok(NetEvent::Closed { conn: c, reason }) = host.rx.try_recv() {
+                assert_eq!(c, conn);
+                break reason;
+            }
+        };
+        assert!(reason.contains("faster than a player"), "{reason}");
+    }
+
+    #[test]
     fn a_connection_that_never_finds_a_host_fails_and_says_why() {
         // nobody listening on the virtual port
         let target = FakeMachine::new();
@@ -1561,6 +1650,9 @@ mod tests {
     #[test]
     fn a_write_that_cannot_be_delivered_closes_the_connection() {
         let (host, mut guest) = pair();
+        // the first frame must be handshake-sized (the Join); the big ones follow it
+        guest.net.send(&frame(30, b"join")).expect("guest send");
+        assert_eq!(next_frame(&host.rx, 1).body, b"join");
         host.machine.stall_receive(true);
         guest.net.set_send_timeout(Duration::from_millis(100));
         let chunk = frame(18, &vec![3u8; 300 * 1024]);

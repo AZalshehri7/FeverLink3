@@ -208,6 +208,12 @@ impl IncomingSave {
         None
     }
 
+    /// The save of round `id` arrived but could not be stored where the game loads it: no longer counted as received,
+    /// so the `ResyncLoad` naming it is refused and the game never loads an older file of the same name.
+    pub fn forget(&mut self, id: i32) {
+        self.done.retain(|(done, _)| *done != id);
+    }
+
     /// Whether a save with this id and hash was received completely and verified.
     pub fn has(&self, id: i32, sha256: &str) -> bool {
         normalize_sha256(sha256).is_some_and(|s| self.done.contains(&(id, s)))

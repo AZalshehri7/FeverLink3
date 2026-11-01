@@ -8,7 +8,12 @@
 //!    and hash containers; the vectors, strings and scalars come from the text through `rebuild`), the engine's copy constructor
 //!    makes the Proposal that will be given away (a self-contained deep copy that owns its blocks), and that copy is written as
 //!    text again and compared with the input: every named member must be equal (the A1 `MATCH` rule). Anything else is refused and
-//!    nothing was handed to the game. Refused too: a text with heap pointers the rebuild cannot resolve.
+//!    nothing was handed to the game. Refused too, by the rebuild before any engine call (the originator's [`text_refusal`] runs the
+//!    same rebuild, so it does not ship such a text): heap pointers the rebuild cannot resolve, an image offset or block reference
+//!    past the image or its block, more bytes than the bound of one build (what it allocates and the scratch it builds that from,
+//!    `MAX_BUILD` in `rebuild`), a hash with entries whose load factor is not 1.0, and an engine container whose links are not its
+//!    own nodes, whose sizes and flags are not numbers of the text, or one of whose nodes or bucket vector a word other than its own
+//!    links points at (`check_containers` in `rebuild`, review 2026-10-31).
 //! 2. The command the mod's script sent (a placeholder of kind `build_proposal`, with the receiver's own conversion of the constructions
 //!    and edge objects): identified as the one that carries the conversion of the mod's own send ([`State`]), then cross-checked against
 //!    the text ([`check_destination`], [`same_build`]).
@@ -57,9 +62,18 @@ pub fn report_file_name(key: u64) -> String {
     format!("native_inject_report_{key}.txt")
 }
 
-/// The text a receiver's mod writes before `inject_next` (atomically: a temporary name, then a rename).
+/// The text a receiver's mod writes and closes before `inject_next`. Deleted once the order is answered
+/// (`Runtime::inject_drop_inputs`), or kept as [`refused_text_file_name`] when it was refused after a command took it.
 pub fn inject_file_name(key: u64) -> String {
     format!("native_inject_{key}.txt")
+}
+
+/// `native_inject_refused_<key>.txt`: the text of an order refused after a command took it (outcome `nothing` / `untouched`),
+/// renamed from [`inject_file_name`] and bounded like the other diagnostic side files (`sidefile`): the receiver's copy is what a
+/// refusal is diagnosed from (friend test 2026-10-16: the refund entry and node layouts in engine.rs were read from a receiver's
+/// `native_inject_4.txt`).
+pub fn refused_text_file_name(key: u64) -> String {
+    format!("native_inject_refused_{key}.txt")
 }
 
 /// The largest side file read.
@@ -493,8 +507,9 @@ fn frozen_of(lines: &std::collections::BTreeMap<&str, &str>, i: u64) -> Result<V
         .collect()
 }
 
-/// R4, INFORMATIONAL ONLY: the unnamed words of `toAdd[i]` that the receiver's own conversion carries (its differential mask on the
-/// donor) against the originator's text (masked the same way before it was written). It never refuses. b51 to b53 refused on it and the
+/// R4, INFORMATIONAL ONLY: the unnamed words of each construction `toAdd[i]` of the originator's text (masked before it was written)
+/// against those of the construction the proof picks for it from the receiver's own conversion ([`donor_take`], not the one at the same
+/// index; masked by the differential mask on the donor). It never refuses. b51 to b53 refused on it and the
 /// differing words changed from run to run (ASCII fragments, `z1` against `w:...`): the differential mask cannot classify bytes that the
 /// engine's copy constructor copies verbatim from the source (the entity's padding is memcpy'd into both scratch copies, so it looks
 /// carried). b45 injected with the donor's unnamed bytes untouched and ran identical on both games, so the engine does not need these
@@ -527,8 +542,21 @@ fn entity_diffs(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) ->
     let donor_text =
         portable::encode_with(c.mem, crate::dump::Env { image_base: c.base }, set, c.build_name, &head, opts)?.text;
     let (theirs, mine) = (rebuild::lines_of(text), rebuild::lines_of(&donor_text));
+    // each of the text's constructions against the conversion's own of the same file and placement, by the pick the proof makes
+    // ([`donor_take`]): a conversion that moves town buildings lists them too, in the engine's order, and paired by index a station
+    // would be compared with a house (review 2026-10-31). The conversion's others are not compared: the injection never takes them.
+    let picks = picks_at(c.mem, donor, &theirs)?;
+    let mine: std::collections::BTreeMap<String, &str> = mine
+        .into_iter()
+        .filter_map(|(p, v)| {
+            let (k, tail) = p.strip_prefix("toAdd[")?.split_once(']')?;
+            let k: usize = k.parse().ok()?;
+            let i = picks.iter().position(|&pk| pk == k)?;
+            Some((format!("toAdd[{i}]{tail}"), v))
+        })
+        .collect();
     let entity = |p: &&str| p.starts_with("toAdd[") && p.contains(".~");
-    let mut paths: Vec<&str> = theirs.keys().chain(mine.keys()).copied().filter(entity).collect();
+    let mut paths: Vec<&str> = theirs.keys().copied().chain(mine.keys().map(String::as_str)).filter(entity).collect();
     paths.sort_unstable();
     paths.dedup();
     let mut diffs = Vec::new();
@@ -549,7 +577,7 @@ fn entity_diffs(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) ->
         }
     }
     say(&format!(
-        "native inject: R4 construction equivalence (INFORMATIONAL, never a refusal): donor residue mask {} carried / {} residue bytes in {} regions ({} ms); {} differing region(s)",
+        "native inject: R4 construction equivalence (INFORMATIONAL, never a refusal): donor residue mask {} carried / {} residue bytes in {} regions ({} ms); the text's construction(s) against the conversion's {picks:?}; {} differing region(s)",
         info.carried,
         info.residue,
         info.regions,
@@ -578,9 +606,12 @@ fn entity_diffs(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) ->
 /// A text that adds constructions needs `donor`, the payload of the script command that carries the receiver's OWN conversion of the same
 /// constructions (same file, parameters, transform): the construction's description is tens of thousands of heap blocks that are not
 /// rebuilt from text. The street part (nodes, segments, node configurations, maps, `frozenNodes`) comes from the text; the engine's
-/// copy constructor makes a copy of the donor's Proposal (read only), its `toAdd` is moved into the engine-made source, and the engine's
-/// copy of that is what is returned; the constructions' `frozenNodes` are then set from the text. The proof compares every named
-/// member, the constructions' too: a conversion that differs from the originator's in a named member is refused.
+/// copy constructor makes a copy of the donor's Proposal (read only) and the text's constructions are taken from it ([`donor_take`]):
+/// its whole `toAdd` is moved into the engine-made source when it holds exactly the text's constructions in the text's order, else
+/// engine copies of the text's ones (picked by file and placement) go into the source's own `toAdd` ([`copy_constructions`]) and the
+/// conversion's others (the town buildings a build moves) die with the donor's copy. The engine's copy of the source is what is
+/// returned; the constructions' `frozenNodes` are then set from the text. The proof compares every named member, the constructions'
+/// too: a conversion that differs from the originator's in a named member is refused.
 ///
 /// Calls the engine through `c` (its Proposal functions, `operator new` through `c.alloc`): never inside `log::guarded`, except as the dry pass
 /// ([`dry_build`]), whose `c` holds stand-ins.
@@ -656,29 +687,55 @@ fn build_proved(
         say("inject: calling the engine copy constructor on the script command's own Proposal (its conversion of the constructions and edge objects)");
         // SAFETY: `donor` is the live command's payload (only read by a copy constructor); `z` is scratch.
         unsafe { (c.fns.copy)(z.ptr(), donor as *const u8) };
-        // Only a member the text adds is taken from the donor. A member the text has none of stays in the donor's copy and dies with it:
-        // the script's conversion adds the town buildings a street build moves or removes to its own toAdd/toRemove, the tool's held
+        // Only what the text adds is taken from the donor: the text is the build, the tool's own Proposal, which is what a single-player
+        // game applies. Everything else of the conversion stays in the donor's copy and dies with it. The script's conversion adds the
+        // town buildings a build moves to its own toAdd (and their old places and the removed ones to its toRemove); the tool's held
         // command does not (friend test 2026-10-21, host 0:22, a bus stop that moves 4 and removes 2 town buildings: the text 0
-        // constructions and 2 edge objects, the script command 4 constructions added and 6 removed). The text is the build; the
-        // swapped-in Proposal carries the text's toRemove, so none of the conversion's own handling of those buildings is kept.
-        let mismatch = DONOR_MEMBERS.iter().zip(&wanted).filter(|(_, &n)| n > 0).find_map(|(m, &n)| {
-            let (b, e) = (u64_at(z.bytes(), m.1), u64_at(z.bytes(), m.1 + 8));
-            let have = if e >= b { (e - b) / m.2 as u64 } else { u64::MAX };
-            (have != n).then(|| format!("the conversion in the script command has {have} {}, the text has {n}", m.0))
-        });
-        // the donated elements move into the source (on a mismatch they stay and die with the donor's copy); the donor's copy keeps empty lists
-        if mismatch.is_none() {
-            let (zb, pb) = (z.bytes_mut(), p.bytes_mut());
-            for (m, _) in DONOR_MEMBERS.iter().zip(&wanted).filter(|(_, &n)| n > 0) {
-                pb[m.1..m.1 + 24].copy_from_slice(&zb[m.1..m.1 + 24]);
-                zb[m.1..m.1 + 24].fill(0);
+        // constructions and 2 edge objects, the script command 4 constructions added and 6 removed). A station or depot that moves
+        // town buildings is folded the same way: the text has 1 construction, the conversion 1 + k. Until the review of 2026-10-31 the
+        // counts had to be equal, so such a build was refused and emptied on every game, the originator's included (the build lost, the
+        // tool told it failed). The swapped-in Proposal carries the text's toRemove and the command keeps the Context the mod gave it
+        // with the originator's flags (`gatherBuildings`): the engine's apply is given what the tool's own command gives it, on every
+        // game alike (that it then moves the town buildings as for the tool's own command is not yet seen in a game). None of the
+        // conversion's own handling of them is kept, on any game.
+        let taking: Result<Vec<Take>, String> = DONOR_MEMBERS
+            .iter()
+            .zip(&wanted)
+            .filter(|(_, &n)| n > 0)
+            .map(|(m, &n)| donor_take(c.mem, z.bytes(), m, n, &lines))
+            .collect();
+        // the donated elements go into the source (on a refusal they stay and die with the donor's copy); a list moved whole leaves the
+        // donor's copy an empty one
+        let given = taking.and_then(|taking| {
+            for t in taking {
+                match t {
+                    Take::Whole(off) => {
+                        let (zb, pb) = (z.bytes_mut(), p.bytes_mut());
+                        pb[off..off + 24].copy_from_slice(&zb[off..off + 24]);
+                        zb[off..off + 24].fill(0);
+                    }
+                    Take::Copies { from, of } => {
+                        // the Copies path also serves a conversion with exactly the text's constructions in another order
+                        let others = match of.saturating_sub(from.len()) {
+                            0 => "the conversion lists the same constructions in another order".to_string(),
+                            n => format!("the other {n} (the town buildings the build moves) stay in the donor's copy"),
+                        };
+                        say(&format!(
+                            "inject: the text's {} construction(s) are the conversion's {:?} of {of}; {others}",
+                            from.len(),
+                            from.iter().map(|&(k, _)| k).collect::<Vec<_>>()
+                        ));
+                        copy_constructions(c, &mut p, &from, say)?;
+                    }
+                }
             }
-        }
+            Ok(())
+        });
         say("inject: calling the engine destructor on the donor's copy");
-        // SAFETY: constructed above, destroyed once; the moved elements now belong to `p`.
+        // SAFETY: constructed above, destroyed once; the moved lists now belong to `p`, the copied elements' sources are still its own.
         unsafe { (c.fns.dtor)(z.ptr()) };
-        if let Some(why) = mismatch {
-            // SAFETY: constructed above, destroyed once.
+        if let Err(why) = given {
+            // SAFETY: constructed above, destroyed once (with whatever was moved or copied into it).
             unsafe { (c.fns.dtor)(p.ptr()) };
             return Err(why);
         }
@@ -735,6 +792,108 @@ fn build_proved(
         blocks: built.blocks,
         r4_report,
     })
+}
+
+/// How [`build_proved`] takes one donor member's elements from the donor's copy.
+enum Take {
+    /// The member's whole list (begin, end, capacity, at this payload offset) moves into the source: the donor's elements are the text's,
+    /// one to one and in the text's order. No element is copied (the path every injection with constructions took before 2026-10-31).
+    Whole(usize),
+    /// Engine copies of these constructions of the donor's copy (index in its `toAdd`, address), in the text's order, go into the
+    /// source's own empty `toAdd` ([`copy_constructions`]); `of`: how many the conversion has (the others stay and die with its copy).
+    Copies { from: Vec<(usize, usize)>, of: usize },
+}
+
+/// Which elements of donor member `m` (the text adds `n` of them) [`build_proved`] takes from the donor's copy `z`; reads only, nothing
+/// is written. The rule is one for every build: the text's elements, nothing else of the conversion.
+///
+/// Constructions are picked by what tells one from another (the same file, the same placement: [`pick_constructions`], the rule of
+/// [`same_constructions`]), each once, in the text's order: the conversion of a station or depot that moves town buildings has the
+/// text's construction and the moved buildings, in an order the engine chooses. Edge objects keep the exact count: no conversion has
+/// been seen to add any (the command must carry the text's number of them, [`check_destination`]), and only the constructions have an
+/// engine copy and vector insert that are verified.
+fn donor_take(
+    mem: &dyn Mem,
+    z: &[u8],
+    m: &(&str, usize, usize),
+    n: u64,
+    lines: &std::collections::BTreeMap<&str, &str>,
+) -> Result<Take, String> {
+    let (b, e) = (u64_at(z, m.1), u64_at(z, m.1 + 8));
+    let have = if e >= b { (e - b) / m.2 as u64 } else { u64::MAX };
+    let counts = || format!("the conversion in the script command has {have} {}, the text has {n}", m.0);
+    if m.1 != TO_ADD {
+        return if have == n { Ok(Take::Whole(m.1)) } else { Err(counts()) };
+    }
+    if have < n || have > PLACE_MAX as u64 || (n > 0 && !pointer_like(b)) {
+        return Err(counts());
+    }
+    let want = text_constructions(lines)?;
+    let conv = constructions_at(mem, b as usize, have as usize)?;
+    let picks = pick_constructions(&conv, &want).map_err(|i| {
+        format!(
+            "the conversion in the script command does not add the text's construction: {}",
+            construction_miss(&conv, &want, i)
+        )
+    })?;
+    if picks.len() == conv.len() && picks.iter().enumerate().all(|(i, &k)| i == k) {
+        return Ok(Take::Whole(TO_ADD));
+    }
+    let from = picks.into_iter().map(|k| (k, b as usize + k * CONSTRUCTION_STRIDE)).collect();
+    Ok(Take::Copies { from, of: conv.len() })
+}
+
+/// Puts engine copies of the donor copy's constructions `from` (in the text's order) into the source's empty `toAdd`, as the engine's
+/// own `emplace_back` does (the asset brush's carrier, `assets::build_into`): the element's copy constructor at the end when the vector
+/// has room, else the vector's insert, which allocates with the game's allocator. Then the source must hold exactly those. Each call is
+/// announced before it is made. On an error the source owns whatever was copied into it (its destructor frees it); the sources stay the
+/// donor copy's own.
+fn copy_constructions(
+    c: &Ctx,
+    p: &mut Scratch,
+    from: &[(usize, usize)],
+    say: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let Some(eng) = c.cons else {
+        return Err(format!(
+            "the conversion in the script command has more constructions than the text (or another order): taking the text's {} needs the engine's ConstructionEntity functions, which are not verified on this game",
+            from.len()
+        ));
+    };
+    let triple =
+        |p: &Scratch| (u64_at(p.bytes(), TO_ADD), u64_at(p.bytes(), TO_ADD + 8), u64_at(p.bytes(), TO_ADD + 16));
+    for (i, &(k, src)) in from.iter().enumerate() {
+        let (b, e, cap) = triple(p);
+        if !sane((b, e, cap), CONSTRUCTION_STRIDE) {
+            return Err(format!("the source's toAdd is not a vector after {i} construction(s) copied into it"));
+        }
+        if e != 0 && e < cap {
+            say(&format!(
+                "inject: calling the engine's ConstructionEntity copy constructor: the text's construction {i} (the conversion's {k}) at the end of the source's toAdd"
+            ));
+            // SAFETY: the vector has room for one more element at `e` (uninitialised); `src` is a constructed element of the donor's copy,
+            // only read; the function is the verified one (or the dry pass's stand-in).
+            unsafe { eng.copy(e as *mut u8, src as *const u8) };
+            p.bytes_mut()[TO_ADD + 8..TO_ADD + 16]
+                .copy_from_slice(&e.saturating_add(CONSTRUCTION_STRIDE as u64).to_le_bytes());
+        } else {
+            say(&format!(
+                "inject: calling the engine's ConstructionEntity vector insert: the text's construction {i} (the conversion's {k}) into the source's toAdd"
+            ));
+            // SAFETY: `p` holds a constructed Proposal whose `toAdd` (at TO_ADD inside the scratch) is a live vector of constructions; `e`
+            // is its end; `src` is a constructed element of the donor's copy, only read; the function is the verified one (or the dry
+            // pass's stand-in).
+            unsafe { eng.insert(p.ptr().add(TO_ADD), e as *mut u8, src as *const u8) };
+        }
+    }
+    let (b, e, cap) = triple(p);
+    if !sane((b, e, cap), CONSTRUCTION_STRIDE) || b == 0 || (e - b) as usize / CONSTRUCTION_STRIDE != from.len() {
+        return Err(format!(
+            "the source's toAdd does not hold the text's {} construction(s) after the engine's copies",
+            from.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Whether [`build_verified`] takes member `f` from the text into the engine-made source: not the members the receiver's own conversion
@@ -1068,7 +1227,8 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_ob
     // the build moves or removes (friend test 2026-10-21, host 0:22: a bus stop whose command added 4 and removed 6 town buildings was
     // passed over as "not a placeholder", the order expired, and the mod's placeholder applied untouched: the engine threw mid-apply
     // and the half-built segment crashed the game a second later). Identity is the place or the constructions ([`same_build`]); which
-    // elements are taken from the conversion is the proof's rule (`build_proved`: the text's members only, their counts exactly).
+    // elements are taken from the conversion is the proof's rule (`build_proved`: the text's elements only; the conversion's moved town
+    // buildings stay in the donor's copy).
     if have < constructions {
         return Err(format!("the command has {have} construction(s), the text has {constructions}{}", shape()));
     }
@@ -1313,10 +1473,59 @@ fn same_construction(have: &Construction, want: &Construction) -> bool {
     have.0 == want.0 && same_transform(&have.1, &want.1).is_ok()
 }
 
-/// The first `n` constructions of the command at `dest` (the caller knows it has that many).
-fn constructions(mem: &dyn Mem, dest: usize, n: usize) -> Result<Vec<Construction>, String> {
-    let bytes = mem.read(dest, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
-    constructions_at(mem, u64_at(&bytes, TO_ADD) as usize, n)
+/// The text's constructions (file and transform), in its order.
+fn text_constructions(lines: &std::collections::BTreeMap<&str, &str>) -> Result<Vec<Construction>, String> {
+    let n = count(lines, "toAdd.#");
+    if n > PLACE_MAX as u64 {
+        return Err(format!("the text has {n} constructions, more than {PLACE_MAX}"));
+    }
+    (0..n as usize)
+        .map(|i| {
+            let file = lines.get(format!("toAdd[{i}].fileName").as_str()).and_then(|v| v.strip_prefix("res:"));
+            let file = file.map(rebuild::unescape).transpose()?.unwrap_or_default();
+            let transf = lines
+                .get(format!("toAdd[{i}].transf").as_str())
+                .and_then(|v| m4_of(v))
+                .ok_or_else(|| format!("construction {i}: the text has no transform"))?;
+            Ok((file, transf))
+        })
+        .collect()
+}
+
+/// For each construction of `want`, in its order, the first construction of `have` not taken yet that is the same one
+/// ([`same_construction`]): the indices into `have`. `have` may hold more (the town buildings a conversion moves) and in another order.
+/// `Err(i)`: `want[i]` has none left.
+fn pick_constructions(have: &[Construction], want: &[Construction]) -> Result<Vec<usize>, usize> {
+    let mut taken = vec![false; have.len()];
+    want.iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let k = (0..have.len()).find(|&k| !taken[k] && same_construction(&have[k], w)).ok_or(i)?;
+            taken[k] = true;
+            Ok(k)
+        })
+        .collect()
+}
+
+/// Why `want[i]` is none of `have` ([`pick_constructions`]), for the log: how far the first construction of the same file stands from
+/// it, or which files `have` adds.
+fn construction_miss(have: &[Construction], want: &[Construction], i: usize) -> String {
+    let w = &want[i];
+    if let Some(h) = have.iter().find(|h| h.0 == w.0) {
+        let how = same_transform(&h.1, &w.1).err().unwrap_or_else(|| "it is taken by another of the text's".into());
+        return format!(
+            "construction {i} ({:?}) stands elsewhere than the text's: {how}",
+            String::from_utf8_lossy(&w.0)
+        );
+    }
+    let files: Vec<String> = have.iter().take(8).map(|h| format!("{:?}", String::from_utf8_lossy(&h.0))).collect();
+    format!(
+        "construction {i} is {:?} in the text; the command adds no construction of that file (its {}: {}{})",
+        String::from_utf8_lossy(&w.0),
+        have.len(),
+        files.join(", "),
+        if have.len() > files.len() { ", ..." } else { "" }
+    )
 }
 
 /// `n` constructions from `b` on (a proposal's `toAdd` begin).
@@ -1338,38 +1547,43 @@ fn constructions_at(mem: &dyn Mem, b: usize, n: usize) -> Result<Vec<Constructio
     Ok(out)
 }
 
+/// For each of the text's constructions, the index of the same one in the `toAdd` of the Proposal at `at` ([`pick_constructions`]):
+/// the pick [`donor_take`] makes on the engine's copy of it, for the informational R4 comparison. Reads only.
+fn picks_at(mem: &dyn Mem, at: usize, lines: &std::collections::BTreeMap<&str, &str>) -> Result<Vec<usize>, String> {
+    let v = mem.read(at + TO_ADD, 24).ok_or("the conversion's toAdd is not readable")?;
+    let t = (u64_at(&v, 0), u64_at(&v, 8), u64_at(&v, 16));
+    if !sane(t, CONSTRUCTION_STRIDE) {
+        return Err("the conversion's toAdd is not a vector".into());
+    }
+    let have = constructions_at(mem, t.0 as usize, ((t.1 - t.0) as usize / CONSTRUCTION_STRIDE).min(PLACE_MAX))?;
+    let want = text_constructions(lines)?;
+    pick_constructions(&have, &want).map_err(|i| construction_miss(&have, &want, i))
+}
+
 /// Every construction of the proposal whose first bytes are `bytes` (its vectors checked first).
 fn constructions_of(mem: &dyn Mem, bytes: &[u8]) -> Result<Vec<Construction>, String> {
     let n = ((u64_at(bytes, TO_ADD + 8) - u64_at(bytes, TO_ADD)) as usize / CONSTRUCTION_STRIDE).min(PLACE_MAX);
     constructions_at(mem, u64_at(bytes, TO_ADD) as usize, n)
 }
 
-/// The command's constructions are the text's: the same file and the same placement ([`same_transform`]), in order. The script
-/// builds them from the originator's record, so the receiver's conversion keeps both (within the float rounding of the record); any
-/// other command that adds constructions (a town's) differs in file or place.
+/// The text's constructions are the command's: each the same file at the same placement ([`same_transform`]) as one of the command's
+/// own, each of the command's matched once ([`pick_constructions`]). The script builds them from the originator's record, so the
+/// receiver's conversion keeps both (within the float rounding of the record); any other command that adds constructions (a town's)
+/// differs in file or place. The command may add more, in any order: the conversion of a station or depot that moves town buildings adds
+/// the moved buildings too (until the review of 2026-10-31 the first constructions had to be the text's, in order). Which of them the
+/// injection takes is the proof's rule ([`build_verified`]: the text's only).
 pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
-    let lines = rebuild::lines_of(text);
-    let n = count(&lines, "toAdd.#") as usize;
-    if n == 0 {
+    let want = text_constructions(&rebuild::lines_of(text))?;
+    if want.is_empty() {
         return Ok(());
     }
-    for (i, (file, transf)) in constructions(mem, dest, n)?.into_iter().enumerate() {
-        let want = lines.get(format!("toAdd[{i}].fileName").as_str()).and_then(|v| v.strip_prefix("res:"));
-        let want = want.map(rebuild::unescape).transpose()?.unwrap_or_default();
-        if file != want {
-            return Err(format!(
-                "construction {i} is {:?}, the text's is {:?}",
-                String::from_utf8_lossy(&file),
-                String::from_utf8_lossy(&want)
-            ));
-        }
-        let Some(want) = lines.get(format!("toAdd[{i}].transf").as_str()).and_then(|v| m4_of(v)) else {
-            return Err(format!("construction {i}: the text has no transform"));
-        };
-        same_transform(&transf, &want)
-            .map_err(|how| format!("construction {i} stands elsewhere than the text's: {how}"))?;
+    let bytes = mem.read(dest, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
+    let t = (u64_at(&bytes, TO_ADD), u64_at(&bytes, TO_ADD + 8), u64_at(&bytes, TO_ADD + 16));
+    if !sane(t, CONSTRUCTION_STRIDE) {
+        return Err("the command's toAdd is not a vector".into());
     }
-    Ok(())
+    let have = constructions_of(mem, &bytes)?;
+    pick_constructions(&have, &want).map(|_| ()).map_err(|i| construction_miss(&have, &want, i))
 }
 
 /// What a command builds, as far as telling one command from another needs: its [`Place`] and its constructions. Two commands with
@@ -1749,7 +1963,8 @@ mod tests {
         let (arena, _, text) = world_text(false);
         assert_eq!(construction_count(&text), 0);
         let mem = Both(&arena);
-        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let poke = ArenaPoke(&arena);
         let (c0, d0, k0) = (CTORS.load(Ordering::SeqCst), DTORS.load(Ordering::SeqCst), COPIES.load(Ordering::SeqCst));
         let mut said = Vec::new();
@@ -1783,7 +1998,8 @@ mod tests {
         assert!(text.contains("toAdd[0].frozenNodes.#\tn:1"), "{text}");
         WORLD.with(|w| w.set(&arena));
         let mem = Both(&arena);
-        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let poke = ArenaPoke(&arena);
         let (c0, d0, k0) = (CTORS.load(Ordering::SeqCst), DTORS.load(Ordering::SeqCst), COPIES.load(Ordering::SeqCst));
         let mut said = Vec::new();
@@ -1844,7 +2060,8 @@ mod tests {
         arena.write(obj as usize, &(-1i32).to_le_bytes());
         arena.write(obj as usize + 8, &(-3i32).to_le_bytes());
         check_destination(&mem, at, 0, 1).expect("the conversion's town building does not make it another command");
-        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         WORLD.with(|w| w.set(&arena));
         let r = build_verified(&ctx, &ArenaPoke(&arena), &text, Some(at), &mut |_| {});
         WORLD.with(|w| w.set(core::ptr::null()));
@@ -1862,11 +2079,119 @@ mod tests {
         release(&ctx, built);
     }
 
+    /// The engine's `ConstructionEntity` functions as the injection calls them: the insert puts the old elements and a byte copy of the
+    /// new one into a new block of the test arena; every element copied is recorded.
+    struct Elements<'a> {
+        arena: &'a Arena,
+        copied: std::cell::RefCell<Vec<usize>>,
+    }
+    impl crate::assets::Engine for Elements<'_> {
+        unsafe fn ctor(&self, _: *mut u8) {}
+        unsafe fn dtor(&self, _: *mut u8) {}
+        unsafe fn copy(&self, dst: *mut u8, src: *const u8) {
+            self.copied.borrow_mut().push(src as usize);
+            self.arena.write(dst as usize, &self.arena.read(src as usize, CONSTRUCTION_STRIDE).unwrap());
+        }
+        unsafe fn insert(&self, vec: *mut u8, _: *mut u8, val: *const u8) {
+            self.copied.borrow_mut().push(val as usize);
+            // SAFETY: the injection passes its own scratch Proposal's toAdd.
+            let t = unsafe { core::ptr::read_unaligned(vec as *const [u64; 3]) };
+            let old =
+                if t[0] == 0 { Vec::new() } else { self.arena.read(t[0] as usize, (t[1] - t[0]) as usize).unwrap() };
+            let all = [old, self.arena.read(val as usize, CONSTRUCTION_STRIDE).unwrap()].concat();
+            let at = self.arena.add(&all) as u64;
+            let end = at + all.len() as u64;
+            // SAFETY: as above.
+            unsafe { core::ptr::write_unaligned(vec as *mut [u64; 3], [at, end, end]) };
+        }
+        unsafe fn resize(&self, _: *mut u8, _: usize) {}
+        unsafe fn push(&self, _: *mut u8, _: *mut u8) {}
+        unsafe fn assign(&self, _: *mut u8, _: *const u8, _: usize) {}
+    }
+
+    #[test]
+    fn a_station_over_town_buildings_takes_its_own_construction_and_leaves_the_moved_ones_in_the_conversion() {
+        // review 2026-10-31: the text (the tool's own Proposal) adds the station; every game's conversion adds the station and the town
+        // building it moves, in the engine's order (here the building first). Until then the proof wanted equal counts, and the build was
+        // refused and emptied on every game.
+        let (arena, at, text) = world_text(true);
+        let begin = u64_at(&arena.read(at + TO_ADD, 8).unwrap(), 0) as usize;
+        let station = arena.read(begin, CONSTRUCTION_STRIDE).unwrap();
+        let mut house = station.clone();
+        let x = 0xc98 + 12 * 4; // the transform's translation x
+        let moved = f32::from_bits(u32_at(&house, x)) + 50.0;
+        house[x..x + 4].copy_from_slice(&moved.to_bits().to_le_bytes());
+        house[0xe3d] = 0x5a; // an unnamed word of the house only: the informational R4 must not pair it with the text's station
+        let two = arena.add(&[house.clone(), station.clone()].concat());
+        let to_add = |b: usize, n: usize| -> Vec<u8> {
+            [b, b + n * CONSTRUCTION_STRIDE, b + n * CONSTRUCTION_STRIDE]
+                .iter()
+                .flat_map(|v| (*v as u64).to_le_bytes())
+                .collect()
+        };
+        arena.write(at + TO_ADD, &to_add(two, 2));
+        let mem = Both(&arena);
+        check_destination(&mem, at, 1, 0).expect("the moved building does not make it another command");
+        same_constructions(&mem, at, &text).expect("the text's construction is the conversion's second");
+        let counts = || [&CTORS, &DTORS, &COPIES, &ASSIGNS].map(|c| c.load(Ordering::SeqCst));
+        let before = counts();
+        let mut dry = Vec::new();
+        let pass = nc::dry_pass("test dry pass", &mem, BASE, settings(), "40420", |c| {
+            let _ = build_verified(c, &nc::DryPoke, &text, Some(at), &mut |l| dry.push(l.to_string()));
+        });
+        assert_eq!(pass, Ok(()));
+        assert!(dry.iter().any(|l| l.contains("vector insert")), "the dry pass takes the same path: {dry:?}");
+        assert_eq!(counts(), before, "with its own stand-ins only");
+        WORLD.with(|w| w.set(&arena));
+        // where the construction functions are not verified the build is refused, and every Proposal made is destroyed once
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
+        let (c0, k0, d0) = (CTORS.load(Ordering::SeqCst), COPIES.load(Ordering::SeqCst), DTORS.load(Ordering::SeqCst));
+        let r = build_verified(&ctx, &ArenaPoke(&arena), &text, Some(at), &mut |_| {});
+        assert!(matches!(&r, Err(e) if e.contains("not verified")), "{:?}", r.err());
+        let made = CTORS.load(Ordering::SeqCst) - c0 + COPIES.load(Ordering::SeqCst) - k0;
+        assert_eq!(made, DTORS.load(Ordering::SeqCst) - d0);
+        // with them: the station's construction alone is copied into the source, the moved building dies with the donor's copy
+        let eng = Elements { arena: &arena, copied: Default::default() };
+        let ctx = Ctx { cons: Some(&eng), ..ctx };
+        let mut said = Vec::new();
+        let r = build_verified(&ctx, &ArenaPoke(&arena), &text, Some(at), &mut |l| said.push(l.to_string()));
+        WORLD.with(|w| w.set(core::ptr::null()));
+        let built = r.expect("proved equal to the text");
+        assert_eq!(built.constructions, 1);
+        assert_eq!(*eng.copied.borrow(), vec![two + CONSTRUCTION_STRIDE], "only the station's construction is copied");
+        assert!(
+            built.r4_report.is_empty(),
+            "R4 compares the station with the conversion's station: {}",
+            built.r4_report
+        );
+        assert!(said.iter().any(|l| l.contains("against the conversion's [1]")), "{said:?}");
+        assert!(said.iter().any(|l| l.contains("the conversion's [1] of 2")), "{said:?}");
+        let p = built.proposal.bytes();
+        let (b, e) = (u64_at(p, TO_ADD) as usize, u64_at(p, TO_ADD + 8) as usize);
+        assert_eq!(e - b, CONSTRUCTION_STRIDE, "the injected Proposal adds one construction");
+        assert_eq!(arena.read(b + 0xc98, 64), Some(station[0xc98..0xcd8].to_vec()), "at the station's place");
+        assert_eq!(
+            arena.read(two, 2 * CONSTRUCTION_STRIDE),
+            Some([house.clone(), station].concat()),
+            "the command is only read"
+        );
+        release(&ctx, built);
+        // a conversion that lacks the text's construction (only the moved building) is refused
+        arena.write(at + TO_ADD, &to_add(two, 1));
+        assert!(same_constructions(&mem, at, &text).unwrap_err().contains("elsewhere"));
+        WORLD.with(|w| w.set(&arena));
+        let r = build_verified(&ctx, &ArenaPoke(&arena), &text, Some(at), &mut |_| {});
+        WORLD.with(|w| w.set(core::ptr::null()));
+        assert!(matches!(&r, Err(e) if e.contains("does not add the text's construction")), "{:?}", r.err());
+    }
+
     #[test]
     fn a_depot_text_without_a_donor_is_refused_and_a_converted_construction_that_differs_is_not_accepted() {
         let (arena, at, text) = world_text(true);
         let mem = Both(&arena);
-        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let poke = ArenaPoke(&arena);
         let c0 = CTORS.load(Ordering::SeqCst);
         let r = build_verified(&ctx, &poke, &text, None, &mut |_| {});
@@ -1971,15 +2296,22 @@ mod tests {
         }
         arena.write(at + 0x258, &t);
         let first = rebuild::lines_of(&text)["toAdd[0].frozenNodes[0]"].to_string();
+        // the second construction is the first one's file at its place (what tells the donor's constructions apart), its own frozenNodes
+        let same: String = text
+            .lines()
+            .filter(|l| l.starts_with("toAdd[0].fileName\t") || l.starts_with("toAdd[0].transf\t"))
+            .map(|l| format!("{}\n", l.replacen("toAdd[0]", "toAdd[1]", 1)))
+            .collect();
         let text2 = |second: &str| {
-            format!("{text}toAdd[1].frozenNodes.#\tn:1\ntoAdd[1].frozenNodes[0]\t{second}\n")
+            format!("{text}{same}toAdd[1].frozenNodes.#\tn:1\ntoAdd[1].frozenNodes[0]\t{second}\n")
                 .replace("toAdd.#\tn:1\n", "toAdd.#\tn:2\n")
         };
         let mem = Both(&arena);
         let alloc = Counting { arena: &arena, held: Default::default(), made: Default::default() };
         let mut f = fns();
         f.dtor = freeing_dtor;
-        let ctx = Ctx { fns: f, alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: f, alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let frozen_triple = |i: usize| two + i * CONSTRUCTION_STRIDE + CONSTRUCTION_FROZEN;
         WORLD.with(|w| w.set(&arena));
         FREED.with(|f| f.borrow_mut().clear());
@@ -2040,7 +2372,8 @@ mod tests {
         let mem = Both(&arena);
         let mut f = fns();
         f.copy = lossy;
-        let ctx = Ctx { fns: f, alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: f, alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let (d0, a0) = (DTORS.load(Ordering::SeqCst), ASSIGNS.load(Ordering::SeqCst));
         let r = build_verified(&ctx, &ArenaPoke(&arena), &text, None, &mut |_| {});
         assert!(matches!(&r, Err(e) if e.contains("differs from the text")), "{:?}", r.err());
@@ -2079,7 +2412,8 @@ mod tests {
             format!("{text}proposal.edgeObjectsToAdd.#\tn:1\n").replace("proposal.edgeObjectsToAdd.#\tn:0\n", "");
         assert_eq!(donor_counts(&stop), vec![1, 0]);
         let mem = Both(&arena);
-        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let c0 = CTORS.load(Ordering::SeqCst);
         let r = build_verified(&ctx, &ArenaPoke(&arena), &stop, None, &mut |_| {});
         assert!(
@@ -2187,7 +2521,8 @@ proposal.new2oldNodes.graph	raw:P w:0000000000000002",
             panic!("{text}")
         };
         let mem = Both(&arena);
-        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let r = build_verified(&ctx, &ArenaPoke(&arena), &broken, None, &mut |_| {});
         let e = r.err().expect("refused");
         let (short, report) = e.split_once(REPORT_MARK).expect("a report follows the reason");
@@ -2208,7 +2543,8 @@ proposal.new2oldNodes.graph	raw:P w:0000000000000002",
         f.copy = lossy;
         let (arena, _, text) = world_text(false);
         let mem = Both(&arena);
-        let ctx = Ctx { fns: f, alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: f, alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let e = build_verified(&ctx, &ArenaPoke(&arena), &text, None, &mut |_| {}).err().expect("refused");
         let (_, report) = e.split_once(REPORT_MARK).expect("a report");
         assert!(
@@ -2217,6 +2553,31 @@ proposal.new2oldNodes.graph	raw:P w:0000000000000002",
                 && report.contains("rebuilt:  n:0"),
             "{report}"
         );
+    }
+
+    #[test]
+    fn a_container_leaving_its_blocks_is_refused_on_every_game_before_any_engine_call() {
+        // review 2026-10-31: the receiver called the engine's constructor and copy constructor on a source built from such a text,
+        // before the proof; the check is the rebuild's, so the originator's text check and every receiver give the same verdict
+        let (arena, _, text) = world_text(false);
+        let hostile = text.replacen(
+            "parcelsMap\tmap:size=0",
+            "parcelsMap\tmap:size=1\nparcelsMap.graph\traw:B90 w:0000000000000001\n@B90\tsize=80\traw:B90 w:0000000012345678 B90 \
+             w:0000000000000101 z6",
+            1,
+        );
+        assert_ne!(hostile, text, "{text}");
+        let why = text_refusal(&hostile, BASE).expect("the originator does not ship it");
+        assert!(why.contains("parcelsMap: the link at @B90+0x8"), "{why}");
+        let live = Both(&arena);
+        assert_eq!(dry_build(&live, BASE, settings(), "40420", &hostile, None), Ok(()), "no panic of ours");
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &live, base: BASE, set: settings(), build_name: "40420", cons: None };
+        let calls = || [&CTORS, &COPIES, &DTORS].map(|c| c.load(Ordering::SeqCst));
+        let before = calls();
+        let e = build_verified(&ctx, &ArenaPoke(&arena), &hostile, None, &mut |_| {}).err().expect("refused");
+        assert!(e.starts_with("the text cannot be built") && e.contains("@B90+0x8"), "{e}");
+        assert_eq!(calls(), before, "no engine stand-in was called");
     }
 
     #[test]
@@ -2541,7 +2902,15 @@ toAdd[0].transf	m4:{t}
             through += 1;
             // the real pass (the engine stand-ins of these tests) on a text the dry pass got through: no panic in our code
             WORLD.with(|w| w.set(&arena));
-            let ctx = Ctx { fns: fns(), alloc: &arena, mem: &live, base: BASE, set: settings(), build_name: "40420" };
+            let ctx = Ctx {
+                fns: fns(),
+                alloc: &arena,
+                mem: &live,
+                base: BASE,
+                set: settings(),
+                build_name: "40420",
+                cons: None,
+            };
             let real = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 build_verified(&ctx, &ArenaPoke(&arena), &text, donor, &mut |_| {}).map(|b| release(&ctx, b))
             }));
@@ -2601,7 +2970,8 @@ toAdd[0].transf	m4:{t}
         let (arena, at, text) = world_text(false);
         let mem = Both(&arena);
         let alloc = Counting { arena: &arena, held: Default::default(), made: Default::default() };
-        let ctx = Ctx { fns: fns(), alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: fns(), alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let donor = own_checks(&mem, at, &text).expect("the held command is the build its text describes");
         assert_eq!(donor, None, "a road needs no donor");
         let held_before = arena.read(at, PAYLOAD_SIZE).unwrap();
@@ -2628,7 +2998,8 @@ toAdd[0].transf	m4:{t}
     fn the_originators_own_proof_of_a_depot_takes_the_constructions_from_its_own_held_command() {
         let (arena, at, text) = world_text(true);
         let mem = Both(&arena);
-        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let donor = own_checks(&mem, at, &text).expect("its constructions are the text's");
         assert_eq!(donor, Some(at), "the donor is the held command the text was written from");
         WORLD.with(|w| w.set(&arena));
@@ -2657,7 +3028,8 @@ toAdd[0].transf	m4:{t}
         let alloc = Counting { arena: &arena, held: Default::default(), made: Default::default() };
         let mut f = fns();
         f.copy = lossy;
-        let ctx = Ctx { fns: f, alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let ctx =
+            Ctx { fns: f, alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420", cons: None };
         let donor = own_checks(&mem, at, &text).unwrap();
         let d0 = DTORS.load(Ordering::SeqCst);
         let why = own_proof(&ctx, &ArenaPoke(&arena), &text, donor, &mut |_| {}).unwrap_err();

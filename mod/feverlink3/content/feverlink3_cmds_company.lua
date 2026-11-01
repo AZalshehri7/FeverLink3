@@ -1077,17 +1077,16 @@ end
 --                               mpfever_bridge.script.lua:3076); its result is not published.
 --   balanceOf(entity)           the account balance of a player entity; nil when infinite or unreadable
 --                               (api.engine.util.finance.getPlayersBalance, gui.zip!gui/game_bar/game_bar.tl:220)
---   bookJournalFor(entity, n, kind)  one journal entry of type `kind` (default OTHER) on that player's account, like the
---                               bridge's bookJournal(amount, kind) does for the savegame's player (the game bar's balance
---                               edit does the same; finding from MPFever (MIT): JournalEntry with time -1 and category
---                               OTHER). Sent with the game's own sendCommand: the operations module owns
+--   bookJournalFor(entity, n, kind)  one journal entry of type `kind` (default OTHER) on that player's account (the game
+--                               bar's balance edit does the same; finding from MPFever (MIT): JournalEntry with time -1 and
+--                               category OTHER). Sent with the game's own sendCommand: the operations module owns
 --                               makeJournalBookAssetCmd, and a booking made here is never a player's action.
 --   lineResult(entity, t0, t1)  income minus running costs of a line between two game times
 --                               (api.engine.util.finance.calculateBalance, gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:626)
 --   monthLength(), yearLength() the game's month and year in game-time units (api.util.getDefaultMonthDuration and
 --                               getDefaultYearDuration, declared in api/tealdef/api/util.d.tl:114-120), for monthly limits
--- And while a local company is set, engine.account and engine.bookJournal (the money the checksum compares and the host
--- corrects) keep reading and booking the savegame's player, not the company the windows act as.
+-- And while a local company is set, engine.account (the money the checksum compares) keeps reading the savegame's player, not
+-- the company the windows act as.
 -- engine.savegamePlayer (set by the bridge from the native module's `interface_player` event, nil without one): the savegame's
 -- player as the module read it from the loaded world. With the native interface player (native iplayer.rs) the interface's own
 -- getPlayer answers the company this game acts as, so the game's getPlayer kept above can no longer say the savegame's player.
@@ -1159,7 +1158,6 @@ function Co.extendEngine(engine, deps)
 			end
 		end
 		if engine.account then engine.account = canonical(engine.account) end
-		if engine.bookJournal then engine.bookJournal = canonical(engine.bookJournal) end
 	end
 	-- Only a line that still exists is read (nil otherwise): a registry entry outlives its line, and its key stays bound to the
 	-- line's old entity id, which is gone or reused by something else. calculateBalance on such an id cost the interface frame

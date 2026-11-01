@@ -290,6 +290,14 @@ fn transfer_gives_up_after_600_seconds() {
     h.host_call(HostSession::tick);
     assert_eq!(ResyncState::Idle, h.host.resync_state());
     assert!(h.failures()[0].contains("transfer"));
+    // the launcher that cannot provide the save fails the round at once (review 2026-10-31); out of turn it is ignored
+    h.host_call(|host| host.start_resync("t"));
+    let id = h.reach_transferring();
+    h.host_call(|host| host.resync_abort(id + 1, "wrong round"));
+    assert_eq!(ResyncState::Transferring, h.host.resync_state());
+    h.host_call(|host| host.resync_abort(id, "disk full"));
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert!(h.failures().iter().any(|f| f.contains("disk full")));
 }
 
 #[test]
@@ -681,6 +689,105 @@ fn a_player_joining_while_files_are_moving_waits_for_the_next_round() {
     assert_eq!(ResyncState::Pausing, h.host.resync_state());
 }
 
+fn clock_at(t: i64, safe: Option<i64>) -> Vec<u8> {
+    json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe, pause: false, stop: None, hop: None })
+}
+
+/// A player joins after the host's game saved and before file_ready: the round's world mod check ran without it, so it is not given
+/// this world (review 2026-10-31: it got the world unchecked). It waits for the next round, whose save checks its mods first.
+/// One that joined during the pause was checked and is a participant; its game's hello from its own later save while the file travels
+/// is not of the save (it was not sent the load yet), so it moves neither the round's pause nor its verify stamp.
+#[test]
+fn a_player_joining_after_the_save_waits_for_the_next_rounds_mod_check() {
+    let (mut h, ids) = Harness::running(1, 1, quiet());
+    h.host_call(|host| host.start_resync("t"));
+    let early = h.connect("Early");
+    let id = h.reach_transferring();
+    let pause_at = h.host.state().pause_at.unwrap();
+    let joiner = h.connect("Joiner");
+    let bytes = blob(600 * 1024);
+    let sha = sha256_hex(&bytes);
+    h.host_call(|host| host.resync_file_ready(id, &sha, bytes.len() as u64));
+    assert_eq!(ResyncState::Transferring, h.host.resync_state());
+    h.player_game(early, MessageKind::Hello, &json(&HelloMessage::new(pause_at + 500_000)));
+    h.player_game(joiner, MessageKind::Hello, &json(&HelloMessage::new(pause_at + 500_000)));
+    assert_eq!(Some(pause_at), h.host.state().pause_at, "its own world's date is not the save's");
+    for (i, chunk) in bytes.chunks(ResyncLimits::CHUNK_SIZE).enumerate() {
+        h.host_call(|host| host.resync_chunk(id, i as u32, chunk));
+    }
+    // a chunk never reaches the game: the assembled save shows what a player was sent
+    assert_eq!(1, h.p(early).saves.len(), "checked at the save: it gets this world");
+    assert_eq!(1, h.p(early).count(MessageKind::ResyncLoad));
+    assert!(h.p(joiner).saves.is_empty(), "no world data before its mods are checked");
+    assert_eq!(0, h.p(joiner).count(MessageKind::ResyncLoad));
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(pause_at)));
+    h.hello_player(ids[0], pause_at, 0);
+    h.hello_player(early, pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert_eq!(pause_at, req.at);
+    report_all(&mut h, &[ids[0], early], req.n, req.at, &[("a", "1")], &[("a", "1")]);
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+    assert_eq!(Some(id + 1), h.host.resync_id(), "the next round checks its mods and brings it the world");
+}
+
+/// A player that joined after file_ready waits for the next round; its game's hello from its own world during Loading makes it ready,
+/// but the verify round neither waits for nor compares it (review 2026-10-31: it failed the repair as "games still differ").
+#[test]
+fn a_pending_joiners_hello_while_the_others_load_is_left_out_of_the_verify_round() {
+    let (mut h, ids) = Harness::running(1, 1, quiet());
+    h.host_call(|host| host.start_resync("t"));
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(1000));
+    let late = h.connect("Late");
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.hello_player(late, pause_at + 500_000, 0);
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(pause_at)));
+    h.hello_player(ids[0], pause_at, 0);
+    assert_eq!(ResyncState::Verifying, h.host.resync_state());
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    h.player_game(late, MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("a", "own")]))));
+    report_all(&mut h, &ids, req.n, req.at, &[("a", "1")], &[("a", "1")]);
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+    assert_eq!(Some(id + 1), h.host.resync_id(), "the next round brings it the session's world");
+}
+
+/// A player connected but not ready (no hello yet) when the host presses Start is outside the host's world: the start runs a round for
+/// it, its own world's clock and promise count nowhere, and a load hello that comes after the round's timeout starts the new player's
+/// round instead of leaving it an outsider (review 2026-10-31).
+#[test]
+fn a_player_not_ready_at_the_start_is_brought_into_the_hosts_world() {
+    let mut h = Harness::new();
+    let guest = h.connect("Guest");
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(10_000)));
+    h.host_game(MessageKind::Clock, &clock_at(10_000, None));
+    h.host_call(HostSession::start);
+    let id = h.host.resync_id().expect("a start round for the game that has not said hello");
+    h.player_game(guest, MessageKind::Hello, &json(&HelloMessage::new(900_000)));
+    h.player_game(guest, MessageKind::Clock, &clock_at(900_000, Some(950_000)));
+    assert!(h.host.future_stamp() < 900_000, "its promise is of another world");
+    assert_eq!(ResyncState::Saving, h.host.resync_state(), "its world is not waited for");
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
+    h.send_file(id, &blob(1000));
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(pause_at)));
+    h.advance(601.0);
+    h.host_call(HostSession::tick);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &[], req.n, req.at, &[("a", "1")], &[]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    h.hello_player(guest, pause_at, 0);
+    assert_eq!(Some(id + 1), h.host.resync_id(), "its late hello gets the new player's round");
+}
+
+/// A second Start of a running session changes nothing (review 2026-10-31: it paused the session or made every guest an outsider).
+#[test]
+fn a_second_start_is_ignored() {
+    let (mut h, _) = Harness::running(1, 2, quiet());
+    h.host_call(HostSession::start);
+    assert_eq!((2, None), (h.host.state().speed, h.host.state().pause_at));
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+}
+
 // ------------------------------------------------------------------ policy in the host
 
 #[test]
@@ -701,16 +808,6 @@ fn without_auto_resync_the_request_is_emitted_and_nothing_starts() {
     checksum_round(&mut h, &ids, Some("roads"));
     checksum_round(&mut h, &ids, Some("roads"));
     assert_eq!(1, h.requests().len());
-    assert_eq!(ResyncState::Idle, h.host.resync_state());
-}
-
-#[test]
-fn money_differences_never_request_a_resync() {
-    let (mut h, ids) = Harness::running(2, 1, quiet());
-    for _ in 0..6 {
-        checksum_round(&mut h, &ids, Some("money"));
-    }
-    assert!(h.requests().is_empty());
     assert_eq!(ResyncState::Idle, h.host.resync_state());
 }
 

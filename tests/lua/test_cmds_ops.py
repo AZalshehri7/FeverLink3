@@ -35,12 +35,11 @@ lupa = T.lupa
 
 OPS_PRELUDE = r'''
 OBJECTS = setmetatable({}, { __mode = "k" })   -- every engine object NEW made
-OPS = { realVehicleInfo = false, priceBuy = 10000, loanSign = 1, drop = nil, refuse = nil, player = 7, strictCmd = false,
+OPS = { realVehicleInfo = false, priceBuy = 10000, drop = nil, refuse = nil, player = 7, strictCmd = false,
   userdataResults = false }
 JOURNAL_LOAN = 2
 MODEL_OFFSET = 0
 MODELS = { "vehicle/bus_red.mdl", "vehicle/bus_blue.mdl", "vehicle/truck.mdl" }
-OPS_ENGINE = {}            -- what the harness hands the bridge as FEVERLINK3_ENGINE: nothing, so its own adapters run
 FAILED, PENDING, LOANS = {}, {}, { obtained = {} }
 TOWNS_STATE, GREEN, MARKETING, SUBS, NOTES = {}, {}, {}, {}, {}
 
@@ -522,9 +521,9 @@ OPS_EXEC.makeJournalBookAssetCmd = function(a, rec)
   assert(a[1] == OPS.player, "player entity expected")
   local e = a[2]
   ACCOUNT.balance = ACCOUNT.balance + e.amount
-  if e.category.type == JOURNAL_LOAN then ACCOUNT.loan = ACCOUNT.loan + OPS.loanSign * e.amount end
+  if e.category.type == JOURNAL_LOAN then ACCOUNT.loan = ACCOUNT.loan + e.amount end
   JOURNAL[#JOURNAL + 1] = e.amount
-  rec.silent = true   -- not listed among the applied commands (the bridge's own corrections are journal entries too)
+  rec.silent = true   -- not listed among the applied commands (a window's booking is a second command of an action)
   return true
 end
 OPS_EXEC.makeGameSetCalendarSpeedCmd = function(a) GAME.calendarSpeed = a[1]; return true end
@@ -554,7 +553,7 @@ OPS_EVENTS = {
       if #LOANS.obtained >= 4 then return end
       local loan = p[2]
       ACCOUNT.balance = ACCOUNT.balance + loan.amount
-      ACCOUNT.loan = ACCOUNT.loan + OPS.loanSign * loan.amount
+      ACCOUNT.loan = ACCOUNT.loan + loan.amount
       LOANS.obtained[#LOANS.obtained + 1] = loan.type .. ":" .. loan.amount
     end,
     Repay = function(p)
@@ -563,7 +562,7 @@ OPS_EVENTS = {
         if l == loan.type .. ":" .. loan.amount then
           table.remove(LOANS.obtained, i)
           ACCOUNT.balance = ACCOUNT.balance - loan.amount
-          ACCOUNT.loan = ACCOUNT.loan - OPS.loanSign * loan.amount
+          ACCOUNT.loan = ACCOUNT.loan - loan.amount
           return
         end
       end
@@ -725,10 +724,7 @@ function ROADS(base, flip)
 end
 '''
 
-# The base harness hands the bridge a FEVERLINK3_ENGINE with a mocked adjustLoan; these tests want the bridge's own.
-_ENGINE_LINE = re.compile(r"env\.FEVERLINK3_ENGINE = \{[^\n]*\}[^\n]*")
-assert len(_ENGINE_LINE.findall(T.HARNESS)) == 1, "test_lockstep.HARNESS changed: update the patch in test_cmds_ops.py"
-OPS_HARNESS = OPS_PRELUDE + _ENGINE_LINE.sub("env.FEVERLINK3_ENGINE = OPS_ENGINE", T.HARNESS)
+OPS_HARNESS = OPS_PRELUDE + T.HARNESS
 
 
 class OpsGame(T.Game):
@@ -1607,13 +1603,7 @@ class FinanceTest(OpsBase):
         game.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "%s", "%s", %s), function(d, s) %s = s end)'
                       % (ident, name, param, var))
 
-    def drift_round(self, n):
-        self.relay.checksum_request(n, self.relay.future_stamp(), False)
-        self.tick(40)
-        self.relay.send_authority(n)
-        self.tick(8)
-
-    def test_loans_marketing_bookings_and_the_hosts_loan_correction(self):
+    def test_loans_marketing_and_bookings(self):
         def loans_marketing_and_bookings():
             self.start()
             self.event(self.B, "Loan", "Obtain", "{ %s, %s }" % (self.FRESH, self.OFFER))
@@ -1664,37 +1654,7 @@ class FinanceTest(OpsBase):
             self.assertEqual((self.A.balance(), self.B.balance()), (1000000 - 12000000 + 5000,) * 2)
             self.agree()
 
-        def loan_drift_corrected():
-            self.start()
-            self.tick(10)
-            self.relay.pump()
-            self.B.L.execute("ACCOUNT.loan = ACCOUNT.loan - 1000")
-            self.drift_round(1)
-            self.assertEqual(self.B.loan(), 250000 - 1000, "one round alone may only be an action still on its way")
-            self.drift_round(2)
-            self.assertEqual(self.B.loan(), 250000, "the same difference twice is a drift: the loan is the host's again")
-            self.assertEqual(self.B.balance(), 1000000, "and the balance was left alone")
-            self.assertEqual(str(self.B.L.eval("table.concat(JOURNAL, ',')")), "1000,-1000", "a LOAN entry and its counter entry")
-            self.assertIn("host authority: loan corrected by 1000", self.B.log())
-            self.assertEqual(self.B.applied(), [], "corrections are not replicated actions")
-
-        def a_correction_the_wrong_way_switches_itself_off():
-            self.start()
-            self.tick(10)
-            self.relay.pump()
-            # an engine whose LOAN entries lower the reported loan: the first correction makes the difference bigger
-            self.B.L.execute("OPS.loanSign = -1; ACCOUNT.loan = ACCOUNT.loan - 1000")
-            self.drift_round(1)
-            self.drift_round(2)
-            self.assertEqual(self.B.loan(), 250000 - 2000)
-            self.drift_round(3)
-            self.drift_round(4)
-            self.assertEqual(self.B.loan(), 250000 - 2000, "no second attempt: the error is not doubled again")
-            self.assertIn("loan correction is off: the loan moved by -1000 after a correction of 1000", self.B.log())
-            self.assertIn("host authority: loan differs but this build cannot correct it", self.B.log())
-            self.assertEqual(str(self.B.L.eval("table.concat(JOURNAL, ',')")), "1000,-1000")
-
-        self.scenarios(loans_marketing_and_bookings, loan_drift_corrected, a_correction_the_wrong_way_switches_itself_off)
+        self.scenarios(loans_marketing_and_bookings)
 
 
 class PermissionTest(OpsBase):
@@ -1711,7 +1671,9 @@ class PermissionTest(OpsBase):
         self.settle()
         self.assertTrue(self.B.L.eval("LOAN_OK == false and SELL_OK == false and NAME_OK == false"), "the windows are told no")
         self.assertTrue(self.B.L.eval("NOTE_OK == true"))
-        self.assertNotIn("Notifications", self.B.log(), "an event nobody replicates is not worth a log line each")
+        # owner decision 2026-11-01: it stays this game's own, logged once a session by name (then counted) so that real sessions show it
+        self.assertEqual(self.B.log().count("Notifications"), 1, "an event nobody replicates is not worth a log line each")
+        self.assertIn("event Notifications/dismiss sent from the script-GUI state", self.B.log())
         self.assertEqual(self.B.actions_shipped(), [])
         self.assertEqual(self.A.applied(), [])
         self.assertEqual(self.B.applied(), ["event:Notifications/dismiss@%d" % int(self.B.L.eval("GAME.applied[1].time"))])

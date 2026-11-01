@@ -522,26 +522,65 @@ end
 -- app.getSavegameInfo(id):get() (Async<SaveGameData>, "Block until the task is complete and then return its result"),
 -- SaveGameData.info.metadata.gameModDescs[i].modId.name (tf3-docs reference/api/app.html, reference/api/api/type:
 -- SaveGameData, GameMetadata, Async; Mod.GameModDesc on reference/api/api/type/mod.html).
-function H.worldMods(appApi, name)
+-- A file the game cannot load (half written, broken) still gives a SaveGameData, with errorMsg set ("Error message if loading
+-- failed (empty string otherwise)", api/tealdef/api/type.d.tl) and most likely no mods: it counts as unreadable, never as a world
+-- without mods (review 2026-10-31).
+-- `before` (optional, H.saveStamps taken earlier): only a save written since then counts, so a file of that name left by an
+-- earlier save is never taken for this one.
+function H.worldMods(appApi, name, before)
 	local ok, ids = pcall(function()
 		local ns = appApi.SaveGameNamespace.getSavegame()
 		for _, s in ipairs(appApi.findAllSavegames(ns) or {}) do
-			if s.saveName == name then
+			if s.saveName == name and not (before and before[tostring(s.path)] == H.saveStamp(s)) then
 				local id = api.type.SavegameId.new()
 				id.path = s.path
 				id.saveGameName = s.saveName
 				id.saveGameNamespace = ns
+				local data = appApi.getSavegameInfo(id):get()
+				if type(data.errorMsg) == "string" and data.errorMsg ~= "" then
+					error("savegame '" .. tostring(name) .. "' cannot be read: " .. data.errorMsg)
+				end
 				local out = {}
-				for _, d in ipairs(appApi.getSavegameInfo(id):get().info.metadata.gameModDescs) do
+				for _, d in ipairs(data.info.metadata.gameModDescs) do
 					out[#out + 1] = tostring(d.modId.name)
 				end
 				return out
 			end
 		end
+		if before then error("no savegame '" .. tostring(name) .. "' written since the click") end
 		error("savegame '" .. tostring(name) .. "' not found")
 	end)
 	if ok then return ids end
 	return nil, tostring(ids)
+end
+
+-- One save's state as SaveGameInfo gives it (timestamp and size in bytes, documented in api/tealdef/api/type.d.tl): a save that
+-- is written again changes at least one of them. Never its path: it may hold the player's account folder.
+function H.saveStamp(s)
+	return tostring(s.timestamp) .. "/" .. tostring(s.size)
+end
+
+-- The state of every save named `name` now, { [path] = H.saveStamp }, or nil and why when the saves cannot be listed. One name can
+-- be there once per savegame folder (a player can have several), so every match is noted, not only the first.
+function H.saveStamps(appApi, name)
+	local ok, res = pcall(function()
+		local out = {}
+		for _, s in ipairs(appApi.findAllSavegames(appApi.SaveGameNamespace.getSavegame()) or {}) do
+			if s.saveName == name then out[tostring(s.path)] = H.saveStamp(s) end
+		end
+		return out
+	end)
+	if ok then return res end
+	return nil, tostring(res)
+end
+
+-- H.saveStamps for the log: the stamps only, sorted, "none" for no save.
+function H.stampsText(stamps)
+	if type(stamps) ~= "table" then return "unknown" end
+	local out = {}
+	for _, st in pairs(stamps) do out[#out + 1] = st end
+	table.sort(out)
+	return #out > 0 and table.concat(out, ", ") or "none"
 end
 
 -- The window's mod lines: a join refused over mods (ctl.mods from the controller: { {block, text}, ... }, blocking ones
@@ -796,9 +835,32 @@ end
 
 -- Saves the world as H.QUIT_SAVE, then quits. `failed(reason)` when a call is refused: the game stays open and nothing is lost.
 -- Returns false when the save could not even start.
+-- The documented callback only says the save "is finished", not that it worked (review 2026-10-31): before quitting,
+-- the save must be found by name and its info read back (H.worldMods, documented calls); if not, the game stays open and the
+-- player is told to save by hand, so a failed save never closes the game on an unsaved world.
+-- The name is fixed, so from the second update on an older feverlink3-restart is already there and a failed save would leave it
+-- to be found: the state of every save of that name is noted before the click (H.saveStamps) and only one that is new or changed
+-- since then counts. The other documented way, app.deleteSavegame before saving, would lose that older save (perhaps the only
+-- copy of an earlier world) whenever this one fails. A listing that fails before the click cannot tell the two apart, so nothing
+-- is saved then.
 function H.saveAndQuit(appApi, log, failed)
+	local before, whyB = H.saveStamps(appApi, H.QUIT_SAVE)
+	if not before then
+		log("save and quit: the saves cannot be listed, a new save could not be told from an older one: " .. tostring(whyB))
+		failed("the world could not be saved")
+		return false
+	end
 	local ok, err = pcall(appApi.saveGame, H.QUIT_SAVE, function()
-		log("save and quit: the world is saved as '" .. H.QUIT_SAVE .. "', quitting the game")
+		local mods, why = H.worldMods(appApi, H.QUIT_SAVE, before)
+		-- timestamp/size before and after, so a game test shows that the fields are filled in
+		local stamps = "saves of that name before: " .. H.stampsText(before)
+			.. "; now: " .. H.stampsText(H.saveStamps(appApi, H.QUIT_SAVE))
+		if not mods then
+			log("save and quit: the save cannot be read back, the game stays open: " .. tostring(why) .. " (" .. stamps .. ")")
+			failed("the world could not be saved")
+			return
+		end
+		log("save and quit: the world is saved as '" .. H.QUIT_SAVE .. "' (" .. stamps .. "), quitting the game")
 		local okQ, errQ = pcall(appApi.quit, false)
 		if not okQ then
 			log("save and quit: app.quit refused: " .. tostring(errQ))

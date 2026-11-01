@@ -76,6 +76,51 @@ impl Runtime {
         *super::lock(&self.inject_dir_path) = Some(dir.to_path_buf());
     }
 
+    /// Deletes the mod's input files (`native_inject_<key>.txt`, `native_refund_<key>.txt`) of every order answered in `events`. An
+    /// order is answered once (`injected` / `inject_refused`), when it has left the queue for good, and the command that took it read
+    /// both files before it was taken ([`Runtime::inject_prepare`]): nothing reads them again. Before, every order left them in the
+    /// session folder for the rest of the run (review 2026-10-31). Terrain and asset orders answer under keys of the same writer's
+    /// count and delete their own file when they read it: for their keys there is nothing here. The text of an order refused after a
+    /// command took it (outcome `nothing` / `untouched`) is renamed into the bounded side files instead
+    /// ([`inj::refused_text_file_name`]): the receiver's copy is what such a refusal is diagnosed from. Service thread only (file calls).
+    pub(super) fn inject_drop_inputs(&self, events: &[Event]) {
+        let Some(dir) = super::lock(&self.inject_dir_path).clone() else { return };
+        // a missing file is the normal case (terrain and asset keys, an order without refund entries); any other failure (a file a
+        // scanner holds) reaches native.log, else the file stays in the folder unseen
+        let failed = |key: u64, what: &str, name: &str, e: std::io::Error| {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                self.say(&format!("native inject: key {key}: cannot {what} {name}: {e}"));
+            }
+        };
+        let took = [inj::Outcome::Nothing, inj::Outcome::Untouched].map(inj::Outcome::as_str);
+        for e in events {
+            let (key, keep) = match e {
+                Event::Injected { key, .. } => (*key, false),
+                Event::InjectRefused { key, outcome, .. } => (*key, took.contains(outcome)),
+                _ => continue,
+            };
+            if key == 0 {
+                continue;
+            }
+            let text = inj::inject_file_name(key);
+            if keep {
+                let name = inj::refused_text_file_name(key);
+                match self.side_files.rename("refused_text", &dir, &text, &name) {
+                    Ok(()) => {
+                        self.say(&format!("native inject: key {key}: the refused order's text is kept as {name}"))
+                    }
+                    Err(e) => failed(key, "keep", &text, e),
+                }
+            } else if let Err(e) = std::fs::remove_file(dir.join(&text)) {
+                failed(key, "delete", &text, e);
+            }
+            let refund = crate::refund::file_name(key);
+            if let Err(e) = std::fs::remove_file(dir.join(&refund)) {
+                failed(key, "delete", &refund, e);
+            }
+        }
+    }
+
     /// The switch is on and the prerequisites hold (this layout's build, the engine's Proposal functions, the allocator's prologues):
     /// the `ready` event then lists `inject_next`.
     pub(super) fn inject_ready(&self) -> bool {
@@ -163,9 +208,9 @@ impl Runtime {
             let fns = self.proposal_fns().map_err(|why| format!("{}{why}", inj::OWN_PROOF))?;
             let alloc = EngineAlloc::at(self.base, &self.build.engine)
                 .map_err(|why| format!("{}the game's allocator was not verified: {why}", inj::OWN_PROOF))?;
-            Ok((donor, fns, alloc))
+            Ok((donor, fns, alloc, self.construction_fns(text)))
         });
-        let (donor, fns, alloc) = match ready {
+        let (donor, fns, alloc, cons) = match ready {
             Some(r) => r?,
             None => return Err(format!("{}our own check panicked (the PANIC line in native.log)", inj::OWN_PROOF)),
         };
@@ -179,6 +224,7 @@ impl Runtime {
             base: self.base,
             set: settings,
             build_name: self.build.layout_name(),
+            cons: cons.as_ref().map(|f| f as &dyn crate::assets::Engine),
         };
         let mut say = |l: &str| self.say(l);
         inj::own_proof(&ctx, &super::cmd_patch::LivePoke, text, donor, &mut say)
@@ -550,6 +596,17 @@ impl Runtime {
         used
     }
 
+    /// The engine's `ConstructionEntity` functions (the asset brush's verified set) when `text` adds constructions: the injection copies
+    /// the text's constructions out of a conversion that adds more (the town buildings a station or depot moves) with them. `None` when
+    /// the text adds none or they are not verified on this game (such a conversion is then refused, on every game of this build alike).
+    /// Reads only.
+    fn construction_fns(&self, text: &str) -> Option<super::assets::AssetFns> {
+        if inj::construction_count(text) == 0 {
+            return None;
+        }
+        super::assets::AssetFns::at(self.base, &self.build.engine).ok()
+    }
+
     /// The engine's Proposal functions; a test sets stand-ins (`TEST_FNS`).
     fn proposal_fns(&self) -> Result<nc::ProposalFns, String> {
         #[cfg(test)]
@@ -734,7 +791,7 @@ impl Runtime {
                 };
                 if let (Some(report), Some(dir)) = (report, super::lock(&self.inject_dir_path).clone()) {
                     let name = inj::report_file_name(order.key);
-                    match std::fs::write(dir.join(&name), &report) {
+                    match self.side_files.write("refused", &dir, &name, &report) {
                         Ok(()) => self.say(&format!("native inject: key {}: full report in {name}", order.key)),
                         Err(e) => self.say(&format!("native inject: key {}: cannot write {name}: {e}", order.key)),
                     }
@@ -820,6 +877,8 @@ impl Runtime {
         let mut adopted = None;
         let done = {
             let mut machine = super::lock(&self.machine);
+            // a deferred command of an earlier world never takes a result of this one (review 2026-10-31)
+            self.drop_old_world(&mut machine);
             // SAFETY: `cmd` is the command the apply function was just called with; the held command is only touched under this lock.
             let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
             machine.complete(held, ok, |h| adopted = Some(unsafe { engine::adopt_result(h, cmd) }))
@@ -892,9 +951,10 @@ impl Runtime {
         let alloc = EngineAlloc::at(self.base, &self.build.engine)
             .map_err(|why| format!("the game's allocator was not verified: {why}"))?;
         let donor = counts.iter().any(|&n| n > 0).then_some(dest);
+        let cons = self.construction_fns(&text);
         let refund = if refund > 0 { Some(self.refund_job(key, refund, &dir, dest)?) } else { None };
         let window = crate::refund::window_of(&text).map_err(|e| format!("refund: {e}"))?;
-        Ok(Prepared { fns, alloc, settings, dir, text, donor, refund, window })
+        Ok(Prepared { fns, alloc, cons, settings, dir, text, donor, refund, window })
     }
 
     /// The refund part of an order (owner decision 2026-10-18: the bulldoze refund natively, `refund.rs`): the side file's entries,
@@ -953,7 +1013,7 @@ impl Runtime {
     /// command (copy assignment) and destroyed. Not inside `log::guarded`, so that an exception of the engine reaches the game's own
     /// handler; the reports in between, which call nothing of the engine, are guarded.
     fn inject_engine(&self, key: u64, dest: usize, p: Prepared) -> Result<(u64, u64, u64), String> {
-        let Prepared { fns, alloc, settings, dir, text, donor, refund, window } = p;
+        let Prepared { fns, alloc, cons, settings, dir, text, donor, refund, window } = p;
         let live = LiveMem;
         let ctx = nc::Ctx {
             fns,
@@ -962,21 +1022,26 @@ impl Runtime {
             base: self.base,
             set: settings,
             build_name: self.build.layout_name(),
+            cons: cons.as_ref().map(|f| f as &dyn crate::assets::Engine),
         };
         let mut say = |l: &str| self.say(l);
         let built = inj::build_verified(&ctx, &super::cmd_patch::LivePoke, &text, donor, &mut say);
         alloc.free_all();
         let built = built?;
         let stats = (built.nodes, built.segments, built.constructions);
+        // A successful injection's dumps (the R4 report, the donor, final and diff texts) are for the lab only: written on every
+        // build they filled the session folder without bound (review 2026-10-31). They follow the dev dump switches; a refusal's
+        // report, the case someone needs to read, is always written (`inject_finish`).
+        let dev = self.dump.get().is_some() || self.portable.get().is_some();
         crate::log::guarded("native inject: reports", || {
-            if !built.r4_report.is_empty() {
+            if dev && !built.r4_report.is_empty() {
                 let name = inj::report_file_name(key);
-                match std::fs::write(dir.join(&name), &built.r4_report) {
+                match self.side_files.write("r4", &dir, &name, &built.r4_report) {
                     Ok(()) => self.say(&format!("native inject: key {key}: informational R4 report in {name}")),
                     Err(e) => self.say(&format!("native inject: key {key}: cannot write {name}: {e}")),
                 }
             }
-            if donor.is_some() {
+            if dev && donor.is_some() {
                 self.inject_donor_report(key, dest, &text, &built, &dir);
             }
         });
@@ -1031,7 +1096,7 @@ impl Runtime {
             portable::encode(&live, Env { image_base: self.base }, settings, self.build.layout_name(), &head)
                 .map(|p| p.text)
         };
-        let write = |name: String, body: &str| match std::fs::write(dir.join(&name), body) {
+        let write = |kind: &'static str, name: String, body: &str| match self.side_files.write(kind, dir, &name, body) {
             Ok(()) => self.say(&format!("native inject: key {key}: wrote {name} ({} bytes)", body.len())),
             Err(e) => self.say(&format!("native inject: key {key}: cannot write {name}: {e}")),
         };
@@ -1045,18 +1110,19 @@ impl Runtime {
                     diff.len() - named
                 ));
                 write(
+                    "diff",
                     format!("native_inject_diff_{key}.txt"),
                     &diff.join(
                         "
 ",
                     ),
                 );
-                write(format!("native_inject_donor_{key}.txt"), &donor);
+                write("donor", format!("native_inject_donor_{key}.txt"), &donor);
             }
             Err(e) => self.say(&format!("native inject: key {key}: the donor cannot be written as text: {e}")),
         }
         if let Ok(fin) = encode(built.proposal.addr(), "final") {
-            write(format!("native_inject_final_{key}.txt"), &fin);
+            write("final", format!("native_inject_final_{key}.txt"), &fin);
         }
     }
 }
@@ -1107,6 +1173,8 @@ struct TextJob {
 struct Prepared {
     fns: nc::ProposalFns,
     alloc: EngineAlloc,
+    /// The engine's `ConstructionEntity` functions, for a text with constructions (`None`: no constructions, or not verified here).
+    cons: Option<super::assets::AssetFns>,
     settings: portable::Settings,
     dir: std::path::PathBuf,
     text: String,

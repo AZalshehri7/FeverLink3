@@ -56,18 +56,10 @@ fn identical_outcomes_never_request() {
 }
 
 #[test]
-fn money_is_never_a_reason_even_forever() {
+fn a_balance_difference_does_not_hide_other_differences() {
     let mut p = policy();
-    for t in 0..200 {
-        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0, &outcome(&["money"])));
-    }
-}
-
-#[test]
-fn money_does_not_hide_other_differences() {
-    let mut p = policy();
-    assert_eq!(None, p.on_outcome(0.0, &outcome(&["money", "roads"])));
-    assert!(p.on_outcome(10.0, &outcome(&["roads", "money"])).is_some());
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["balance", "roads"])));
+    assert!(p.on_outcome(10.0, &outcome(&["roads", "balance"])).is_some());
 }
 
 #[test]
@@ -75,9 +67,14 @@ fn drift_parts_are_the_named_ones_and_script_prefixed_ones() {
     for part in ["vehicles", "onboard", "persons", "stocks", "nodeConfigs", "script:trains", "script:"] {
         assert!(ChecksumPolicy::is_drift_part(part), "{part}");
     }
-    for part in ["roads", "lines", "money", "scripts", "Vehicles", "constructions", "townBuildings", "townBuildings:12"]
+    for part in
+        ["roads", "lines", "money", "scripts", "Vehicles", "constructions", "townBuildings", "townBuildings:12", "balance", "loan"]
     {
         assert!(!ChecksumPolicy::is_drift_part(part), "{part}");
+    }
+    // the id-binding parts of the heavy lanes: ordinary, and heavy (not measured in a light round)
+    for part in ["edges@ids", "constructions@ids", "townBuildings@ids"] {
+        assert!(!ChecksumPolicy::is_drift_part(part) && ChecksumPolicy::is_heavy_part(part), "{part}");
     }
 }
 
@@ -193,7 +190,9 @@ fn a_waiting_repair_is_cancelled_by_a_full_round_that_finds_the_worlds_equal() {
     assert!(p.pending().is_some());
     assert_eq!(None, p.on_outcome(50.0, &not_ready(&[], &["edges"])), "an unmeasured part proves nothing");
     assert!(p.pending().is_some());
-    assert_eq!(None, p.on_outcome(60.0, &outcome(&["balance"])), "money is corrected in place");
+    assert_eq!(None, p.on_outcome(55.0, &outcome(&["balance"])));
+    assert!(p.pending().is_some(), "a money difference is not equal worlds");
+    assert_eq!(None, p.on_outcome(60.0, &outcome(&[])), "a full round with no difference");
     assert_eq!(None, p.pending());
     assert_eq!(None, p.due(200.0));
 }
@@ -240,8 +239,8 @@ fn the_wider_lanes_are_classified_and_named_in_the_difference_message() {
         assert!(!ChecksumPolicy::is_drift_part(part), "{part}");
     }
     assert_eq!(
-        "stations, vehicles (drift), money (corrected), edges",
-        ChecksumPolicy::describe_parts(["stations", "vehicles", "money", "edges"])
+        "stations, vehicles (drift), balance, edges",
+        ChecksumPolicy::describe_parts(["stations", "vehicles", "balance", "edges"])
     );
     let mut p = policy();
     assert_eq!(None, p.on_outcome(0.0, &outcome(&["vehicles"])));
@@ -255,17 +254,15 @@ fn the_wider_lanes_are_classified_and_named_in_the_difference_message() {
 }
 
 #[test]
-fn a_difference_in_balance_or_loan_is_corrected_in_place_and_never_reloads() {
+fn a_money_difference_in_two_checks_in_a_row_is_repaired_and_one_round_is_not() {
+    // owner decisions 2026-11-01 (review 2026-10-31): money is no longer booked to the host's value; it is an ordinary part
     let mut p = policy();
-    for t in 0..6 {
-        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0, &outcome(&["balance"])), "balance round {t}");
-        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0 + 5.0, &outcome(&["loan", "balance"])), "loan round {t}");
-    }
-    // another part next to the money still counts, and the money is left out of the reason
-    p.on_outcome(100.0, &outcome(&["balance", "roads"]));
-    let reason = p.on_outcome(110.0, &outcome(&["balance", "roads"])).expect("roads differ twice");
-    assert!(reason.starts_with("roads differ"), "{reason}");
-    assert!(ChecksumPolicy::describe_parts(["balance"]).contains("(corrected)"));
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["balance"])), "one round can round a .5 differently");
+    assert_eq!(None, p.on_outcome(10.0, &outcome(&[])), "a clean round resets the count");
+    assert_eq!(None, p.on_outcome(20.0, &outcome(&["loan"])));
+    let reason = p.on_outcome(30.0, &outcome(&["balance", "loan"])).expect("a lasting money difference is repaired");
+    assert!(reason.starts_with("balance, loan differ in 2 checks in a row"), "{reason}");
+    assert!(!ChecksumPolicy::describe_parts(["balance"]).contains("(drift)"));
 }
 
 fn light(parts: &[&str]) -> ChecksumOutcome {

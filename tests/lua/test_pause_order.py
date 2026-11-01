@@ -283,6 +283,18 @@ class PausedBuildTest(I.InjectTest):
             self.assertSameAndNotLate()
             self.assertGreater(self.A.time(), p + 10 * STEP, "and the games run on afterwards")
 
+        def self_check_fails():
+            # the record the simulation half makes of the slot's build fails its own self-check: not shipped, the slot given up, and the
+            # one repair request goes under the slot's key, which X.slotGiveUp and the ledger use too (one build, one request)
+            paused(0, 3)
+            self.texts(I.road_text_naming(I.UNBUILDABLE_NODE, (300.0, 0.0, 0.0)), I.road_text())
+            build_without_record(self.A)
+            self.tick(23)
+            self.assertIn("native build self-check FAILED", self.A.log())
+            self.assertIn("NOT shipped: its own self-check failed", self.A.log())
+            self.assertEqual([g for g, d in self.relay.replay_failed], [0], self.relay.replay_failed)
+            self.assertIn("build 0:1 differs on this game: a build applied on its originator only", self.relay.replay_failed[0][1])
+
         def no_hold_caught(over_host, over_client):
             # real session 2026-10-23, 1:399: a native build the hold did not catch (here an Add that is not a tool's) is applied by its
             # engine where its game stands; it was stamped at the pause stamp, 553 steps before every game (PAUSE LATE, a resync). Now it
@@ -315,6 +327,7 @@ class PausedBuildTest(I.InjectTest):
         self.cases([("the host's build, the client further on", {}, hosts_build), ("the client's build, the host further on", {}, clients_build),
                     ("a later build of the pause waits for the slot", {}, a_later_build_waits_for_the_slot),
                     ("the resume waits for the record of an open slot", {}, the_resume_waits),
+                    ("its record fails its own self-check", {}, self_check_fails),
                     ("a native build no hold caught, both games past the pause", {}, lambda: no_hold_caught(2, 2)),
                     ("a native build no hold caught, the other game behind", {}, lambda: no_hold_caught(3, 0)),
                     ("outside a pause: released at the click", {}, outside_a_pause)])

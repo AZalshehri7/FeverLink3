@@ -46,6 +46,8 @@ api = {
     makeScriptingSendEventCmd = function(a, b, c, d) return { kind = "event", a, b, c, d } end,
     makeLineCreateCmd = function(...) return { kind = "line", ... } end,
     makeWorldBuildProposalCmd = function(...) return { kind = "build", ... } end,
+    makeCreateIndustryExtendProposalCmd = function(...) return { kind = "extend", ... } end,
+    makeWorldChangeWindCmd = function(...) return { kind = "wind", ... } end,
   },
   type = {},
 }
@@ -98,24 +100,38 @@ class UiHookTest(unittest.TestCase):
         self.lua.execute("local id, ok, e, key = ...; local w = C.newWriter(C.path('ui_in.log'), 1); "
                          "C.writerSend(w, 'result', { id = id, key = key, success = ok, e = e })", id, success, e, key)
 
-    def test_outside_a_session_and_for_what_nobody_replicates_every_command_reaches_the_engine_untouched(self):
+    def test_outside_a_session_everything_and_in_one_only_local_commands_reach_the_engine_unheld(self):
         self.runtime(session=False)
         self.assertTrue(self.lua.eval("Hook.install()"), "installed in live mode, inert until a session is on")
         self.lua.execute('api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(2))')
         self.lua.execute('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, {} }))')
-        self.assertEqual((2, []), (self.sent(), self.records()), "both reach the game")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldChangeWindCmd(3)); api.cmd.sendCommand({ kind = 'debug' })")
+        self.assertEqual((4, []), (self.sent(), self.records()), "all reach the game, with a schema or without")
         self.runtime()
         self.lua.execute("Hook.install()")
-        # an event nobody replicates, and a build the script marks as not the player's
+        # an event nobody replicates, and a query that changes nothing in the world (L.LOCAL_COMMANDS)
         self.lua.execute('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Tutorial", "Step", {}))')
-        self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({}, nil, false, false))")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeCreateIndustryExtendProposalCmd(9, 0, 1), function(d, s) EXT = s end)")
         self.assertEqual((2, []), (self.sent(), self.records()))
+        self.assertTrue(self.lua.eval("EXT == true"), "the industry window gets the engine's answer at once")
+        with self.subTest("in a session, what no schema replicates is refused here too and logged by name"):
+            # review 2026-10-31: a command without a schema, one made by no wrapped factory (the debug panel's) and a build the
+            # script marks as not the player's went to the engine on this game alone, and nothing replicated them: a silent fork
+            self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldChangeWindCmd(3), function(d, s) WIND = s end)")
+            self.lua.execute("api.cmd.sendCommand({ kind = 'debug' }, function(d, s) RAW = s end)")
+            self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({}, nil, false, false), function(d, s) NOPI = s end)")
+            self.assertEqual(2, self.sent(), "none reaches the engine")
+            self.assertTrue(self.lua.eval("WIND == false and RAW == false and NOPI == false"), "each window is told no")
+            self.assertEqual([("action_not_shared", "makeWorldChangeWindCmd"), ("action_not_shared", None), ("action_not_shared", "makeWorldBuildProposalCmd")],
+                             [(r[1]["msg"], r[1]["cmd"]) for r in self.records()])
+            with open(os.path.join(self.tmp, "mod.log"), encoding="utf-8") as f:
+                self.assertIn("command makeWorldChangeWindCmd is REFUSED", f.read())
         with self.subTest("a player's build a mod's script sends: held by the API layer, or handed to the native net"):
             # real session 2026-10-26: the bus and truck bay mod's upgrade tool sent its build with api.cmd.sendCommand in this state; it went
             # to the engine at the click (applied there 3 steps before the other games: a free-id fork). Now the API layer holds it.
             self.runtime()
             self.fake_cmds(makeWorldBuildProposalCmd='{ category = "build", encode = function(_, args) if args[1].bad then return nil, "no model yet" end '
-                                                     'return { fn = "makeWorldBuildProposalCmd", args = { { segs = 1 }, {}, false, true } } end }')
+                                                     'return { fn = "makeWorldBuildProposalCmd", args = { { segs = 1 }, {}, false, args[4] == true } } end }')
             self.lua.execute("Hook.install()")
             self.lua.execute("PROPOSAL = {}; api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd(PROPOSAL, 'ctx', false, true), function(d, s, e) BUILT = { d, s } end)")
             recs = self.records()
@@ -132,6 +148,13 @@ class UiHookTest(unittest.TestCase):
                              "H.writeSnapshot(C, h, {}); local real = os.clock; os.clock = function() return real() + 5 end; "
                              "api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({ bad = true }, nil, false, true)); os.clock = real")
             self.assertEqual(1, self.sent(), "the native safety net holds it at the command list")
+            # playerInitiated false: held the same way with its flag, but never handed to the native net, which lets that flag pass
+            self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({}, nil, true, false))")
+            rec = self.records()[-1]
+            self.assertEqual("cmd", rec[0])
+            self.assertFalse(self.lua.eval("function(s) return C.parse(s) end")(rec[1]["body"])["args"][4], "the record keeps the flag")
+            self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({ bad = true }, nil, true, false))")
+            self.assertEqual((1, "notice"), (self.sent(), self.records()[-1][0]))
 
     def test_a_window_command_waits_for_its_stamp_apply_and_hears_its_result_once(self):
         # the originator applies a window command at its stamp like every other game: not at the click (that shifted the engine's

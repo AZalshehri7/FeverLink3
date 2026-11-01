@@ -37,9 +37,9 @@ use feverlink3_core::session::mods::{self, ModFingerprint};
 use feverlink3_core::session::{
     codec, sha256_hex, ChecksumOutcome, ChecksumPolicy, CollectedReport, ConnectionState, HostOptions, HostOutput,
     HostReportEvent, HostSession, Lockstep, MessageKind, PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage,
-    PlayerOutput, PlayerReportEvent, PlayerSession, PlayerState, ReportAskMessage, ResumeTicket, ResyncChunkMessage,
-    ResyncLimits, ResyncSaveMessage, ResyncState, RosterEntry, SaveDoneMessage, SessionState, CAP_BULK_DGRAM,
-    CAP_BULK_PAR, CAP_RESYNC_SOURCE,
+    PlayerOutput, PlayerReportEvent, PlayerSession, PlayerState, ReplayFailedMessage, ReportAskMessage, ResumeTicket,
+    ResyncChunkMessage, ResyncLimits, ResyncLoadMessage, ResyncSaveMessage, ResyncState, RosterEntry, SaveDoneMessage,
+    SessionState, CAP_BULK_DGRAM, CAP_BULK_PAR, CAP_RESYNC_SOURCE,
 };
 
 use crate::gamelink::{self, Line};
@@ -92,14 +92,13 @@ const fn row(name: &'static str, kind: MessageKind, to_game: bool, from_game: bo
 /// The complete mapping, `docs/PROTOCOL.md` kinds to file-link kinds (documented in `launcher/README.md`).
 /// Names are the snake_case of the message kind, except `peerclock`, which is what the mod already reads.
 /// `resync_chunk` never goes to the game: the launcher streams savegame chunks to disk itself.
-pub const LINE_KINDS: [LineKind; 22] = [
+pub const LINE_KINDS: [LineKind; 21] = [
     row("welcome", MessageKind::Welcome, true, false),
     row("session", MessageKind::Session, true, false),
     row("peerclock", MessageKind::PeerClock, true, false),
     row("player_joined", MessageKind::PlayerJoined, true, false),
     row("player_left", MessageKind::PlayerLeft, true, false),
     row("checksum_request", MessageKind::ChecksumRequest, true, false),
-    row("authority", MessageKind::Authority, true, false),
     row("resync_save", MessageKind::ResyncSave, true, false),
     row("resync_load", MessageKind::ResyncLoad, true, false),
     row("permissions", MessageKind::Permissions, true, false),
@@ -591,14 +590,24 @@ pub fn with_checksum_part(payload: Vec<u8>, name: &str, value: &str) -> Vec<u8> 
 
 /// New messages from the game, in file order. Lines that cannot be translated are logged and skipped.
 fn read_from_game(link: &mut gamelink::Session, shared: &Shared) -> Vec<(MessageKind, Vec<u8>)> {
-    let lines = match link.poll() {
+    let polled = link.poll();
+    let mut out = Vec::new();
+    if link.take_lost() > 0 {
+        // Lines of from_game.log deleted before this launcher read them (it fell behind every kept generation; the tail went
+        // on at the oldest one still there). They were this game's messages, its actions among them, which it applied at their
+        // stamps while no other game ever gets them: the worlds forked, so the host is asked for the repair at once, the way the
+        // mod asks when its own reader loses lines of to_game.log (review 2026-10-31). The host's cooldown paces repeated asks.
+        let detail = "from_game.log lines were deleted before the launcher read them: messages of this game never reached the session";
+        shared.log(format!("{detail}; asking the host for a repair"));
+        out.push((MessageKind::ReplayFailed, codec::encode(&ReplayFailedMessage { detail: detail.to_owned() })));
+    }
+    let lines = match polled {
         Ok(l) => l,
         Err(e) => {
             shared.log(format!("cannot read from_game.log: {e}"));
-            return Vec::new();
+            return out;
         }
     };
-    let mut out = Vec::new();
     for line in lines {
         match from_game_line(&line) {
             Ok(mut m) => {
@@ -674,6 +683,7 @@ pub fn run_host_over<T: HostTransport + Sync>(
     // the first status already lists the host's own game
     refresh_host_status(&host, &net, &shared);
     shared.log(format!("listening on {}", net.describe()));
+    prune_resync_saves(&save_dirs, &shared);
     if let Some(d) = &test_delay {
         shared.log(format!("TEST: {}: every message from the players arrives that much later", d.describe()));
     }
@@ -812,6 +822,9 @@ fn host_dispatch(outputs: Vec<HostOutput>, link: &mut gamelink::Session, io: &mu
             HostOutput::ResyncProgress { id, state, detail } => {
                 shared.log(format!("resync {id}: {state:?} {detail}"));
                 shared.update(|s| s.resync = Some(format!("{state:?}")));
+                if state == ResyncState::Pausing {
+                    io.round_began(id);
+                }
                 if state == ResyncState::Transferring {
                     // the save is found, hashed and sent by the loop's later turns (HostIo::pump), never in this call
                     io.begin_transfer(id);
@@ -847,6 +860,14 @@ fn host_dispatch(outputs: Vec<HostOutput>, link: &mut gamelink::Session, io: &mu
             }
             HostOutput::PlayerJoined(_) | HostOutput::PlayerLeft(_) | HostOutput::Received { .. } => {}
         }
+    }
+}
+
+/// At a session start: the resync saves earlier sessions left in the savegame folders go ([`resync::prune_saves`]).
+fn prune_resync_saves(save_dirs: &[PathBuf], shared: &Shared) {
+    let removed = resync::prune_saves(save_dirs, resync::PRUNE_AGE, std::time::SystemTime::now());
+    if removed > 0 {
+        shared.log(format!("deleted {removed} resync file(s) of earlier sessions from the savegame folders"));
     }
 }
 
@@ -969,6 +990,7 @@ pub fn run_player_over(
     }
     let shared = Shared::new(Status::new(Role::Player, &config.name), config.echo_log);
     shared.log(format!("connected to {}", first.describe()));
+    prune_resync_saves(&config.save_dirs, &shared);
     if let Some(d) = &test_delay {
         shared.log(format!("TEST: {}: every message from the host arrives that much later", d.describe()));
     }
@@ -1127,20 +1149,13 @@ impl PlayerLoop {
                     NetEvent::BulkFile { conn, id, sha256, len, path, note } if conn == self.generation => {
                         self.par_progress = None;
                         shared.log(note);
-                        // the file is in the first savegame folder already; the others get a copy
+                        // the file is in the first savegame folder already, so the round can load whatever the
+                        // copies into the others do; a folder that missed it is only logged
                         let name = resync::save_name(id);
-                        for dir in self.config.save_dirs.iter().skip(1) {
-                            let copy = std::fs::create_dir_all(dir).and_then(|()| {
-                                let tmp = dir.join(format!("{name}.sav.tmp"));
-                                std::fs::copy(&path, &tmp)?;
-                                std::fs::rename(&tmp, dir.join(format!("{name}.sav")))
-                            });
-                            if let Err(e) = copy {
-                                shared.log(format!(
-                                    "resync {id}: cannot copy the received save to {}: {e}",
-                                    dir.display()
-                                ));
-                            }
+                        let others = self.config.save_dirs.get(1..).unwrap_or_default();
+                        for line in resync::copy_save(&path, others, &name).missed {
+                            shared
+                                .log(format!("resync {id}: the received save is not in every savegame folder: {line}"));
                         }
                         outputs.extend(self.player.bulk_file_received(id, &sha256, len));
                     }
@@ -1481,8 +1496,16 @@ impl PlayerLoop {
 
     /// Acts on the state machine's outputs. True when the session is over (rejected).
     fn dispatch(&mut self, outputs: Vec<PlayerOutput>, clocks: &mut BTreeMap<u16, i64>, shared: &Shared) -> bool {
+        // a save that could not be written: its load may be in this same batch, accepted before the write was tried
+        let mut unstored: Option<i32> = None;
         for output in outputs {
             match output {
+                PlayerOutput::DeliverToLocalGame { kind: MessageKind::ResyncLoad, payload }
+                    if codec::try_decode::<ResyncLoadMessage>(&payload).is_some_and(|m| Some(m.id) == unstored) =>
+                {
+                    let id = unstored.unwrap_or_default();
+                    shared.log(format!("resync {id}: the load is not passed to the game: its save was not written"));
+                }
                 PlayerOutput::SendToHost(frame) => {
                     if let Some(net) = &self.net {
                         if let Err(e) = net.send(&frame) {
@@ -1578,12 +1601,29 @@ impl PlayerLoop {
                 PlayerOutput::SaveReceived { id, sha256, bytes } => {
                     let name = resync::save_name(id);
                     match resync::write_save(&self.config.save_dirs, &name, &bytes) {
-                        Ok(n) => shared.log(format!(
-                            "resync {id}: save received ({} bytes, SHA-256 {}), written to {n} folder(s) as {name}.sav",
-                            bytes.len(),
-                            &sha256[..12.min(sha256.len())]
-                        )),
-                        Err(e) => shared.log(format!("resync {id}: cannot write the received save: {e}")),
+                        Ok(stored) => {
+                            shared.log(format!(
+                                "resync {id}: save received ({} bytes, SHA-256 {}), in {} folder(s) as {name}.sav",
+                                bytes.len(),
+                                &sha256[..12.min(sha256.len())],
+                                stored.held
+                            ));
+                            for line in stored.missed {
+                                shared.log(format!(
+                                    "resync {id}: the received save is not in every savegame folder: {line}"
+                                ));
+                            }
+                        }
+                        // no folder holds it: the load that follows would open nothing or an older file of the same
+                        // name (another session's world), so the save counts as not received, the load is refused
+                        // and this game keeps its world (review 2026-10-31)
+                        Err(e) => {
+                            self.player.forget_save(id);
+                            unstored = Some(id);
+                            shared.log(format!(
+                                "resync {id}: cannot write the received save: {e}; this game will not load it"
+                            ));
+                        }
                     }
                 }
                 PlayerOutput::Log(text) => shared.log(text),
@@ -1622,6 +1662,55 @@ impl Retry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 2026-10-31: a reader whose generation was deleted under it went on at the NEWEST generation, past the kept ones.
+    #[test]
+    fn lost_game_lines_ask_for_a_repair_and_reading_goes_on_at_the_oldest_kept_generation() {
+        let root = tempfile::TempDir::new().unwrap();
+        let mut link = gamelink::Session::open(root.path()).unwrap();
+        let shared = Shared::new(Status::new(Role::Player, "p"), false);
+        let base = root.path().join(gamelink::FROM_GAME);
+        let mut game = gamelink::GenWriter::open(base.clone(), "1").unwrap().with_limits(120, 3);
+        let chat = |i: u32| format!("chat\t1\t{{[\"text\"]=\"n {i}\"}}\n");
+        let texts = |got: &[(MessageKind, Vec<u8>)]| -> Vec<String> {
+            got.iter()
+                .filter(|(k, _)| *k == MessageKind::Chat)
+                .map(|(_, p)| {
+                    serde_json::from_slice::<serde_json::Value>(p).unwrap()["text"].as_str().unwrap().to_owned()
+                })
+                .collect()
+        };
+        game.append(&chat(0)).unwrap();
+        assert_eq!(texts(&read_from_game(&mut link, &shared)), ["n 0"]);
+        // the game writes on while the launcher reads nothing: generation 1, where the tail stands, and the next ones are deleted
+        for i in 1..=40 {
+            game.append(&chat(i)).unwrap();
+        }
+        let oldest = game.generation() - 2;
+        assert!(!base.exists() && !gamelink::generation_path(&base, oldest - 1).exists(), "three generations are kept");
+        let first_kept = std::fs::read_to_string(gamelink::generation_path(&base, oldest)).unwrap();
+        let first_kept: u32 =
+            first_kept.split("\"n ").nth(1).and_then(|t| t.split('"').next()).unwrap().parse().unwrap();
+        let got = read_from_game(&mut link, &shared);
+        assert_eq!(
+            got.first().map(|m| m.0),
+            Some(MessageKind::ReplayFailed),
+            "the loss asks the host for a repair first"
+        );
+        let detail = codec::try_decode::<ReplayFailedMessage>(&got[0].1).unwrap().detail;
+        assert!(detail.contains("deleted before the launcher read them"), "{detail}");
+        assert_eq!(
+            texts(&got),
+            (first_kept..=40).map(|i| format!("n {i}")).collect::<Vec<_>>(),
+            "every kept line, from the oldest kept generation on"
+        );
+        game.append(&chat(41)).unwrap();
+        assert_eq!(
+            read_from_game(&mut link, &shared).iter().map(|m| m.0).collect::<Vec<_>>(),
+            [MessageKind::Chat],
+            "asked once"
+        );
+    }
 
     #[test]
     fn an_extra_checksum_part_joins_the_reports_parts_and_leaves_everything_else() {

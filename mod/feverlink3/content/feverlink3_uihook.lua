@@ -24,10 +24,13 @@
 --   * another mod's own script event (its window sends a setting to its game script, makeScriptingSendEventCmd): no schema of ours
 --     knows it, but when its parameter is plain data it is shipped and held like the above (L.markForeignEvent), so every game's
 --     copy of that mod gets it at the stamp. Told apart by where the calling code lies (C.callerOf), never by a list of mods.
---   * a player's build another mod's tool or window sends (makeWorldBuildProposalCmd): recorded with the build codec and held the same
---     way (the API layer); one the codec cannot record is left to the native module's hold at the command list (the safety net), or
---     refused when that is not on (handle).
---   * anything else (no schema, or an event no game replicates), and everything while no session is on: untouched.
+--   * a build another mod's tool or window sends (makeWorldBuildProposalCmd), whatever its playerInitiated flag: recorded with the build
+--     codec and held the same way (the API layer); a player-initiated one the codec cannot record is left to the native module's hold at
+--     the command list (the safety net), and refused when that is not on; any other one the codec cannot record is refused (handle).
+--   * an event no game replicates (notifications, tutorial steps: L.EVENT_SPEC's "local"), and the commands of L.LOCAL_COMMANDS, which
+--     change nothing in the world: untouched.
+--   * anything else (no schema, or made by no factory this hook wraps): REFUSED like a command that cannot be encoded (fail closed).
+--   * everything while no session is on: untouched.
 -- Entity ids never travel; the keys of entities created in the session come from binds.txt, which the bridge writes.
 --
 -- Credit: wrapping the engine's command functions in the interface state, keeping the command objects in a weak table, and
@@ -35,8 +38,8 @@
 -- stamp and completing the window's callback with the stamp apply's result is this project's general rule for every command
 -- (the builds' deferred completion, the bridge's own wrap), so the originator applies at the same step as everybody.
 --
--- With FEVERLINK3_DEV=1 every command function of api.cmd is traced into dev_trace.txt (name and arguments), which is how
--- the real shape of what the game's windows issue is learned without guessing.
+-- With FEVERLINK3_DEV=1 every command sent is traced into dev_trace.txt (name and arguments), which is how the real shape of what
+-- the game's windows issue is learned without guessing.
 
 local okC, C = pcall(ug_require, "feverlink3_common.lua")
 if not okC then C = ug_require("feverlink3::/feverlink3_common.lua") end
@@ -69,6 +72,10 @@ end
 
 local DEV = false
 pcall(function() DEV = C.env("FEVERLINK3_DEV") == "1" end)
+
+-- Every engine maker is wrapped (M.install, L.FACTORIES), not only those with a schema, so every command a window sends in a session
+-- carries its name; the commands without a schema that change nothing in the world are L.LOCAL_COMMANDS. Both lists live in the
+-- lockstep module, so the bridge's wrap of the script-GUI state follows the very same ones.
 
 local U = {
 	tags = setmetatable({}, { __mode = "k" }),   -- command object -> { name, args }
@@ -138,6 +145,18 @@ function M.sessionOver(why)
 		end
 	end
 	if n > 0 then log("session over (" .. tostring(why) .. "): " .. n .. " held command(s) wait " .. OVER_SECONDS .. " s for the bridge's last answer, then fail") end
+	M.tallyOut("session over")
+end
+
+-- The counts of noteUnregistered, written and dropped: at the session's end and when a sync round begins (the window, which sees the
+-- round in the controller's state). A resync load replaces this Lua state, and the counts with it (review 2026-10-31: those made before
+-- a load were never logged); nothing in this state runs right before the load, so the round's start, seconds earlier, is the last moment
+-- it is told of. A game whose round ends without a load (a round that fails before it, a host with FEVERLINK3_HOST_RELOAD=0) counts on
+-- in a new book: each count is still logged once, but a name's first line comes again in the same session.
+function M.tallyOut(when)
+	local unreg = C.tallyText(U.unregistered)
+	if unreg then log(tostring(when) .. ": events nobody registered that a window sent, each applied on this game only (name xtimes): " .. unreg) end
+	U.unregistered = nil
 end
 
 -- is a session on? (the identity file the controller writes; read at most once a second). A session that ended, or was replaced by
@@ -368,16 +387,51 @@ M.speedAnswers = speedAnswers
 -- originator only made the worlds differ and the next resync erased the player's edit (friend test 2026-10-16: line edits that
 -- "do not rebuild equal" were applied on the editing game only, 9 of the 14 resyncs of that test followed from it). The window's
 -- callback fails, the log says why, and the player reads it in the window's notices (a `notice` record: the bridge adds it to this
--- game's notices only).
+-- game's notices only). A command made by no factory this hook wraps has no name (tag.name nil): the notice then says "action".
 local function refuse(tag, cb, why)
 	U.stats.failed = U.stats.failed + 1
-	log("command " .. tag.name .. " is REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): " .. tostring(why))
+	local name = tag.name or "(no name: made by no factory this hook wraps)"
+	log("command " .. name .. " is REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): " .. tostring(why))
 	-- the bridge words it (feverlink3_text.lua, action_not_shared); the reason stays in the log line above
 	send("notice", { msg = "action_not_shared", cmd = tag.name, sid = C.SESSION })
-	fire(0, { cb = cb, name = tag.name }, {}, false, {})
+	fire(0, { cb = cb, name = name }, {}, false, {})
 	return true
 end
 M.refuse = refuse
+
+-- A command the API layer cannot hold (no schema, or it cannot be encoded): a player's build goes on to the engine's command list while
+-- the native module holds builds there (the safety net: it holds every player-initiated build from no tool site, native runtime.rs
+-- plan_add); anything else is refused, a build whose playerInitiated is not true too: the native hold lets that flag pass (it marks the
+-- game's own scripts' builds), so handing it on would apply it here alone (L.nativeNetHolds, the bridge's wrap asks the same). Returns
+-- what handle returns: false = the engine gets it.
+local function unheld(tag, cb, why)
+	if L.nativeNetHolds(tag.name, tag.args) then
+		M.sessionSpeed()   -- the snapshot, read at most every SESSION_READ_S
+		if U.nativeHolds then
+			log("command " .. tag.name .. " cannot be recorded through the API (" .. tostring(why) .. "): handed to the native safety net at the command list")
+			return false
+		end
+	end
+	return refuse(tag, cb, why)
+end
+
+-- An event nobody registered goes to the engine on this game only, as in single-player (L.unregisteredEvent). Owner decision 2026-11-01:
+-- it stays so until real sessions show which ones occur, so each is logged once a session with what sent it and counted (C.tally; the
+-- counts at the session's end and when a sync round begins, M.tallyOut). A refused command's line is not limited here: a window sends on
+-- a click, not every frame.
+local function noteUnregistered(tag)
+	local name = L.unregisteredEvent(tag.name, tag.args)
+	if not name then return end
+	U.unregistered = U.unregistered or {}
+	local write, n, key = C.tally(U.unregistered, name)
+	if not write then return end
+	if n == 1 then
+		log("event " .. name .. " sent from a window (the interface state, " .. (tag.mod and ("mod " .. tostring(tag.mod)) or "the game's own or FeverLink3's code")
+			.. ") went to the engine on this game only: no module of FeverLink3 registers it, so the other games do not get it (logged once a session, then counted)")
+	else
+		log("event " .. name .. " sent from a window: " .. n .. " times this session" .. (key == name and "" or " (with other names)") .. ", each on this game only")
+	end
+end
 
 -- The window's refresh (feverlink3_ui.script.lua, its step timer): it runs between the window's handlers, never inside one, so it
 -- closes the group of commands the window issued since the last refresh. What one handler issues in one go (a clone of N vehicles:
@@ -426,11 +480,20 @@ local function handle(tag, cmd, cb, progress, t0)
 	-- build is recorded with the build codec and held here like every window command; every game, this one included, rebuilds it with
 	-- makeWorldBuildProposalCmd at the stamp and its callback gets that apply's result (answers). One the codec cannot record goes on to
 	-- the engine's command list only while the native module holds builds there (the safety net: it holds the command and the bridge
-	-- ships it from the command's own proposal and text); without it, it is refused. A build the script marks as not the player's
-	-- (playerInitiated false) is the script's own business, as the engine treats it: untouched.
-	if tag.name == "makeWorldBuildProposalCmd" and tag.args[4] ~= true then return false end
+	-- ships it from the command's own proposal and text); without it, it is refused (unheld).
+	-- A build whose playerInitiated is false goes the same way, its flag kept in the record so every game rebuilds the same command. That
+	-- flag tells the game's own scripts' builds from a player's in the simulation state, where every game runs those scripts at the same
+	-- step; nothing in this state runs in step with the other games, so a build sent here is this game's alone unless it is held. It went
+	-- to the engine untouched until 2026-11-01, and nothing replicated it: the native hold passes the flag false, the simulation's capture
+	-- skips it (review 2026-10-31). Of the base game's window scripts (gui/, build 40420) only the map editor sends such builds
+	-- (industry_util.removeIndustries), so in a session it is most likely another mod's.
+	-- A command no schema knows changes the world unless it is one of L.LOCAL_COMMANDS: applied here alone it would fork the worlds, so
+	-- it is refused (fail closed; until 2026-11-01 it went to the engine untouched).
 	local spec = L.COMMANDS[tag.name]
-	if not spec or spec.virtual then return false end
+	if not spec or spec.virtual then
+		if L.LOCAL_COMMANDS[tag.name] then return false end
+		return unheld(tag, cb, "no schema of FeverLink3 replicates it")
+	end
 	-- another mod's own event (its window sends its settings to its game script): shipped like a window command, delivered at the stamp
 	-- on every game (L.markForeignEvent); one that is not plain data stays on this game as before
 	if tag.mod and tag.args.foreign == nil then
@@ -448,7 +511,10 @@ local function handle(tag, cmd, cb, progress, t0)
 	end
 	local category = L.categoryOf(tag.name, tag.args)
 	-- what no game replicates (an event nobody registered: notifications, tutorial steps) is this game's own business
-	if category == "local" then return false end
+	if category == "local" then
+		pcall(noteUnregistered, tag)
+		return false
+	end
 	local rev = reverse()
 	tm.r = C.clock()
 	-- argMs / objMs: the schema's own timing of each argument and of each engine object's dry run (feverlink3_cmds_ops.lua)
@@ -461,16 +527,9 @@ local function handle(tag, cmd, cb, progress, t0)
 	for i = 1, (tag.args and tag.args.n) or 0 do parts[i] = ctx.argMs[i] and string.format("%.1f", ctx.argMs[i]) or "-" end
 	tm.detail = string.format("binds=%.1f args=[%s] objects=[%s] world_searches=%d (%.0f ms)", (tm.r - tm.p) * 1000, table.concat(parts, " "),
 		table.concat(ctx.objMs, "; "), n1 - n0, ms1 - ms0)
-	if not body and tag.name == "makeWorldBuildProposalCmd" then
-		M.sessionSpeed()   -- the snapshot, read at most every SESSION_READ_S
-		if U.nativeHolds then
-			log("command " .. tag.name .. " cannot be recorded through the API (" .. tostring(why) .. "): handed to the native safety net at the command list")
-			return false
-		end
-	end
-	if not body then return refuse(tag, cb, why) end
+	if not body then return unheld(tag, cb, why) end
 	local okS, text = pcall(C.serialize, body)
-	if not okS then return refuse(tag, cb, text) end
+	if not okS then return unheld(tag, cb, text) end
 	U.seq = U.seq + 1
 	local id = U.seq
 	tm.e = C.clock()
@@ -510,11 +569,13 @@ function M.install()
 	if not orig.sendCommand then
 		orig.sendCommand = api.cmd.sendCommand
 		orig.factory = {}
+		-- every maker, so that every command sent in a session has a name (L.FACTORIES), and those of other areas' schemas a module
+		-- may add one day
 		local wanted = {}
 		for name, spec in pairs(L.COMMANDS) do
 			if not spec.virtual then wanted[name] = true end
 		end
-		wanted.makeGameSetSpeedCmd = true
+		for _, name in ipairs(L.FACTORIES) do wanted[name] = true end
 		if DEV then
 			for _, name in ipairs(memberNames(api.cmd) or {}) do wanted[name] = true end
 		end
@@ -567,8 +628,15 @@ function M.install()
 						return
 					end
 				end
-			elseif DEV then
-				trace("sendCommand (untagged) " .. tostring(cmd))
+			elseif cmd ~= nil then
+				if DEV then trace("sendCommand (untagged) " .. tostring(cmd) .. (active() and "" or " [no session]")) end
+				-- made by no factory this hook wraps (api.cmd.debug's: the debug panel's cargo and person edits; a maker the engine added
+				-- since L.FACTORIES): nothing says it leaves the world alone, and applied here alone it would fork the worlds (fail closed)
+				if active() then
+					U.fireCtx = "a window's sendCommand (no name)"
+					pcall(refuse, {}, cb, "made by no factory this hook wraps (" .. short(cmd) .. ")")
+					return
+				end
 			end
 			U.stats.untouched = U.stats.untouched + 1
 			return orig.sendCommand(cmd, cb, progress)

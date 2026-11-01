@@ -20,6 +20,13 @@ if HERE not in sys.path:
 import test_cmds_build as B  # noqa: E402  (the construction harness; imported, not edited)
 import test_lockstep as T  # noqa: E402
 
+
+def content_parts(parts):
+    """A report's parts without the id parts (`<lane>@ids`): the mock games hand out new entity ids from their own bases (50000,
+    51000) so that nothing relies on an id, and a build's ids then differ by design; in the game a build applied at its stamp takes
+    the same ids from the free-id FIFO on every game, which those parts check."""
+    return {k: v for k, v in parts.items() if not k.endswith("@ids")}
+
 ANNOUNCE = r'''
 -- the engine tells the game script about a build just before it applies it
 ANNOUNCE_BUILDS = true
@@ -132,7 +139,7 @@ class NativeCaptureTest(unittest.TestCase):
         self.tick(40)
         ta, pa = self.relay.reports[1][0]
         tb, pb = self.relay.reports[1][1]
-        self.assertEqual(pa, pb, "every checksum part agrees")
+        self.assertEqual(content_parts(pa), content_parts(pb), "every checksum part agrees")
         self.assertIn("companies", pa, "the ledger is part of the checksum once an action was recorded")
 
     def test_several_builds_in_a_row_each_land_once_and_the_marks_do_not_leak(self):

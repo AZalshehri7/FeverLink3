@@ -76,7 +76,7 @@ its callback with the real local result. None needs *replay on peers* or *poll*.
 | `makeLineDestroyCmd` | line (the window sells the line's vehicles first, in the same frame) | bulldoze | **Replicated** |
 | `makeEntitySetNameCmd` | any entity: line, vehicle, station group, depot, town, the company (the player entity) | other | **Replicated**; the player travels as "own company" |
 | `makeEntitySetColorCmd` | entity, `Vec3f` (lines, vehicles) | other | **Replicated** |
-| `makeJournalBookAssetCmd` | player, `JournalEntry`, optional popup position; from windows: the sandbox balance edit (`game_bar.tl`), the cost of a marketing campaign (`marketing_campaign_tool.script.tl`) | spend | **Replicated** when a window sends it; the bridge's own corrections use the game's `sendCommand` and are never replicated |
+| `makeJournalBookAssetCmd` | player, `JournalEntry`, optional popup position; from windows: the sandbox balance edit (`game_bar.tl`), the cost of a marketing campaign (`marketing_campaign_tool.script.tl`) | spend | **Replicated** when a window sends it; payments between separate companies (`cmds_company` `bookJournalFor`) use the game's `sendCommand` and are never replicated |
 | `makeGameSetCalendarSpeedCmd`, `makeGameSetDateCmd` (a `Date`: year, month, day), `makeGameSetTimeOfDayCmd`, `makeGameSetCloudCoverageCmd` | calendar widget (`game_bar_widgets.tl`) | other | **Replicated** (only the window's calls: the game-time script's own run in every game) |
 | `makeStockListDiscardCargoCmd` | stock owner, cargo ids, fraction (`entity_window_util.tl`) | other | **Replicated** |
 | `makeTownBuildingSetBlockedDevelopmentCmd` | town building ("historic preservation", `town_building.tl`) | other | **Replicated**; the building is found by file and position |
@@ -87,7 +87,12 @@ its callback with the real local result. None needs *replay on peers* or *poll*.
 One engine command carries dozens of messages to game scripts. It has one spec, in the lockstep core; modules register
 the `(id, name)` pairs they replicate (`events` in the module's return table). **An event nobody registered stays
 native and is never refused**, whatever the grants (category `local`): notifications, tutorial and mission steps,
-guide events and the like are per-game state and intentionally local.
+guide events and the like are per-game state and intentionally local. Some may reach their own script's simulation half
+and change the world there, so in a session each one a window or a script GUI sends is logged on that game, once a
+session per `id/name` (the sending state, and that it ran on this game only), then counted, with the counts at the
+session's end and before a resync load, which starts the Lua states afresh (the window's at the start of a sync round,
+the script GUI's right before the load; after it the first line of a name comes again): real sessions show which ones
+occur before anything else is decided for them (owner decision 2026-11-01; `L.unregisteredEvent`).
 
 | Event | Parameter | Category | Status |
 |---|---|---|---|
@@ -101,6 +106,17 @@ guide events and the like are per-game state and intentionally local.
 | `Companies` / `applyLevel` | `{level}` (`company.tl`) | | company module |
 
 ### Everything else, and why it is not here
+
+The first three rows of the table below are shared another way, as their last column says (the construction module, the
+company module, the session's speed). In a session, a game window (the UI hook's state) or a script GUI (the bridge's
+state: the game scripts' and other mods' `guiUpdate`/`guiHandleEvent` and their windows) that sends a command of one of
+the other rows, which no module replicates, or a command of a maker that is not wrapped (`api.cmd.debug.*`), is refused
+on that game too and told "could not be shared": applied there alone it would fork the worlds, and nothing else
+replicates it (review 2026-10-31). The one exception is `makeCreateIndustryExtendProposalCmd`, a query that builds
+nothing (`L.LOCAL_COMMANDS` in `feverlink3_lockstep.lua`, one list for both states, each entry with its reason). The
+base game's own script GUIs send none of them. The simulation state's own sends (game scripts) are not affected. In the
+script-GUI state a refusal is logged once a session per command name and reason, then counted (a guiUpdate may send
+the same command in every frame); the counts are logged when the session ends and right before a resync load.
 
 | Command | What it is | Left to |
 |---|---|---|
@@ -141,8 +157,9 @@ notification. Back-compat: `makeVehicleBuyCmd` is still `spend`, `makeLineCreate
 
 ## Money
 
-The balance authority (host's `balance` and `loan` values, corrected at checkpoints) is unchanged. What changed is the
-loan, and it was a placeholder:
+A money difference between games is repaired by a sync, like other lasting differences: `balance` and `loan` are ordinary
+lanes of the checksum (two checks in a row), hashed in whole money units (2026-11-01; until then the host sent its values and the other games
+booked the difference as journal entries, which hid the cause). The loan is replicated as follows:
 
 - TF3 has **no loan command**. The loan is a game script (`game_mechanics/finance/loan.gs`, state `LoanTable`: offers,
   obtained loans, `freeId`). The window sends the event `Loan` / `Obtain` or `Repay`; the script books one
@@ -152,10 +169,6 @@ loan, and it was a placeholder:
 - So the loan is replicated by replicating the **event**; every game's script then does the rest with the same state,
   offers, and (the mod's deterministic `math.random`) cooldowns. The values in the event are the sender's offers; only
   the offer type is used from the replacement slot.
-- `engine.adjustLoan(delta)`, the authority's last resort, now books a `LOAN` entry of `delta` and the same sum back as
-  `OTHER`, so the balance is untouched. That a `LOAN` entry raises the reported loan by its amount is read from the
-  script, not measured (V8); if a correction moves the loan the wrong way the adapter notices at the next one, logs why,
-  and stops instead of doubling the error every round.
 
 ## Not replicable yet
 
@@ -233,11 +246,8 @@ hint, V5, V6, V8, V9, V12, V13) show up as a `REFUSED: it cannot be replicated` 
 8. **V8. Loans.** Take a loan, with the game running and again paused (host alone is enough for the first half). Log:
    `action <id>:<n> makeScriptingSendEventCmd stamped ...` and `applied`, no `REFUSED: it cannot be replicated`; the finance window shows
    the obtained loan. With a second game both show the same balance and loan in the next report (parts `balance` and
-   `loan` equal in the two `checksum_report` lines of `from_game.log`). This also verifies the assumption behind
-   `adjustLoan`: in the host's `checksum_report` lines the `authority` field holds the real `balance` and `loan`;
-   two reports on either side of the loan must differ by the loan's amount in **both** numbers (+amount each; the
-   money spent meanwhile moves only the balance, so take the loan with nothing else running). Then repay it: both go
-   back down. `adjustLoan` itself only runs when a divergence is found; the unit tests cover it with a mock.
+   `loan` equal in the two `checksum_report` lines of `from_game.log`). Then repay it: both games again show the same
+   balance and loan.
 9. **V9. Marketing and money.** Start a marketing campaign on a town from the client: both balances drop by the same
    cost, once. `from_game.log` of the client holds two `action` lines (the event and the journal booking).
 10. **V10. Permissions.** The host revokes `spend` for the client in the window. The client's purchase, loan and campaign

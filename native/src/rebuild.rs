@@ -14,8 +14,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 
-use crate::dump::{pointer_like, u64_at, Env, Mem, PAYLOAD_SIZE};
-use crate::portable::{self, Elem, Header, Settings, Ty, F, PAYLOAD};
+use crate::dump::{pointer_like, u64_at, Env, Mem, IMAGE_BOUND, PAYLOAD_SIZE};
+use crate::portable::{self, Elem, HashNode, Header, MapNode, MapValue, Settings, Ty, F, PAYLOAD};
 
 pub const REBUILD_VAR: &str = "FEVERLINK3_PORTABLE_REBUILD";
 pub const REBUILD_FILE: &str = "native_rebuild.log";
@@ -50,8 +50,126 @@ pub struct Built {
 
 type R<T> = Result<T, String>;
 
-/// The largest byte vector a text may describe (the size of the largest side file, `inject::MAX_TEXT_BYTES`).
+/// The largest byte vector a text may describe (the size of the largest side file, `inject::MAX_TEXT_BYTES`). Also the bound of one
+/// block of the heap graph and of a zero run: both are a few digits in the text and that many bytes in memory, and an allocation the
+/// allocator cannot serve ends the process (no guard contains it).
 const MAX_BLOB: usize = 64 << 20;
+
+/// The most bytes one build makes in all: what it allocates and the Rust scratch it builds that from (every token's bytes, the element
+/// buffers of the named vectors). [`MAX_BLOB`] bounds each block, vector and zero run, not their sum: a few KB of text could name many
+/// blocks of 64 MB, each allocated, or nest `V` tokens whose every level holds a zero run of 64 MB before its inner block is made
+/// (review 2026-10-31: 117 bytes of nested tokens held 576 MB before they were refused). Nothing is given back, so the sum bounds what
+/// one build holds at any time besides the parsed lines of the text; a zero run and a vector buffer are counted before they exist,
+/// any other token (a few words, or the hex of the text itself) once made. A byte of a vector counts twice (its scratch and its
+/// block), so the encoder's own bounds (`portable::Settings`) do not all fit; a text past the bound is refused by the originator's own
+/// check of it (`inject::text_refusal` makes the same build), never by one receiver alone. Twice [`MAX_BLOB`]: the largest full build
+/// of the 8219 logged texts of the lab runs makes 6.9 MB, 3.5 MB of it allocated (the originator's check of them at most 1 MB), and
+/// counting the scratch changed none of their verdicts. The sizes are the text's, so the verdict is the same on every game.
+const MAX_BUILD: usize = 2 * MAX_BLOB;
+
+/// The node of the `std::set<u32>` behind each value of an id map ([`MapValue::IdSet`]): links, colour, isnil, the key at +0x1c.
+const SET_NODE: usize = 0x20;
+
+/// What one value's own tokens put into it besides the text's own bytes. The tokens inside a `V` or `R` are not in it (they go
+/// into a block of their own).
+#[derive(Default)]
+struct Refs {
+    /// where its block references put their words: byte offset in the value -> (block number, offset into it); a `P` as [`UNRESOLVED`]
+    links: BTreeMap<usize, (usize, usize)>,
+    /// the bytes that hold an address of this game: a block (`B`), the image (`I`), the words of a vector or range (`V`, `R`), the
+    /// buffer pointer of a long string (`S`). They differ from game to game; a `P` is a zero, the same everywhere.
+    placed: Vec<(usize, usize)>,
+}
+
+impl Refs {
+    fn get(&self, off: usize) -> Option<(usize, usize)> {
+        self.links.get(&off).copied()
+    }
+
+    /// Whether bytes `from..to` of the value are the text's own (a `w`, `z` or `b` token, a short string): the same on every game.
+    fn literal(&self, from: usize, to: usize) -> bool {
+        !self.placed.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    fn place(refs: &mut Option<&mut Refs>, at: usize, len: usize) {
+        if let Some(r) = refs.as_deref_mut() {
+            r.placed.push((at, at + len));
+        }
+    }
+}
+
+/// The block number of a `P` in [`Refs`]: no block of the text has it.
+const UNRESOLVED: usize = usize::MAX;
+
+/// Why a container's walk stopped: a link the text leaves unresolved (a `P`: the text is refused for it with every such pointer
+/// listed, [`Built::blocked`]), or one that is not the container's own (the text is refused here).
+enum Stop {
+    Unresolved,
+    Bad(String),
+}
+
+type W<T> = Result<T, Stop>;
+
+/// An engine container the text gives a heap graph to: its links are checked before anything reaches the engine
+/// ([`Builder::check_containers`]).
+struct Container {
+    path: String,
+    shape: Shape,
+    /// the container's own words as the engine gets them (`<member>.graph`) and their block references
+    words: Vec<u8>,
+    refs: Refs,
+}
+
+#[derive(Clone, Copy)]
+enum Shape {
+    /// `std::map`: a tree through a sentinel
+    Tree(&'static MapNode),
+    /// `std::unordered_map/set`: a ring through a sentinel, and the bucket vector
+    Ring(&'static HashNode),
+}
+
+/// Which container each node and bucket vector belongs to (its index in `Builder::containers`), and where its links are: each
+/// destructor frees its own.
+struct Owners {
+    of: HashMap<usize, (usize, Links)>,
+    /// the container being walked
+    now: usize,
+}
+
+impl Owners {
+    /// Takes block `n` for the container being walked; false when a container has it already.
+    fn take(&mut self, n: usize, links: Links) -> bool {
+        if self.of.contains_key(&n) {
+            return false;
+        }
+        self.of.insert(n, (self.now, links));
+        true
+    }
+}
+
+/// The words of a container's block that are its links: the only places a reference to a block of the same container may be.
+#[derive(Clone, Copy)]
+enum Links {
+    /// a tree's sentinel or node, a set's too: left, parent, right
+    Tree,
+    /// a node of an id map ([`MapValue::IdSet`]): those, and its set's sentinel at +0x28
+    IdNode,
+    /// a list's sentinel or node: next, prev
+    List,
+    /// a bucket vector: every word (the first and last node of each bucket)
+    Buckets,
+}
+
+impl Links {
+    fn at(self, off: usize) -> bool {
+        match self {
+            Links::Tree => matches!(off, 0 | 8 | 0x10),
+            Links::IdNode => matches!(off, 0 | 8 | 0x10 | 0x28),
+            Links::List => matches!(off, 0 | 8),
+            Links::Buckets => true,
+        }
+    }
+}
 
 /// The one allocation of a flat hash set of 4-byte ids (see [`Ty::EntSet`]) holding `ids`, and its capacity. The smallest capacity
 /// `2^k - 1` whose load bound (7/8) holds them. The ids fill the first slots and their control bytes say "full" (0x00); the real
@@ -93,6 +211,15 @@ struct Builder<'a> {
     made: HashMap<usize, usize>,
     /// blocks made and not yet filled
     fill: VecDeque<usize>,
+    /// block number -> its bytes and its own block references, once filled (for the container check)
+    filled: HashMap<usize, (Vec<u8>, Refs)>,
+    /// the containers built from a heap graph of the text
+    containers: Vec<Container>,
+    /// the blocks referenced from outside every block and container graph (unnamed bytes, raw members, inside a `V` or `R`), each with
+    /// the first place: none may be a container's node (its destructor frees it)
+    elsewhere: BTreeMap<usize, String>,
+    /// the bytes allocated and built as scratch so far ([`MAX_BUILD`])
+    spent: usize,
 }
 
 fn parse_hex(s: &str) -> R<Vec<u8>> {
@@ -158,16 +285,31 @@ impl<'a> Builder<'a> {
         Ok(n)
     }
 
+    /// Counts `n` more bytes of the build, allocated or scratch, against the bound of the whole build ([`MAX_BUILD`]).
+    fn spend(&mut self, path: &str, n: usize) -> R<()> {
+        self.spent = self.spent.saturating_add(n);
+        if self.spent > MAX_BUILD {
+            return Err(format!("{path}: the text allocates more than {MAX_BUILD:#x} bytes in all"));
+        }
+        Ok(())
+    }
+
+    /// `n` bytes from the allocator, within the bound of the whole build ([`MAX_BUILD`]).
+    fn alloc(&mut self, path: &str, n: usize) -> R<usize> {
+        self.spend(path, n)?;
+        let addr = self.a.alloc(n).ok_or_else(|| format!("{path}: allocation of {n:#x} bytes failed"))?;
+        self.blocks += 1;
+        Ok(addr)
+    }
+
     fn block(&mut self, path: &str, data: &[u8]) -> R<(u64, u64, u64)> {
         if data.is_empty() {
             return Ok((0, 0, 0));
         }
-        let addr =
-            self.a.alloc(data.len()).ok_or_else(|| format!("{path}: allocation of {:#x} bytes failed", data.len()))?;
+        let addr = self.alloc(path, data.len())?;
         if !self.a.write(addr, data) {
             return Err(format!("{path}: write into the new block failed"));
         }
-        self.blocks += 1;
         Ok((addr as u64, (addr + data.len()) as u64, (addr + data.len()) as u64))
     }
 
@@ -186,12 +328,10 @@ impl<'a> Builder<'a> {
             let mut t = text.to_vec();
             t.push(0);
             // the engine frees a string by its capacity (size | 15, plus the terminator)
-            let addr =
-                self.a.alloc((text.len() | 15) + 1).ok_or_else(|| format!("{path}: string allocation failed"))?;
+            let addr = self.alloc(path, (text.len() | 15) + 1)?;
             if !self.a.write(addr, &t) {
                 return Err(format!("{path}: string write failed"));
             }
-            self.blocks += 1;
             out[0..8].copy_from_slice(&(addr as u64).to_le_bytes());
             out[0x18..0x20].copy_from_slice(&((text.len() | 15) as u64).to_le_bytes());
         }
@@ -222,7 +362,7 @@ impl<'a> Builder<'a> {
                 if let Some(rva) = body.strip_prefix("0,I+") {
                     // the empty table points at the library's static empty group, as the engine's own empty sets do
                     let rva = usize::from_str_radix(rva, 16).map_err(|e| format!("{key}: {e}"))?;
-                    buf[0..8].copy_from_slice(&((self.base + rva) as u64).to_le_bytes());
+                    buf[0..8].copy_from_slice(&(self.image(&key, rva)? as u64).to_le_bytes());
                     return Ok(());
                 }
                 let n: usize = body.parse().map_err(|_| format!("{key}: {v}"))?;
@@ -286,6 +426,7 @@ impl<'a> Builder<'a> {
             }
             Ty::EntVec => {
                 let n = self.elements(path)?;
+                self.spend(path, n * 4)?;
                 let mut data = Vec::with_capacity(n * 4);
                 for i in 0..n {
                     let l = format!("{path}[{i}]");
@@ -302,6 +443,8 @@ impl<'a> Builder<'a> {
                 if n.saturating_mul(elem.stride) > MAX_BLOB {
                     return Err(format!("{path}: {n} elements of {:#x} bytes", elem.stride));
                 }
+                // held while the elements' own vectors are made (a vector member of an element)
+                self.spend(path, n * elem.stride)?;
                 let mut data = vec![0u8; n * elem.stride];
                 for i in 0..n {
                     let item = &mut data[i * elem.stride..(i + 1) * elem.stride];
@@ -316,6 +459,7 @@ impl<'a> Builder<'a> {
                 if n > MAX_BLOB {
                     return Err(format!("{path}: a vector of {n} bytes"));
                 }
+                self.spend(path, n)?;
                 let mut data = vec![0u8; n];
                 if let Some(raw) = self.val(&format!("{path}.raw")) {
                     let bytes = self.raw_value(&format!("{path}.raw"), raw)?;
@@ -328,7 +472,7 @@ impl<'a> Builder<'a> {
                 Self::put_triple(buf, t);
                 Ok(())
             }
-            Ty::Map(_) => {
+            Ty::Map(node) => {
                 let v = v.ok_or_else(|| format!("missing line {path}"))?;
                 let size: u64 = v
                     .split("size=")
@@ -343,11 +487,18 @@ impl<'a> Builder<'a> {
                 }
                 if let Some(g) = self.val(&format!("{path}.graph")) {
                     // the head pointer and the size, with the tree's nodes made as blocks of the heap graph
-                    let bytes = self.raw_value(&format!("{path}.graph"), g)?;
+                    let mut refs = Refs::default();
+                    let bytes = self.raw_value_refs(&format!("{path}.graph"), g, Some(&mut refs))?;
                     if bytes.len() != 0x10 {
                         return Err(format!("{path}: map graph has {} bytes, not 16", bytes.len()));
                     }
                     buf[..0x10].copy_from_slice(&bytes);
+                    self.containers.push(Container {
+                        path: path.to_string(),
+                        shape: Shape::Tree(node),
+                        words: bytes,
+                        refs,
+                    });
                 } else {
                     self.blocked.push(Blocked {
                         kind: "std::map",
@@ -357,7 +508,7 @@ impl<'a> Builder<'a> {
                 }
                 Ok(())
             }
-            Ty::Hash(_) => {
+            Ty::Hash(node) => {
                 let v = v.ok_or_else(|| format!("missing line {path}"))?;
                 let size: u64 = v
                     .split("size=")
@@ -371,13 +522,27 @@ impl<'a> Builder<'a> {
                 if size == 0 {
                     return Ok(());
                 }
+                // the copy constructor inserts the entries under this maximum load factor: 0, a tiny, negative or non-finite one makes
+                // its bucket count `ceil(n / load)` overflow, an undefined conversion or a throw inside the engine (review 2026-10-31;
+                // MSVC's rehash behaviour, not read from the engine's code). 1.0 is the library's default, and every hash with entries
+                // in the logged texts of the lab runs has it
+                if load != 1.0f32.to_bits() {
+                    return Err(format!("{path}: load factor {load:08x}, not the library's 1.0"));
+                }
                 if let Some(g) = self.val(&format!("{path}.graph")) {
                     // list head, size, bucket vector, mask and maximum index, with the list nodes as blocks of the heap graph
-                    let bytes = self.raw_value(&format!("{path}.graph"), g)?;
+                    let mut refs = Refs::default();
+                    let bytes = self.raw_value_refs(&format!("{path}.graph"), g, Some(&mut refs))?;
                     if bytes.len() != 0x38 {
                         return Err(format!("{path}: hash graph has {} bytes, not 56", bytes.len()));
                     }
                     buf[8..0x40].copy_from_slice(&bytes);
+                    self.containers.push(Container {
+                        path: path.to_string(),
+                        shape: Shape::Ring(node),
+                        words: bytes,
+                        refs,
+                    });
                 } else {
                     self.blocked.push(Blocked {
                         kind: "std::unordered_map",
@@ -438,14 +603,29 @@ impl<'a> Builder<'a> {
     }
 
     fn raw_value(&mut self, path: &str, v: &str) -> R<Vec<u8>> {
+        self.raw_value_refs(path, v, None)
+    }
+
+    /// [`Self::raw_value`]; `refs` gets where the value's own block references put their words.
+    fn raw_value_refs(&mut self, path: &str, v: &str, refs: Option<&mut Refs>) -> R<Vec<u8>> {
         let body = v.strip_prefix("raw:").ok_or_else(|| format!("{path}: not a raw value"))?;
         if let Some(h) = body.strip_prefix("b:") {
             return parse_hex(h);
         }
-        self.tokens(path, body)
+        self.tokens(path, body, refs)
     }
 
-    fn tokens(&mut self, path: &str, s: &str) -> R<Vec<u8>> {
+    /// The address of image offset `rva`. Only an offset inside the image bound is one: the encoder writes `I+` for nothing else
+    /// ([`IMAGE_BOUND`]), and past it the word would be an address in no module that the engine takes for one (a vtable, static
+    /// data) once it has the copy (review 2026-10-31). The bound is a constant, so every game reads the same text the same way.
+    fn image(&self, path: &str, rva: usize) -> R<usize> {
+        if rva >= IMAGE_BOUND {
+            return Err(format!("{path}: image offset {rva:#x} is past the image (bound {IMAGE_BOUND:#x})"));
+        }
+        Ok(self.base + rva)
+    }
+
+    fn tokens(&mut self, path: &str, s: &str, mut refs: Option<&mut Refs>) -> R<Vec<u8>> {
         let b = s.as_bytes();
         let mut out: Vec<u8> = Vec::new();
         let mut i = 0;
@@ -454,12 +634,18 @@ impl<'a> Builder<'a> {
                 i += 1;
                 continue;
             }
-            let start = i;
+            let (start, made) = (i, out.len());
             match b[i] {
                 b'z' => {
                     i += 1;
                     let n = Self::number(s, &mut i)?;
+                    if n.saturating_mul(8).saturating_add(out.len()) > MAX_BLOB {
+                        return Err(format!("{path}: a zero run of {n} words"));
+                    }
+                    // counted before it exists: a few digits are megabytes, and a `V` or `R` holds this frame while its own are made
+                    self.spend(path, n * 8)?;
                     out.resize(out.len() + n * 8, 0);
+                    continue;
                 }
                 b'w' => {
                     let h = s.get(i + 2..i + 18).ok_or("short w token")?;
@@ -477,6 +663,9 @@ impl<'a> Builder<'a> {
                     }
                     let mut w = [0u8; 0x20];
                     self.string_into(path, &text, &mut w)?;
+                    if text.len() > 15 {
+                        Refs::place(&mut refs, out.len(), 8);
+                    }
                     out.extend_from_slice(&w);
                     i = end;
                 }
@@ -484,20 +673,23 @@ impl<'a> Builder<'a> {
                     i += 1;
                     let n = Self::number(s, &mut i)?;
                     let (inner, next) = Self::bracketed(s, i)?;
-                    let data =
-                        if let Some(h) = inner.strip_prefix("b:") { parse_hex(h)? } else { self.tokens(path, inner)? };
+                    let data = if let Some(h) = inner.strip_prefix("b:") {
+                        parse_hex(h)?
+                    } else {
+                        self.tokens(path, inner, None)?
+                    };
                     if data.len() != n {
                         return Err(format!("{path}: vector token of {n} bytes holds {}", data.len()));
                     }
                     let mut t = [0u8; 24];
                     if n == 0 {
-                        let a = self.a.alloc(8).ok_or("allocation failed")? as u64;
-                        self.blocks += 1;
+                        let a = self.alloc(path, 8)? as u64;
                         Self::put_triple(&mut t, (a, a, a));
                     } else {
                         let tr = self.block(path, &data)?;
                         Self::put_triple(&mut t, tr);
                     }
+                    Refs::place(&mut refs, out.len(), 24);
                     out.extend_from_slice(&t);
                     i = next;
                 }
@@ -510,17 +702,13 @@ impl<'a> Builder<'a> {
                     } else if let Some(h) = inner.strip_prefix("b:") {
                         parse_hex(h)?
                     } else {
-                        self.tokens(path, inner)?
+                        self.tokens(path, inner, None)?
                     };
                     if data.len() != n {
                         return Err(format!("{path}: range token of {n} bytes holds {}", data.len()));
                     }
-                    let a = if n == 0 {
-                        self.blocks += 1;
-                        self.a.alloc(8).ok_or("allocation failed")? as u64
-                    } else {
-                        self.block(path, &data)?.0
-                    };
+                    let a = if n == 0 { self.alloc(path, 8)? as u64 } else { self.block(path, &data)?.0 };
+                    Refs::place(&mut refs, out.len(), 16);
                     out.extend_from_slice(&a.to_le_bytes());
                     out.extend_from_slice(&(a + n as u64).to_le_bytes());
                     i = next;
@@ -535,14 +723,31 @@ impl<'a> Builder<'a> {
                         off = usize::from_str_radix(&s[i..end], 16).map_err(|e| e.to_string())?;
                         i = end;
                     }
+                    let size = self.graph.get(&n).ok_or_else(|| format!("{path}: block B{n} is not in the text"))?.0;
+                    // the encoder writes an offset only for an address inside block n or just past its end (a vector's end and
+                    // capacity words); a larger one is an address in no block the rebuild made (review 2026-10-31)
+                    if off > size {
+                        return Err(format!("{path}: B{n}+{off:x} is past the end of its block of {size:#x} bytes"));
+                    }
                     let addr = self.block_addr(path, n)?;
+                    match refs.as_deref_mut() {
+                        Some(r) => {
+                            r.links.insert(out.len(), (n, off));
+                        }
+                        None => {
+                            self.elsewhere.entry(n).or_insert_with(|| path.to_string());
+                        }
+                    }
+                    Refs::place(&mut refs, out.len(), 8);
                     out.extend_from_slice(&((addr + off) as u64).to_le_bytes());
                 }
                 b'I' => {
                     let end = s[i..].find(' ').map_or(s.len(), |p| i + p);
                     let rva = usize::from_str_radix(s.get(i + 2..end).ok_or("short I token")?, 16)
                         .map_err(|e| e.to_string())?;
-                    out.extend_from_slice(&((self.base + rva) as u64).to_le_bytes());
+                    let addr = self.image(path, rva)?;
+                    Refs::place(&mut refs, out.len(), 8);
+                    out.extend_from_slice(&(addr as u64).to_le_bytes());
                     i = end;
                 }
                 b'P' => {
@@ -551,6 +756,9 @@ impl<'a> Builder<'a> {
                         path: format!("{path}+{:#x}", out.len()),
                         why: "points to an object the portable text does not describe (shared resource data, list or tree nodes, control blocks)",
                     });
+                    if let Some(r) = refs.as_deref_mut() {
+                        r.links.insert(out.len(), (UNRESOLVED, 0));
+                    }
                     out.extend_from_slice(&0u64.to_le_bytes());
                     i += 1;
                 }
@@ -561,6 +769,7 @@ impl<'a> Builder<'a> {
                 }
                 c => return Err(format!("{path}: unknown token starting {:?} at {start}", c as char)),
             }
+            self.spend(path, out.len() - made)?;
         }
         Ok(out)
     }
@@ -571,8 +780,7 @@ impl<'a> Builder<'a> {
             return Ok(a);
         }
         let (size, _) = *self.graph.get(&n).ok_or_else(|| format!("{path}: block B{n} is not in the text"))?;
-        let addr = self.a.alloc(size).ok_or_else(|| format!("{path}: allocation of block B{n} failed"))?;
-        self.blocks += 1;
+        let addr = self.alloc(&format!("{path} (B{n})"), size)?;
         self.made.insert(n, addr);
         self.fill.push_back(n);
         Ok(addr)
@@ -583,7 +791,8 @@ impl<'a> Builder<'a> {
         while let Some(n) = self.fill.pop_front() {
             let (size, tokens) = self.graph[&n];
             let name = format!("@B{n}");
-            let bytes = self.raw_value(&name, tokens)?;
+            let mut refs = Refs::default();
+            let bytes = self.raw_value_refs(&name, tokens, Some(&mut refs))?;
             if bytes.len() != size {
                 return Err(format!("{name}: {} bytes of tokens for a block of {size}", bytes.len()));
             }
@@ -591,6 +800,213 @@ impl<'a> Builder<'a> {
             if !self.a.write(addr, &bytes) {
                 return Err(format!("{name}: writing the block failed"));
             }
+            self.filled.insert(n, (bytes, refs));
+        }
+        Ok(())
+    }
+
+    /// The links of every engine container built from the text's heap graph, checked before anything of it reaches the engine. The
+    /// engine's copy constructor and destructor follow them (a tree from its sentinel's root through the children and every node's
+    /// isnil byte, the set behind each value of an id map the same way, a list from its sentinel through `next` and `prev`) and free
+    /// every node and the bucket vector. A link that is a literal word or an image address, points into a block or at a block of
+    /// another size, closes a cycle or reaches a node of another container would make the engine read or free memory that is not the
+    /// container's, and the proof runs only after that copy (review 2026-10-31: a damaged or hostile text could crash the receiving
+    /// game inside the engine). The walks are the encoder's own (`walk_tree`, `register_hash_list`, `register_hash_buckets` in
+    /// `portable`), applied to the text's block references instead of memory, with two rules the encoder does not check: an empty
+    /// tree's root is its sentinel, and the buckets are a power of two with the mask one less ([`Self::tree`], the bucket vector
+    /// below; every logged text of the lab runs keeps both, but they are MSVC's behaviour, not read from the engine's code). A block
+    /// reference to a node or bucket vector of a container is one of its links or the text is refused: a link word of a block of
+    /// that same container ([`Links`]: a node's or sentinel's tree or list links, the set head of an id map's node, any word of the
+    /// bucket vector), never any other word (none of the logged texts of the lab runs that build has one).
+    ///
+    /// The verdict depends on the text alone, the same on every game: the walks follow block numbers, and every count and flag they
+    /// read (sizes, mask, colour and isnil) must be bytes of the text, never part of an address this game placed. Literal words
+    /// elsewhere are not judged: in unnamed bytes and values the layout does not say which word is a pointer, data looks like
+    /// addresses (b64: packed 32-bit values), and "an address in this game" would differ from game to game. A container whose walk
+    /// meets a `P` is left to the refusal of every unresolved pointer ([`Built::blocked`]), which lists each one in its report.
+    fn check_containers(&self) -> R<()> {
+        let mut owned = Owners { of: HashMap::new(), now: 0 };
+        let mut complete = true;
+        for (k, c) in self.containers.iter().enumerate() {
+            owned.now = k;
+            match self.check_container(c, &mut owned) {
+                Ok(()) => {}
+                Err(Stop::Unresolved) => complete = false,
+                Err(Stop::Bad(why)) => return Err(why),
+            }
+        }
+        if !complete {
+            // a walk cut short at a `P` leaves some of its nodes without an owner; the text is refused for the `P` anyway
+            return Ok(());
+        }
+        // A word that points at a container's node or bucket vector and is not one of that container's own links (in unnamed bytes,
+        // a raw member, a `V` or `R`, another container's block, or a value word of its own nodes): the source's destructor frees
+        // that block and the engine's copy keeps the word as it is, so the injected Proposal would hold a freed address; a vector
+        // member of its own node aimed at its sentinel is freed twice by the source's destructor (review 2026-10-31).
+        let node_of = |n: usize| owned.of.get(&n).map(|&(k, _)| (k, self.containers[k].path.as_str()));
+        let refused = |at: &str, n: usize, c: &str| {
+            Err(format!("{at}: a reference to @B{n}, a node of {c}, outside that container's links"))
+        };
+        for (&n, at) in &self.elsewhere {
+            if let Some((_, c)) = node_of(n) {
+                return refused(at, n, c);
+            }
+        }
+        let mut blocks: Vec<usize> = self.filled.keys().copied().collect();
+        blocks.sort_unstable();
+        for s in blocks {
+            let own = owned.of.get(&s).copied();
+            for (&off, &(n, _)) in &self.filled[&s].1.links {
+                if let Some((k, c)) = node_of(n) {
+                    if !own.is_some_and(|(o, links)| o == k && links.at(off)) {
+                        return refused(&format!("@B{s}+{off:#x}"), n, c);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_container(&self, c: &Container, owned: &mut Owners) -> W<()> {
+        let (p, size) = (c.path.as_str(), u64_at(&c.words, 8));
+        // the size the engine's copy goes by, and a hash's mask and bucket count
+        let counts: &[(usize, usize)] = match c.shape {
+            Shape::Tree(_) => &[(8, 0x10)],
+            Shape::Ring(_) => &[(8, 0x10), (0x28, 0x38)],
+        };
+        if counts.iter().any(|&(from, to)| !c.refs.literal(from, to)) {
+            return Err(Stop::Bad(format!("{p}: its size or bucket count is an address, not a number of the text")));
+        }
+        match c.shape {
+            Shape::Tree(map) => {
+                let head = self.link_in(p, &c.refs, "the head", 0, map.size)?;
+                let id_map = matches!(map.value, MapValue::IdSet);
+                let nodes =
+                    self.tree(p, head, size, map.size, if id_map { Links::IdNode } else { Links::Tree }, owned)?;
+                if id_map {
+                    for n in nodes {
+                        let (bytes, refs) = &self.filled[&n];
+                        let set = self.link_in(p, refs, &format!("@B{n}"), 0x28, SET_NODE)?;
+                        if !refs.literal(0x30, 0x38) {
+                            return Err(Stop::Bad(format!(
+                                "{p}: the set size at @B{n}+0x30 is an address, not a number"
+                            )));
+                        }
+                        let size = bytes.get(0x30..0x38).map_or(u64::MAX, |w| u64_at(w, 0));
+                        self.tree(p, set, size, SET_NODE, Links::Tree, owned)?;
+                    }
+                }
+                Ok(())
+            }
+            Shape::Ring(list) => {
+                let head = self.link_in(p, &c.refs, "the head", 0, list.size)?;
+                self.ring(p, head, size, list.size, owned)?;
+                // begin at the start of a block, end and capacity in it, the capacity its end: the vector's destructor frees the
+                // block by begin and capacity. Two list pointers per bucket, a power-of-two bucket count and the mask one less
+                // (MSVC's invariant; every hash with entries in the logged injection texts of the lab runs has it): the copy
+                // constructor puts each element into bucket `hash & mask` of a vector as long as the source's, so a larger mask
+                // writes past it
+                let words = [0x10, 0x18, 0x20].map(|off| c.refs.get(off));
+                if words.iter().any(|w| w.is_some_and(|(n, _)| n == UNRESOLVED)) {
+                    return Err(Stop::Unresolved);
+                }
+                let (mask, buckets) = (u64_at(&c.words, 0x28), u64_at(&c.words, 0x30));
+                match words {
+                    [Some((bk, 0)), Some((e, eo)), Some((k, ko))]
+                        if e == bk
+                            && k == bk
+                            && ko == self.graph[&bk].0
+                            && eo as u64 == buckets.saturating_mul(16)
+                            && eo <= ko
+                            && buckets.is_power_of_two()
+                            && mask == buckets - 1 =>
+                    {
+                        if !owned.take(bk, Links::Buckets) {
+                            return Err(Stop::Bad(format!("{p}: its bucket vector @B{bk} belongs to another container too")));
+                        }
+                        Ok(())
+                    }
+                    _ => Err(Stop::Bad(format!(
+                        "{p}: its bucket vector is not one block of the text from begin to capacity holding its {buckets} \
+                         buckets (mask {mask:#x})"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// The block a link of the text points at: the word at `off` of a value (`refs`) must be a block reference to the start of a
+    /// block of `node` bytes.
+    fn link_in(&self, path: &str, refs: &Refs, at: &str, off: usize, node: usize) -> W<usize> {
+        match refs.get(off) {
+            Some((UNRESOLVED, _)) => Err(Stop::Unresolved),
+            Some((n, 0)) if self.graph.get(&n).is_some_and(|g| g.0 == node) => Ok(n),
+            _ => Err(Stop::Bad(format!(
+                "{path}: the link at {at}+{off:#x} is not the start of a node block of {node:#x} bytes (a literal word, an image \
+                 address, a place inside a block or a block of another size)"
+            ))),
+        }
+    }
+
+    fn link(&self, path: &str, n: usize, off: usize, node: usize) -> W<usize> {
+        let refs = &self.filled.get(&n).ok_or_else(|| Stop::Bad(format!("{path}: @B{n} was never filled")))?.1;
+        self.link_in(path, refs, &format!("@B{n}"), off, node)
+    }
+
+    /// The nodes of the tree at sentinel `head` (`portable`'s `walk_tree`): reached from the sentinel's root through the children,
+    /// each once, isnil clear, exactly `size` of them. The root link is followed for an empty tree too: MSVC's tree copy reads the
+    /// root's isnil byte whatever the size (`_Copy_nodes`), and its empty tree's root is the sentinel itself.
+    fn tree(&self, path: &str, head: usize, size: u64, node: usize, nodes: Links, owned: &mut Owners) -> W<Vec<usize>> {
+        // colour and isnil must be bytes of the text: as part of an address this game placed (a `B` at +0x18) they would differ from
+        // game to game, and so would the verdict (review 2026-10-31: one of 256 allocator layouts accepted such a node)
+        let isnil = |n: usize| {
+            self.filled.get(&n).filter(|(_, r)| r.literal(0x18, 0x1a)).and_then(|(b, _)| b.get(0x19)).copied()
+        };
+        if isnil(head) != Some(1) || !owned.take(head, Links::Tree) {
+            return Err(Stop::Bad(format!("{path}: @B{head} is not a tree's own sentinel")));
+        }
+        let mut found = Vec::new();
+        let mut stack = vec![self.link(path, head, 8, node)?];
+        while let Some(a) = stack.pop() {
+            if a == head {
+                continue;
+            }
+            if found.len() as u64 >= size || !owned.take(a, nodes) || isnil(a) != Some(0) {
+                return Err(Stop::Bad(format!(
+                    "{path}: the tree at @B{head} is not {size} nodes of its own (at @B{a})"
+                )));
+            }
+            stack.push(self.link(path, a, 0, node)?);
+            stack.push(self.link(path, a, 0x10, node)?);
+            found.push(a);
+        }
+        if found.len() as u64 != size {
+            return Err(Stop::Bad(format!(
+                "{path}: the tree at @B{head} has {} nodes, its size is {size}",
+                found.len()
+            )));
+        }
+        Ok(found)
+    }
+
+    /// The list at sentinel `head` (`portable`'s `register_hash_list`): back at the sentinel after exactly `size` nodes of its own,
+    /// every `prev` the node before.
+    fn ring(&self, path: &str, head: usize, size: u64, node: usize, owned: &mut Owners) -> W<()> {
+        if !owned.take(head, Links::List) {
+            return Err(Stop::Bad(format!("{path}: its list sentinel @B{head} belongs to another container too")));
+        }
+        let (mut prev, mut at, mut count) = (head, self.link(path, head, 0, node)?, 0u64);
+        while at != head {
+            if count >= size || !owned.take(at, Links::List) || self.link(path, at, 8, node)? != prev {
+                return Err(Stop::Bad(format!(
+                    "{path}: the list at @B{head} is not {size} nodes of its own (at @B{at})"
+                )));
+            }
+            count += 1;
+            (prev, at) = (at, self.link(path, at, 0, node)?);
+        }
+        if count != size || self.link(path, head, 8, node)? != prev {
+            return Err(Stop::Bad(format!("{path}: the list at @B{head} has {count} nodes, its size is {size}")));
         }
         Ok(())
     }
@@ -653,6 +1069,7 @@ pub fn build_selected(text: &str, image_base: usize, a: &dyn Alloc, select: Opti
                 let size: usize = size
                     .strip_prefix("size=")
                     .and_then(|x| x.parse().ok())
+                    .filter(|&n| n <= MAX_BLOB)
                     .ok_or_else(|| format!("bad size in {p}"))?;
                 graph.insert(n.parse().map_err(|_| format!("bad block number in {p}"))?, (size, tokens));
             } else {
@@ -673,10 +1090,17 @@ pub fn build_selected(text: &str, image_base: usize, a: &dyn Alloc, select: Opti
         graph,
         made: HashMap::new(),
         fill: VecDeque::new(),
+        filled: HashMap::new(),
+        containers: Vec::new(),
+        elsewhere: BTreeMap::new(),
+        spent: 0,
     };
     let mut payload = vec![0u8; PAYLOAD_SIZE];
     b.fields("", &mut payload, PAYLOAD, PAYLOAD_SIZE)?;
     b.fill_blocks()?;
+    // before the payload goes anywhere: the receiver's engine copies it right after (`inject::build_verified`), the originator's
+    // text check (`inject::text_refusal`) runs this same build, so both come to the same verdict on the same text
+    b.check_containers()?;
     Ok(Built { payload, blocked: b.blocked, blocks: b.blocks })
 }
 
@@ -1266,6 +1690,127 @@ mod tests {
         assert_eq!(u64_at(&n1, 0) as usize, last);
     }
 
+    /// The text of the synthetic proposal with [`super::testgraph::add_containers`]: `old2new` (list sentinel B2, nodes B5 and B6,
+    /// buckets B3) and `parcelsMap` (sentinel B4, one node B7).
+    fn container_text() -> (Arena, String) {
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        super::testgraph::add_containers(&arena, at);
+        let text = encode(&arena, Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
+        for l in [
+            "old2new.graph\traw:B2 w:0000000000000002 B3 B3+80 B3+80 w:0000000000000007 w:0000000000000008",
+            "parcelsMap.graph\traw:B4 w:0000000000000001",
+            "@B5\tsize=24\traw:B6 B2 ",
+            "@B6\tsize=24\traw:B2 B5 ",
+            "@B7\tsize=80\traw:B4 B4 B4 z1 ",
+            "\traw:z24 I+500 B1 z369",
+            "@B1\tsize=38\t",
+            "proposal.idSet1a0.#\tset:null",
+        ] {
+            assert!(text.contains(l), "{l}: {text}");
+        }
+        assert!(
+            build(&text, BASE, &arena).is_ok(),
+            "the text as written passes: a capacity word at its block's end too"
+        );
+        (arena, text)
+    }
+
+    /// `text` with its first `from` replaced by `to` is refused by the rebuild, with `why` in the reason.
+    fn refused(arena: &Arena, text: &str, from: &str, to: &str, why: &str) {
+        let e = build(&text.replacen(from, to, 1), BASE, arena).err().unwrap_or_else(|| panic!("{to}: not refused"));
+        assert!(e.contains(why), "{to}: {e}");
+    }
+
+    #[test]
+    fn an_address_past_the_image_or_its_block_or_a_size_past_the_bound_refuses_the_text() {
+        // review 2026-10-31: the image offsets, block offsets and sizes of a peer's text went into the payload unchecked, and the
+        // receiver's engine copied from them before the proof; refused by the rebuild, before any engine call, on every game alike
+        let (arena, text) = container_text();
+        refused(&arena, &text, "I+500 B1", "I+10000000 B1", "past the image");
+        refused(&arena, &text, "idSet1a0.#\tset:null", "idSet1a0.#\tset:0,I+10000000", "past the image");
+        refused(&arena, &text, "B3+80 B3+80", "B3+80 B3+81", "past the end of its block");
+        refused(&arena, &text, "@B1\tsize=38", "@B1\tsize=99999999999", "bad size");
+        refused(&arena, &text, "B1 z369", "B1 z9999999999999", "a zero run");
+        // blocks within the bound one by one, past it in all
+        let big = (90..93).map(|n| format!("\n@B{n}\tsize={MAX_BLOB}\traw:z{}", MAX_BLOB / 8)).collect::<String>();
+        let e = build(&(text.replacen("B1 z369", "B90 B91 B92 z367", 1) + &big), BASE, &arena).err().expect("refused");
+        assert!(e.contains("(B91): the text allocates more than"), "{e}");
+        // nested vectors whose every level holds a zero run of 64 MB while the next is made: the scratch counts too, so the third run
+        // is refused before it exists (uncounted, the three runs were held and the text then refused for the vector's size)
+        let z = MAX_BLOB / 8;
+        let nested = format!("V8[z{} V8[z{} V8[z{z}]]] z367", z - 3, z - 3);
+        let e = build(&text.replacen("B1 z369", &nested, 1), BASE, &arena).err().expect("refused");
+        assert!(e.contains("the text allocates more than"), "{e}");
+        // a hash with entries copied under a load factor of 0 (its bucket count would be n / 0)
+        refused(&arena, &text, "hash:size=2,load=3f800000", "hash:size=2,load=00000000", "load factor 00000000");
+        assert!(
+            build(&text.replacen("I+500 B1", "I+fffffff B1", 1), BASE, &arena).is_ok(),
+            "the last offset of the image"
+        );
+    }
+
+    #[test]
+    fn a_container_link_that_is_not_one_of_its_own_nodes_refuses_the_text() {
+        // review 2026-10-31: the engine's copy constructor and destructor follow these links before the proof can run
+        let (arena, text) = container_text();
+        let no = |from: &str, to: &str, why: &str| refused(&arena, &text, from, to, why);
+        // the map's head: a literal word, an image address, a place inside its block
+        for head in ["w:0000000012345678", "I+500", "B4+8"] {
+            no("parcelsMap.graph\traw:B4 ", &format!("parcelsMap.graph\traw:{head} "), "the link at the head+0x0");
+        }
+        // a child that is a literal, a node that is its own child (a cycle), a size the tree does not hold
+        no("@B7\tsize=80\traw:B4 ", "@B7\tsize=80\traw:w:0000000012345678 ", "the link at @B7+0x0");
+        no("@B7\tsize=80\traw:B4 ", "@B7\tsize=80\traw:B7 ", "is not 1 nodes of its own");
+        no("raw:B4 w:0000000000000001", "raw:B4 w:0000000000000002", "has 1 nodes, its size is 2");
+        // the hash list: a next that is a literal, a prev that is not the node before
+        no("@B5\tsize=24\traw:B6 ", "@B5\tsize=24\traw:w:0000000012345678 ", "the link at @B5+0x0");
+        no("@B6\tsize=24\traw:B2 B5 ", "@B6\tsize=24\traw:B2 B6 ", "is not 2 nodes of its own");
+        // its buckets: not from the block's start, a mask past them
+        no("B3 B3+80 B3+80", "B3+8 B3+80 B3+80", "bucket vector");
+        no("w:0000000000000007 w:0000000000000008", "w:000000000000000f w:0000000000000008", "bucket vector");
+        // two containers on one list: each destructor would free it
+        no(
+            "proposal.hash90\thash:size=0,load=00000000",
+            "proposal.hash90\thash:size=2,load=3f800000\nproposal.hash90.graph\traw:B2 w:0000000000000002 B3 B3+80 B3+80 \
+             w:0000000000000007 w:0000000000000008",
+            "belongs to another container too",
+        );
+        // a count or flag the walk reads that is an address of this game: a size, a hash's bucket count, a node's isnil byte
+        no("raw:B4 w:0000000000000001", "raw:B4 I+1", "parcelsMap: its size or bucket count is an address");
+        no(
+            "w:0000000000000007 w:0000000000000008",
+            "w:0000000000000007 I+8",
+            "old2new: its size or bucket count is an address",
+        );
+        // the same for the address words of a long string, a vector and a range (each placed, so never taken for a number)
+        let long = format!("B2 S32:{}", "41".repeat(32));
+        no("B2 w:0000000000000002 B3 B3+80 B3+80", &long, "old2new: its size or bucket count is an address");
+        no("B3+80 w:0000000000000007 w:0000000000000008", "V0[]", "old2new: its size or bucket count is an address");
+        no("w:0000000000000007 w:0000000000000008", "R0[]", "old2new: its size or bucket count is an address");
+        // as byte 1 of a block's address, isnil was 0 under one allocator layout in 256 (review 2026-10-31): now one verdict for all
+        let isnil = text.replacen("@B7\tsize=80\traw:B4 B4 B4 z1 ", "@B7\tsize=80\traw:B4 B4 B4 B4 ", 1);
+        let verdicts: std::collections::BTreeSet<String> = (0..256)
+            .map(|k| build(&isnil, BASE, &Arena::new(0x3000_0000_0000 + k * 0x100)).err().unwrap_or_default())
+            .collect();
+        assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+        assert!(verdicts.iter().all(|e| e.contains("is not 1 nodes of its own (at @B7)")), "{verdicts:?}");
+        // a word pointing at a container's node that is not one of its links: in unnamed bytes, inside a vector, from another
+        // container, a value word of its own node (a parcel's faces vector aimed at its sentinel would be freed twice)
+        no("B1 z369", "B7 z369", ": a reference to @B7, a node of parcelsMap, outside");
+        no("B1 z369", "V8[B5] z367", ": a reference to @B5, a node of old2new, outside");
+        no(
+            "@B5\tsize=24\traw:B6 B2 w:fffffffefffffffd",
+            "@B5\tsize=24\traw:B6 B2 B7",
+            "@B5+0x10: a reference to @B7, a node of parcelsMap",
+        );
+        no("@B5\tsize=24\traw:B6 B2 w:fffffffefffffffd", "@B5\tsize=24\traw:B6 B2 B6", "@B5+0x10: a reference to @B6");
+        no("w:000000000000004d z1 z1 z3", "w:000000000000004d z1 z1 B4 B4+50 B4+50", "@B7+0x38: a reference to @B4");
+        // a link the text leaves unresolved is refused for that (`Built::blocked`, every pointer in its report), not here
+        let p = build(&text.replacen("@B7\tsize=80\traw:B4 ", "@B7\tsize=80\traw:P ", 1), BASE, &arena).expect("built");
+        assert!(p.blocked.iter().any(|b| b.kind == "heap pointer" && b.path == "@B7+0x0"), "{:?}", p.blocked);
+    }
+
     #[test]
     fn the_real_commands_of_the_spike_run_are_rebuilt_as_far_as_the_text_goes() {
         let Ok(dump) = std::fs::read_to_string(concat!(
@@ -1522,6 +2067,12 @@ mod tests {
                 "{:?}",
                 built.blocked
             );
+            // the set's size is a number of the text, never an address this game placed (review 2026-10-31)
+            let node =
+                text.lines().find(|l| l.starts_with("@B") && l.contains("w:00000000fffffffb B")).expect("{text}");
+            let bad = text.replacen(node, &node.replacen("w:0000000000000002", "I+2", 1), 1);
+            let e = build_selected(&bad, BASE, &arena, None).err().expect("refused");
+            assert!(e.contains(&format!("{name}: the set size at @B")), "{node}: {e}");
         }
     }
 
@@ -1864,6 +2415,10 @@ mod tests {
             graph: HashMap::new(),
             made: HashMap::new(),
             fill: VecDeque::new(),
+            filled: HashMap::new(),
+            containers: Vec::new(),
+            elsewhere: BTreeMap::new(),
+            spent: 0,
         };
         let mut buf = [0xaau8; 0x20];
         b.field("x", Ty::EntSet, &mut buf).unwrap();

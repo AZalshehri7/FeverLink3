@@ -741,8 +741,7 @@ class CompanyUnit(unittest.TestCase):
             }
         """)
         engine = L.eval("""{ player = function() return api.engine.util.getPlayer() end,
-                             account = function() return api.engine.util.getPlayer() * 10, 3 end,
-                             bookJournal = function(n) BOOKED_ON = api.engine.util.getPlayer() end }""")
+                             account = function() return api.engine.util.getPlayer() * 10, 3 end }""")
         sent = L.eval("{}")
         deps = L.eval("function(sent) return { sender = function() return function(c) sent[#sent + 1] = c end end } end")(sent)
         self.Co.extendEngine(engine, deps)
@@ -763,8 +762,6 @@ class CompanyUnit(unittest.TestCase):
         self.assertEqual(L.eval("api.engine.util.getPlayer()"), 52001)
         self.assertEqual(engine.canonicalPlayer(), 7)
         self.assertEqual(pair(engine.account()), (70, 3), "the money the checksum compares is the savegame's player's")
-        engine.bookJournal(5)
-        self.assertEqual(L.eval("BOOKED_ON"), 7)
         self.assertEqual(L.eval("api.engine.util.getPlayer()"), 52001, "and the windows' player is put back")
         # even when the money code fails: the error goes on, the windows' player is put back first
         failing = L.eval("{ account = function() error('boom') end }")
@@ -1041,7 +1038,7 @@ class CompanyGameTest(unittest.TestCase):
         self.relay.pump()
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
         self.tick(20)
-        self.assertEqual(set(self.relay.reports[1][0][1]) - {"stations", "edges", "nodeConfigs", "vehicles", "names", "ids"}, {"time", "balance", "loan", "constructions", "lines", "townBuildings"}, "pristine: no part")
+        self.assertEqual(set(self.relay.reports[1][0][1]) - {"stations", "edges", "nodeConfigs", "vehicles", "names", "ids"}, {"time", "balance", "loan", "constructions", "lines", "townBuildings", "constructions@ids", "townBuildings@ids"}, "pristine: no part")
         self.assertTrue(self.buy(self.B))
         self.assertTrue(self.line(self.B))
         self.assertTrue(self.buy(self.A))
@@ -1411,25 +1408,14 @@ class CompanyGameTest(unittest.TestCase):
         self.tick(20)
         self.assertEqual(self.both("#GAME.applied"), applied)
         self.assertEqual(len(self.A.registry()["companies"]), 2)
-        # the host's money authority still corrects the savegame's player, and leaves the client's company (the windows show it) alone
-        company_b, journals_b = self.B.ev("ACCOUNTS[%d].balance" % pb), self.B.ev("#(JOURNALS[%d] or {})" % pb)
-        own = self.B.ev("ACCOUNT.balance")
-        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 5000")        # the savegame's player drifts on the client
+        # the balance lane reads the savegame's player, not the client's company the windows show
+        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 5000")        # the savegame's player differs on the client
         self.relay.pump()
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
         self.tick(20)
         ra, rb = self.relay.reports[1][0][1], self.relay.reports[1][1][1]
         self.assertIn("balance", {k for k in ra if ra[k] != rb[k]})
-        self.relay.send_authority(1)
-        self.tick(6)
-        self.assertEqual(self.B.ev("ACCOUNT.balance"), own + 5000, "one round alone is not corrected")
-        self.relay.checksum_request(2, self.relay.future_stamp(), False)
-        self.tick(20)
-        self.relay.send_authority(2)
-        self.tick(6)
-        self.assertEqual(self.B.ev("ACCOUNT.balance"), own, "corrected once the same difference was seen twice")
-        self.assertEqual(self.B.ev("JOURNALS[7][#JOURNALS[7]]"), -5000)
-        self.assertEqual((self.B.ev("ACCOUNTS[%d].balance" % pb), self.B.ev("#(JOURNALS[%d] or {})" % pb)), (company_b, journals_b))
+        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance - 5000")
         # nobody leaves in this mode; joining the host's company plays as the savegame's player, joining back switches back
         self.assertFalse(self.op(self.B, op="leave"))
         self.assertTrue(self.op(self.B, op="join", company="c1"))

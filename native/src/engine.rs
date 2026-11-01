@@ -152,11 +152,16 @@ pub struct Held {
     /// Cancelling this command fires the tool's completion callback first: the switch is on and the callback's `_Do_call` is one the
     /// build table lists. Decided when the command is captured.
     done_ok: bool,
+    /// The world (game interface) the command was taken in (`Runtime::world`), set by the caller right after the capture.
+    world: u64,
 }
 
 // SAFETY: a Held is plain bytes and engine pointers that are only used on the thread that makes the calls
 // (the interface thread, in the Add hook); it travels through the state machine as an opaque value.
 unsafe impl Send for Held {}
+
+// [`abandon`] relies on it: freeing a Held's box runs nothing but the allocator, never an engine destructor.
+const _: () = assert!(!core::mem::needs_drop::<Held>());
 
 impl Held {
     pub fn payload(&self) -> usize {
@@ -167,6 +172,30 @@ impl Held {
     pub fn done_ok(&self) -> bool {
         self.done_ok
     }
+
+    /// The command list the command was taken from (the one [`release`] adds it to).
+    pub fn list(&self) -> *mut u8 {
+        self.list
+    }
+
+    pub fn world(&self) -> u64 {
+        self.world
+    }
+
+    pub fn set_world(&mut self, world: u64) {
+        self.world = world;
+    }
+}
+
+/// Gives up a held command of a world that is gone (review 2026-10-31): only this module's box is freed. Nothing of the
+/// engine is called: its list, its tool's callback and the command's own destructor belong to a world whose memory is freed or
+/// reused, so releasing, failing or completing it would be a use after free. What the engine owns of it (the payload, the callable)
+/// is leaked on purpose: the command's whole engine-owned Proposal payload with its containers, and the callable with its captures,
+/// for each held command of the old world (at most the ring's capacity). Freeing it would run the old world's destructors; at the
+/// rate worlds change (a load) the leak is harmless.
+#[allow(clippy::boxed_local)] // taking the Box is the point: a held command leaves the machine once
+pub fn abandon(held: Box<Held>) {
+    drop(held); // plain bytes (the assertion above): no destructor of the game runs
 }
 
 /// Reads the kind byte of the command at `cmd` (a `Command*`): payload pointer, then the byte at `kind_offset`.
@@ -384,7 +413,8 @@ pub unsafe extern "system-unwind" fn capture(fns: &EngineFns, args: &AddArgs) ->
 /// never called inside `log::guarded`).
 ///
 /// # Safety
-/// `add` is the unhooked `CommandList::Add`; the list the command was taken for must still exist.
+/// `add` is the unhooked `CommandList::Add`; the list the command was taken for must still exist (`Runtime::take_due_here` gives up a
+/// command of an earlier world instead).
 #[allow(clippy::boxed_local)] // taking the Box is the point: a held command can be handed back only once
 pub unsafe extern "system-unwind" fn release(fns: &EngineFns, mut held: Box<Held>, add: AddFn) {
     crate::log::calls_engine("release (Add)");

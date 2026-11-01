@@ -37,7 +37,7 @@ pub mod speed;
 #[cfg(test)]
 pub(crate) mod fake;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 pub use speed::{specs_for, RunKind, RunOutcome, RunSpec};
 use speed::{Incoming, Phase, SpeedRun};
@@ -426,14 +426,22 @@ struct ProbeState {
     /// The last run's outcome, once it has ended.
     outcome: Option<RunOutcome>,
     incoming: Option<Incoming>,
-    senders: usize,
-    /// A datagram upload from a friend that we are receiving (its transfer id).
-    dg_in: Option<u32>,
-    /// A parallel (`Auto (scaled)`) upload from a friend that we are receiving: the connection of the speed test and
-    /// the run id it carries.
-    par_in: Option<(Handle, u64)>,
-    /// Tests the tester asked us to stop sending.
+    /// The uploads we make for friends' speed tests: the run id and the connection that asked (at most
+    /// [`speed::MAX_SENDERS`]).
+    sending: Vec<(u64, Handle)>,
+    /// A datagram upload from a friend that we are receiving: the connection and its transfer id.
+    dg_in: Option<(Handle, u32)>,
+    /// A parallel (`Auto (scaled)`) upload from a friend that we are receiving: the connection of the speed test, the
+    /// run id it carries and the friend's account.
+    par_in: Option<(Handle, u64, u64)>,
+    /// Tests the tester asked us to stop sending: only ids of `sending`, so it never holds more than they do (review
+    /// 2026-10-31: any peer could grow it with `tput stop` messages).
     stopped_ids: std::collections::HashSet<u64>,
+    /// Per account, the friends' runs we did work for in the last minute: their ids, when they began and what each
+    /// asked of us so far.
+    responder_runs: HashMap<u64, Vec<(u64, Instant, Vec<speed::Ask>)>>,
+    /// Parallel allowances (account, owner) to withdraw at the next poll, where no lock is held.
+    withdraw: Vec<(u64, u64)>,
     last_run_id: u64,
     /// A series of runs (the window's "both" or "parallel"): the ones still to run, the result blocks so far.
     plan: VecDeque<RunSpec>,
@@ -454,6 +462,10 @@ struct ProbeService {
     hub: Arc<bulk_io::Hub>,
     /// Acts like an older program that does not know the rate request (tests).
     legacy: std::sync::atomic::AtomicBool,
+    /// This game hosts or plays a session (set by the controller): no work for other players' speed tests.
+    in_session: std::sync::atomic::AtomicBool,
+    /// The standalone responder: every tester is served (see [`Probe::serve_every_tester`]).
+    serve_all: std::sync::atomic::AtomicBool,
     /// What the parallel receiver reported, taken by the poll (the callbacks only queue, they never lock `state`).
     par_events: Mutex<Vec<speed::ParNote>>,
     /// The listener for parallel bulk connections of this core (created on first use).
@@ -545,6 +557,17 @@ impl Owner for ProbeService {
         if state.incoming.as_ref().is_some_and(|i| i.conn == conn) {
             state.incoming = None;
         }
+        // what a friend asked of us ends with its connection (review 2026-10-31: a `parup` without lanes held
+        // `par_in` until the game restarted); the parallel allowance goes at the next poll, outside the poller
+        if let Some((_, _, remote)) = state.par_in.filter(|p| p.0 == conn) {
+            state.par_in = None;
+            state.withdraw.push((remote, speed::SPEED_RESPONDER));
+        }
+        if state.dg_in.is_some_and(|d| d.0 == conn) {
+            state.dg_in = None;
+        }
+        let asked: Vec<u64> = state.sending.iter().filter(|s| s.1 == conn).map(|s| s.0).collect();
+        state.stopped_ids.extend(asked);
         if end.cause != Cause::Local {
             if let Some(run) = state.speed.as_mut().filter(|r| r.owns(conn) && r.active()) {
                 run.phase = Phase::Failed(format!("the connection ended: {}", end.describe()));
@@ -591,6 +614,8 @@ impl Probe {
             state: Mutex::new(ProbeState::default()),
             hub: bulk_io::Hub::new(),
             legacy: std::sync::atomic::AtomicBool::new(false),
+            in_session: std::sync::atomic::AtomicBool::new(false),
+            serve_all: std::sync::atomic::AtomicBool::new(false),
             par_events: Mutex::new(Vec::new()),
             par_svc: Mutex::new(None),
         });
@@ -1399,6 +1424,85 @@ mod tests {
     }
 
     #[test]
+    fn a_friends_test_is_turned_away_in_a_session_and_bounded_per_account() {
+        // review 2026-10-31: the probe served any account, any number of times, also in a session
+        let machine = FakeMachine::new();
+        let core = machine.core();
+        let probe = Probe::on(core.handle());
+        let svc = &probe.service;
+        {
+            let mut state = lock(&svc.state);
+            state.peers.push(Peer { conn: 77, steam_id: Some(5), link: None });
+            state.peers.push(Peer { conn: 78, steam_id: None, link: None });
+        }
+        let now = Instant::now();
+        let ok = |conn: Handle, id: u64, ask: speed::Ask, at: Instant| {
+            svc.responder_ok(&mut lock(&svc.state), conn, id, ask, at)
+        };
+        use speed::Ask::{DgUp, Down, Up};
+        probe.set_in_session(true);
+        assert!(!ok(77, 1, Up, now), "in a session");
+        probe.set_in_session(false);
+        // one test of the window: each run's upload and download pass; the next run within the minute not
+        for id in 1..=4 {
+            assert!(ok(77, id, Up, now) && ok(77, id, Down, now), "run {id}");
+        }
+        assert!(!ok(77, 1, Down, now), "a run asks for each once: a reused id gets nothing more");
+        assert!(!ok(77, 5, DgUp, now));
+        assert!(!ok(78, 9, Up, now), "an unknown account");
+        let later = now + Duration::from_secs(61);
+        assert!(ok(77, 5, Up, later), "a minute later");
+        // an old run's id, once its minute is over, counts as a new run again
+        for id in 1..=3 {
+            assert!(ok(77, id, Down, later), "run {id} again");
+        }
+        assert!(!ok(77, 4, Down, later));
+
+        // the standalone responder serves every tester, as often as its ladder asks
+        let open = Probe::on(core.handle());
+        open.serve_every_tester();
+        open.set_in_session(true);
+        lock(&open.service.state).peers.push(Peer { conn: 77, steam_id: Some(5), link: None });
+        for id in 1..=10 {
+            assert!(open.service.responder_ok(&mut lock(&open.service.state), 77, id, Down, now), "run {id}");
+        }
+
+        // a friend's upload that sent nothing for as long as a tester waits no longer holds the place
+        let long_ago = now.checked_sub(throughput::ABORT_AFTER + Duration::from_secs(1)).unwrap();
+        lock(&svc.state).incoming = Some(Incoming {
+            conn: 77,
+            remote: Some(5),
+            rx: throughput::Receiver::new(1, 1 << 20, long_ago),
+            end: None,
+        });
+        probe.drive_speed();
+        assert!(lock(&svc.state).incoming.is_none());
+
+        // `stop` is kept only for a run this connection asked us to send: a flood of others leaves nothing behind
+        for id in 0..10_000 {
+            svc.tput(77, throughput::Msg::Stop { id });
+        }
+        assert!(lock(&svc.state).stopped_ids.is_empty());
+        lock(&svc.state).sending.push((3, 77));
+        svc.tput(78, throughput::Msg::Stop { id: 3 });
+        assert!(lock(&svc.state).stopped_ids.is_empty(), "another connection's stop");
+        svc.tput(77, throughput::Msg::Stop { id: 3 });
+        assert_eq!(lock(&svc.state).stopped_ids.len(), 1);
+
+        // a friend's parallel upload that never sent a lane ends with its connection, the allowance with it
+        {
+            let mut state = lock(&svc.state);
+            state.stopped_ids.clear();
+            state.par_in = Some((77, 3, 5));
+        }
+        svc.closed(77, End { opened: true, cause: Cause::Peer, code: 0, detail: String::new() });
+        let state = lock(&svc.state);
+        assert!(state.par_in.is_none());
+        assert_eq!(state.withdraw, vec![(5, speed::SPEED_RESPONDER)]);
+        assert!(state.stopped_ids.contains(&3), "what it asked us to send stops");
+    }
+
+    #[test]
     fn reliable_runs_over_several_connections_count_every_chunk_once() {
         for n in [2u32, 4] {
             let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
@@ -1422,22 +1526,24 @@ mod tests {
     #[test]
     fn a_run_at_a_chosen_send_rate_asks_the_peer_to_set_its_own_and_both_restore_it() {
         let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        let default = Config::default().send_rate;
         let spec = RunSpec { rate: Some(4 << 20), ..RunSpec::reliable(2) };
         probe_a.start_run(b.steam_id(), spec);
         let outcome = finish(&mut probe_a, &mut probe_b, "the run");
         assert_eq!(outcome.failure, None, "{outcome:?}");
         let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+        // the peer goes no faster than its own setting (review 2026-10-31) and says so
         assert!(
             r.rate_note.contains("own send rate set to 4194304")
-                && r.rate_note.contains("peer set its send rate to 4194304"),
+                && r.rate_note.contains(&format!("peer set its send rate to {default}")),
             "{}",
             r.rate_note
         );
-        let default = Config::default().send_rate;
-        for machine in [&a, &b] {
-            let rates: Vec<i32> = machine.connection_config().iter().filter(|c| c.1 == 10).map(|c| c.2).collect();
-            assert!(rates.contains(&(4 << 20)), "{rates:?}");
-        }
+        let rates = |machine: &FakeMachine| -> Vec<i32> {
+            machine.connection_config().iter().filter(|c| c.1 == 10).map(|c| c.2).collect()
+        };
+        assert!(rates(&a).contains(&(4 << 20)), "{:?}", rates(&a));
+        assert!(!rates(&b).contains(&(4 << 20)), "{:?}", rates(&b));
         until("the peer to put its rate back", || {
             probe_a.poll();
             probe_b.poll();

@@ -723,6 +723,53 @@ function L.registerCommands(commands)
 	for name, spec in pairs(commands or {}) do L.COMMANDS[name] = spec end
 end
 
+-- Every command maker of the engine's api.cmd (the 55 of docs/COVERAGE_OPS.md, found by probing the engine: MPFever's C.FACTORIES,
+-- MIT). Both interface states wrap all of them, not only those with a schema (the UI hook in the window state, the bridge's installWrap
+-- in the script-GUI state), so every command sent there in a session carries its name: one no game can replicate is refused and logged
+-- by name, and only L.LOCAL_COMMANDS go to the engine unheld. The engine's table cannot be listed from a script (MPFever: pairs() gives
+-- nothing; the UI hook's DEV runs' member list added none either, their install line counted the same 32 functions as without DEV). A
+-- command of a maker missing here (api.cmd.debug's, the debug panel's) is refused unnamed.
+L.FACTORIES = {
+	"makeAnimalSetStateCmd", "makeAnimalSpawnAtCmd", "makeCreateIndustryExtendProposalCmd", "makeCustomEntityCreateCmd",
+	"makeCustomEntityDestroyCmd", "makeCustomEntityUpdateStateCmd", "makeCustomEntityUpdateTransformationCmd",
+	"makeCustomVehicleCreateOrUpdateCmd", "makeEntitySetColorCmd", "makeEntitySetEmissionsCmd", "makeEntitySetNameCmd",
+	"makeEntitySetPlayerCmd", "makeGameAddPlayerCmd", "makeGameSetCalendarSpeedCmd", "makeGameSetCloudCoverageCmd",
+	"makeGameSetDateCmd", "makeGameSetSpeedCmd", "makeGameSetTimeOfDayCmd", "makeIndustrySetDespawnTimeCmd",
+	"makeIndustrySetManualDevelopmentCmd", "makeJournalBookAssetCmd", "makeJournalClearAllCmd", "makeJournalLogEntryCmd",
+	"makeLineCreateCmd", "makeLineDestroyCmd", "makeLineUpdateCmd", "makeScriptingSendEventCmd",
+	"makeStockListDiscardCargoCmd", "makeStockListSetModifiersCmd", "makeStockListSetStocksCargoTypeCmd",
+	"makeTownAutoDetectConnectionsCmd", "makeTownBuildingSetBlockedDevelopmentCmd", "makeTownConnectWithIndustriesCmd",
+	"makeTownCreateCmd", "makeTownCustomDistributionWeightsCmd", "makeTownDestroyCmd", "makeTownDevelopAtCmd",
+	"makeTownSetDevelopmentActiveCmd", "makeTownSetInitialLandUseCapacitiesCmd", "makeTownUpdateCargoNeedsCmd",
+	"makeTownUpdateSizeCmd", "makeVehicleBuyCmd", "makeVehicleReplaceCmd", "makeVehicleReverseCmd", "makeVehicleSellCmd",
+	"makeVehicleSendToDepotCmd", "makeVehicleSetLineCmd", "makeVehicleSetManualDepartureCmd", "makeVehicleSetModifiersCmd",
+	"makeVehicleSetStoppedByUserCmd", "makeVehicleTryToDepartCmd", "makeWorldBuildProposalCmd", "makeWorldChangeWindCmd",
+	"makeWorldReplaceTerrainCmd", "makeWorldSetBulldozableCmd",
+}
+
+-- The commands without a schema that change nothing in the world, so an interface state (a game window, another mod's script GUI)
+-- may send them in a session and the engine gets them at once, unheld, as in single-player. ONE list for both interface states. Each
+-- with why it is local; a command not listed and without a schema is refused there (fail closed). Camera, UI and settings do not go
+-- through api.cmd at all (no maker of L.FACTORIES is one), and the speed buttons' makeGameSetSpeedCmd is no engine command in a
+-- session: it becomes a request to the host.
+L.LOCAL_COMMANDS = {
+	-- A query: the industry window asks the engine for the extension proposal of an industry whose expansion failed and draws the
+	-- colliding triangles from the answer (base gui/entity_window/industry/industry.tl, build 40420; sent at most once a game tick while
+	-- the window shows a failed expansion). Nothing is built: the extension itself is a makeWorldBuildProposalCmd, held
+	-- like every build (docs/COVERAGE_BUILD.md section 2, "Not a change of the world").
+	makeCreateIndustryExtendProposalCmd = true,
+}
+
+-- A build an interface state could not hold through the API (no codec record, or none written) may go on to the engine's command list
+-- for the native module's hold (the safety net) only when it is a player's: the module holds every playerInitiated build from no tool
+-- site (native runtime.rs plan_add) and lets any other pass, as that flag marks the game's own scripts' builds, which every game's
+-- simulation sends in step; the simulation half's capture skips that flag too. Sent from an interface state, where nothing runs in
+-- step with the other games, such a build would be applied on that game alone (review 2026-10-31), so it is refused instead. The UI
+-- hook and the bridge's wrap both ask this.
+function L.nativeNetHolds(name, args)
+	return name == "makeWorldBuildProposalCmd" and type(args) == "table" and args[4] == true
+end
+
 -- Events. makeScriptingSendEventCmd(src, id, name, param) is one engine command for dozens of unrelated messages to
 -- game scripts (loans, subsidies, town and company actions, but also notifications and tutorial steps). It has ONE
 -- spec, here, and the modules register the (id, name) pairs they replicate, so none of them replaces the others':
@@ -753,6 +800,15 @@ function L.markForeignEvent(args, mod, plain)
 	if not ok then return false, "its parameter is not plain data (" .. tostring(why) .. ")" end
 	args.foreign = tostring(mod)
 	return true
+end
+
+-- An event nobody registered (category "local", not a registered event's localFor setting, not another mod's marked one): sent from an
+-- interface state in a session, it goes to the engine on the sending game only. Owner decision 2026-11-01: it stays so until real
+-- sessions show which ones occur, so the UI hook and the bridge's wrap log each one (C.tally). Returns its "id/name", else nil.
+function L.unregisteredEvent(name, args)
+	if name ~= "makeScriptingSendEventCmd" or type(args) ~= "table" or args.foreign ~= nil then return nil end
+	if eventHandler(args[2], args[3]) then return nil end
+	return tostring(args[2]) .. "/" .. tostring(args[3])
 end
 
 L.EVENT_SPEC = {
@@ -1195,59 +1251,6 @@ function L.permitted(perms, category)
 	return perms[category] ~= false
 end
 
--- ------------------------------------------------------------------ host authority (money)
-
--- The account as the checksum round saw it: what the host's report carries as `authority`, and what a player keeps
--- per round to measure its difference against at the same game time.
-function L.accountSnapshot(engine)
-	local ok, balance, loan = pcall(engine.account)
-	if not ok then return nil end
-	return { balance = balance, loan = loan }
-end
-
--- Differences host - own for the values both sides have (balance rounded to whole money units, as a journal entry
--- holds them). Zero differences are left out.
-function L.authorityDeltas(own, host)
-	local out = {}
-	if type(own) ~= "table" or type(host) ~= "table" then return out end
-	if type(own.balance) == "number" and type(host.balance) == "number" then
-		local d = math.floor(host.balance - own.balance + 0.5)
-		if d ~= 0 then out.balance = d end
-	end
-	if type(own.loan) == "number" and type(host.loan) == "number" then
-		local d = host.loan - own.loan
-		if d ~= 0 then out.loan = d end
-	end
-	return out
-end
-
--- Brings this game's account to the host's values: engine.bookJournal(amount) books the balance difference as a
--- journal entry, engine.adjustLoan(delta) moves the loan (absent on a build where no way is known: reported as
--- unavailable). `previous` is what the round before measured (the bridge keeps it): only a difference that is still the
--- same one round later is corrected. With replay on peers an action reaches another game a stamp's lead after the game it
--- came from, so a checksum round that falls in between sees its effect on one side only: a lag lasting less than a round,
--- not a drift (the loan taken on the host showed up twice on the guest in the first real test). Returns the deltas applied,
--- the names that could not be corrected, and every difference measured (to be passed as `previous` next round).
-function L.applyAuthority(engine, own, host, previous)
-	local measured = L.authorityDeltas(own, host)
-	local deltas = {}
-	for key, d in pairs(measured) do
-		local was = previous and previous[key]
-		local tolerance = key == "balance" and 50 or 0
-		if type(was) == "number" and math.abs(was - d) <= tolerance then deltas[key] = d end
-	end
-	local applied, failed = {}, {}
-	if deltas.balance then
-		local ok = engine.bookJournal and pcall(engine.bookJournal, deltas.balance)
-		if ok then applied.balance = deltas.balance else failed[#failed + 1] = "balance" end
-	end
-	if deltas.loan then
-		local ok = engine.adjustLoan and pcall(engine.adjustLoan, deltas.loan)
-		if ok then applied.loan = deltas.loan else failed[#failed + 1] = "loan" end
-	end
-	return applied, failed, measured
-end
-
 -- ------------------------------------------------------------------ deterministic random (section 7)
 
 local TWO32 = 4294967296
@@ -1295,9 +1298,17 @@ end
 
 -- Wider lanes (idea and field choices from MPFever (MIT), mpfever_refs.lua contentHash: stations, edges, edgeObjects,
 -- nodeConfigs, vehicleState, names). Each lane is a small function over an optional engine accessor of the same name that
--- returns plain data; a build or test without the accessor simply has no such part. No entity id enters a hash (ids are
--- not guaranteed equal between games): positions rounded to 0.1, models and names stand in for ids, lists are sorted.
-local function r1(v) return string.format("%.1f", v or 0) end
+-- returns plain data; a build or test without the accessor simply has no such part. The content parts carry no entity id:
+-- positions rounded to 0.1, models and names stand in for ids, lists are sorted, so they compare what the worlds hold. Ids enter
+-- only the `ids` lane (the sorted id sets) and the `<lane>@ids` parts (L.SPREAD_LANES `bind`: each id bound to what it names);
+-- both rest on the ids being equal on every game, which they are while every build is applied at its stamp.
+-- A value that rounds to zero is "0.0" whatever its sign: an edge read the other way round negates its tangents (CS.edgeEnds), and
+-- -0.0 printed as "-0.0" would differ from the 0.0 of the same edge on a game that stores it the other way.
+local function r1(v)
+	local s = string.format("%.1f", v or 0)
+	if s == "-0.0" then return "0.0" end
+	return s
+end
 
 local function sortedItems(keys)
 	table.sort(keys)
@@ -1369,7 +1380,8 @@ function L.namesSample(all)
 	return n > 0 and out or nil
 end
 
--- entity ids (a heavy lane, the only one that hashes ids): edges, constructions and town buildings, each sorted. The engine takes every new
+-- entity ids (a heavy lane): edges, constructions and town buildings, each sorted (which id names which entity: the `<lane>@ids` parts,
+-- L.SPREAD_LANES `bind`). The engine takes every new
 -- entity's id from one FIFO of free ids, so the ids are equal on every game only while every build is applied at the same step on every
 -- game (the stamp rule); any path that misses it shifts all later ids (native id trace, 2026-10-14) and a later build naming such an
 -- entity would touch another one. The content lanes cannot see that; this lane makes it a difference the host repairs.
@@ -1402,18 +1414,54 @@ L.TOWN_PART_LIMIT = 48       -- `townBuildings:<town>` parts for the first this 
 
 -- the key of one entity of a heavy lane: the same text from a list accessor (mocks) and from the one-entity readers (the game)
 local CS = {}
-function CS.construction(c) return string.format("%s@%.2f,%.2f,%.2f", tostring(c.file), c.x or 0, c.y or 0, c.z or 0) end
--- road and rail edges: endpoints (canonical order), street type, template/style, decorations and the models of the edge
--- objects (signals, stops, ...) in a canonical order
+-- 0.01 like the positions, "0.00" whatever its sign (r1)
+function CS.r2(v)
+	local s = string.format("%.2f", v or 0)
+	if s == "-0.00" then return "0.00" end
+	return s
+end
+-- constructions: model file, position and the rotation terms of the transform (its x axis: m[1], m[2]); a construction turned on one
+-- game only stood at the same place and was invisible before (review 2026-10-31)
+function CS.construction(c)
+	return string.format("%s@%.2f,%.2f,%.2f", tostring(c.file), c.x or 0, c.y or 0, c.z or 0) .. "/r" .. CS.r2(c.ax) .. "," .. CS.r2(c.ay)
+end
+function CS.vec(t, s)
+	t = t or {}
+	return r1(s * (t.x or 0)) .. "," .. r1(s * (t.y or 0)) .. "," .. r1(s * (t.z or 0))
+end
+-- The two ends of an edge in a canonical order (place x, y, z rounded to 0.1, the lesser text first), each with its tangent pointing
+-- from the first end to the second and its node id: an edge stored the other way round (node0 and node1 swapped) gives the same
+-- text. tangent1 points along node0 -> node1 (tf3-docs BaseEdge), so the swapped order takes both tangents negated.
+function CS.edgeEnds(e)
+	local a, b = r1(e.x0) .. "," .. r1(e.y0) .. "," .. r1(e.z0), r1(e.x1) .. "," .. r1(e.y1) .. "," .. r1(e.z1)
+	if a == b then
+		-- both ends at one place (an edge under 0.1 m, a loop): the lesser tangents text decides, so the key never rests on how a game
+		-- stores the edge (review 2026-10-31). An edge that reads the same both ways has the same key either way; its node ids go
+		-- lesser first, so `edges@ids` does not rest on it either
+		local fa, fb, ra, rb = CS.vec(e.t0, 1), CS.vec(e.t1, 1), CS.vec(e.t1, -1), CS.vec(e.t0, -1)
+		local fwd, rev = fa .. ";" .. fb, ra .. ";" .. rb
+		if rev < fwd or (rev == fwd and type(e.n0) == "number" and type(e.n1) == "number" and e.n1 < e.n0) then
+			return b, a, ra, rb, e.n1, e.n0
+		end
+		return a, b, fa, fb, e.n0, e.n1
+	end
+	if a > b then return b, a, CS.vec(e.t1, -1), CS.vec(e.t0, -1), e.n1, e.n0 end
+	return a, b, CS.vec(e.t0, 1), CS.vec(e.t1, 1), e.n0, e.n1
+end
+-- road and rail edges: ends with their heights and tangents (canonical order), street type, template/style, decorations and the
+-- models of the edge objects (signals, stops, ...) in a canonical order. Heights and tangents since review 2026-10-31: a bridge
+-- raised or a curve bent differently on one game kept both ends' x, y. A track's catenary is in its road template (TF3:
+-- "track/simple/simple.street_template" / "simple_catenary.street_template", real session logs 2026-10-21), its kind by the same
+-- naming; TF3's ComponentType has no BASE_EDGE_TRACK (tf3-docs), so nothing else is read for it.
+-- Second value: the node ids at the two ends in the same order (the `edges@ids` part, CS.readRange).
 function CS.edge(e)
-	local a, b = r1(e.x0) .. "," .. r1(e.y0), r1(e.x1) .. "," .. r1(e.y1)
-	if a > b then a, b = b, a end
+	local a, b, ta, tb, na, nb = CS.edgeEnds(e)
 	local objs = {}
 	for _, m in ipairs(e.objects or {}) do objs[#objs + 1] = tostring(m) end
 	table.sort(objs)
 	return a .. "-" .. b .. "/" .. tostring(e.type) .. "/" .. tostring(e.typeIndex) .. "/" .. tostring(e.roadType)
 		.. "/" .. tostring(e.template) .. "/" .. tostring(e.style) .. "/d" .. tostring(e.decorations or 0)
-		.. "/o" .. table.concat(objs, ",")
+		.. "/o" .. table.concat(objs, ",") .. "/t" .. ta .. ";" .. tb, tostring(na) .. "," .. tostring(nb)
 end
 -- lane connections, crosswalks and traffic lights of the nodes (a drift part: see ChecksumPolicy::DRIFT_PARTS)
 function CS.nodeConfig(n)
@@ -1428,19 +1476,24 @@ end
 
 -- Each heavy lane: `has` (the engine can give it), `ids` (the list taken at the stamp: entity ids, or the records of a list accessor) and
 -- `read` (one entry -> a record, nil when the entity is gone). Read in this order, one cursor across all of them.
+-- `bind`: the lane also gives `<name>@ids`, each entity id bound to its key's hash (an edge's also to its node ids), so the same things
+-- under swapped ids differ (review 2026-10-31; the margin runs of 2026-10-14: late applies permuted ids and the `ids` lane, a hash
+-- of the sorted id sets, saw nothing: one session ran forked to its end, two crashed at the next build naming such an id). Ids are
+-- equal on every game while every build is applied at its stamp (the free-id FIFO, `ids` lane), so this is an ordinary part like
+-- `ids`. Not for nodeConfigs: a drift lane, whose key drifts; the node ids are bound through the edges.
 local function streetIds(engine, ctx)
 	if ctx.street == nil then ctx.street = engine.streetIds() or {} end
 	return ctx.street
 end
 L.SPREAD_LANES = {
-	{ name = "constructions", key = CS.construction,
+	{ name = "constructions", key = CS.construction, bind = true,
 		has = function() return true end,   -- always a part (an engine without any accessor reports "error", as it always did)
 		ids = function(e, ctx)
 			if e.construction then return ctx.ids and ctx.ids.constructions or e.constructionIds() end
 			return e.constructions()
 		end,
 		read = function(e, x) if e.construction then return e.construction(x) end return x end },
-	{ name = "edges", key = CS.edge,
+	{ name = "edges", key = CS.edge, bind = true,
 		has = function(e) return (e.edge and e.streetIds) or e.edges end,
 		ids = function(e, ctx) if e.edge and e.streetIds then return streetIds(e, ctx).edges or {} end return e.edges() end,
 		read = function(e, x, ctx) if e.edge and e.streetIds then return e.edge(x, ctx) end return x end },
@@ -1448,7 +1501,7 @@ L.SPREAD_LANES = {
 		has = function(e) return (e.nodeConfig and e.streetIds) or e.nodeConfigs end,
 		ids = function(e, ctx) if e.nodeConfig and e.streetIds then return streetIds(e, ctx).nodes or {} end return e.nodeConfigs() end,
 		read = function(e, x) if e.nodeConfig and e.streetIds then return e.nodeConfig(x) end return x end },
-	{ name = "townBuildings", key = CS.townBuilding, towns = true,
+	{ name = "townBuildings", key = CS.townBuilding, towns = true, bind = true,
 		has = function(e) return e.townBuilding end,
 		ids = function(e, ctx) return ctx.ids and ctx.ids.townBuildings or e.townBuildingIds() end,
 		read = function(e, x) return e.townBuilding(x) end },
@@ -1457,11 +1510,16 @@ L.SPREAD_LANES = {
 function CS.readRange(r, ln, from, to)
 	local spec, engine, ctx, keyHash = ln.spec, r.engine, r.ctx, r.keyHash
 	for i = from, to do
-		local v = spec.read(engine, ln.ids[i], ctx)
+		local id = ln.ids[i]
+		local v = spec.read(engine, id, ctx)
 		if v ~= nil then
-			local key = spec.key(v)
+			local key, ends = spec.key(v)
 			local h = keyHash(key)
 			ln.n, ln.sum = ln.n + 1, (ln.sum + h) % 4294967296
+			-- `<name>@ids` (L.SPREAD_LANES `bind`): the id with the key's hash, a short text, so it costs one more small hash and no read
+			if spec.bind and type(id) == "number" then
+				ln.idSum = (ln.idSum + keyHash(tostring(id) .. "|" .. (ends or "") .. "|" .. tostring(h))) % 4294967296
+			end
 			if spec.towns then
 				local town = v.town or -1
 				local t = ln.towns[town]
@@ -1479,9 +1537,13 @@ function CS.finishLane(r, ln)
 	local name, parts, hash = ln.spec.name, r.parts, r.hash
 	if ln.failed then
 		parts[name] = "error"
+		-- not ready, never absent: a part one game lacks would read as a difference
+		if ln.spec.bind then parts[name .. "@ids"] = "error" end
 		r.errors[name] = ln.failed
 		return
 	end
+	-- a list of entity ids (the game; a list accessor's records have none): the same on every game whose world has such entities
+	if ln.spec.bind and type(ln.ids[1]) == "number" then parts[name .. "@ids"] = hash({ n = ln.n, sum = ln.idSum }) end
 	if ln.spec.towns then
 		-- `townBuildings` = "<total>/<hash of all towns>", `townBuildings:<town id>` = "<count>/<hash>" for the first TOWN_PART_LIMIT towns
 		-- (the town entity id only names the part: towns come from the savegame, so it agrees)
@@ -1504,11 +1566,13 @@ end
 --   engine.gameTime()       -> number
 --   engine.account()        -> balance, loan
 --   engine.lines()          -> list of { stops = number }
---   heavy lanes (L.SPREAD_LANES): engine.constructionIds() + engine.construction(e) -> { file, x, y, z }, or engine.constructions() -> list of
---   those; engine.streetIds() -> { edges = {...}, nodes = {...} } + engine.edge(e, ctx) / engine.nodeConfig(n), or engine.edges() /
---   engine.nodeConfigs(); engine.townBuildingIds() + engine.townBuilding(e) -> { town, file, x, y, z, level, depth, parcels, timeBuilt }
--- Each part is hashed separately so the launcher can name the differing one. Entity ids enter only the `ids` lane:
--- constructions are compared by file and position, lines by their stop counts, both sorted.
+--   heavy lanes (L.SPREAD_LANES): engine.constructionIds() + engine.construction(e) -> { file, x, y, z, ax, ay }, or
+--   engine.constructions() -> list of those; engine.streetIds() -> { edges = {...}, nodes = {...} } + engine.edge(e, ctx) -> { x0, y0, z0,
+--   x1, y1, z1, t0, t1, n0, n1, type, ... } / engine.nodeConfig(n), or engine.edges() / engine.nodeConfigs(); engine.townBuildingIds() +
+--   engine.townBuilding(e) -> { town, file, x, y, z, level, depth, parcels, timeBuilt }
+-- Each part is hashed separately so the launcher can name the differing one. The content parts carry no entity id: constructions
+-- are compared by file, position and rotation, lines by their stop counts, both sorted. Entity ids enter only the `ids` lane (the
+-- sorted id sets) and the `<lane>@ids` parts (L.SPREAD_LANES `bind`: each id bound to what it names).
 -- `light` (true): a light round, the heavy lanes are left out (L.HEAVY_LANES; the host asks for a full round every Nth time,
 -- see ChecksumRequestMessage.full). Each of those costs one component read per edge, node, construction or town building.
 -- opts: detail (a table: filled with the itemised keys of every lane), clock (seconds; observation only, never part of the result),
@@ -1540,8 +1604,11 @@ function L.newChecksumRound(engine, hashFn, light, opts)
 	local okT, t = pcall(engine.gameTime)
 	r.time = okT and t or -1
 	parts.time = hashFn(r.time)
-	part("balance", function() local balance = engine.account(); return balance end)
-	part("loan", function() local _, loan = engine.account(); return loan end)
+	-- in whole money units: a fraction the engine's float sums leave differently on two games is not a difference, except at a .5
+	-- boundary (1000.4999 / 1000.5001 round apart), which lasts one round and the drift window absorbs
+	local function whole(x) return type(x) == "number" and math.floor(x + 0.5) or x end
+	part("balance", function() local balance = engine.account(); return whole(balance) end)
+	part("loan", function() local _, loan = engine.account(); return whole(loan) end)
 	part("lines", function()
 		local list = engine.lines()
 		local keys = {}
@@ -1560,7 +1627,7 @@ function L.newChecksumRound(engine, hashFn, light, opts)
 			if spec.has(engine) then
 				local tl = clock()
 				local ok, ids = pcall(spec.ids, engine, r.ctx)
-				local ln = { spec = spec, ids = (ok and type(ids) == "table") and ids or {}, n = 0, sum = 0, towns = {}, keys = detail and {} or nil }
+				local ln = { spec = spec, ids = (ok and type(ids) == "table") and ids or {}, n = 0, sum = 0, idSum = 0, towns = {}, keys = detail and {} or nil }
 				if not ok then ln.failed = tostring(ids) end
 				r.lanes[#r.lanes + 1] = ln
 				r.total = r.total + #ln.ids
@@ -1713,7 +1780,7 @@ function L.checksumRoundSave(r, rec)
 	for i, ln in ipairs(r.lanes) do
 		local s = rec.lanes[i] or {}
 		if s.ids == nil then s.ids = L.packIds(ln.ids) end
-		s.name, s.n, s.sum, s.failed = ln.spec.name, ln.n, ln.sum, ln.failed
+		s.name, s.n, s.sum, s.idSum, s.failed = ln.spec.name, ln.n, ln.sum, ln.idSum, ln.failed
 		local towns = {}
 		for town, t in pairs(ln.towns) do towns[#towns + 1] = { town = town, n = t.n, sum = t.sum } end
 		table.sort(towns, function(a, b) return tostring(a.town) < tostring(b.town) end)
@@ -1732,7 +1799,7 @@ function L.checksumRoundSync(r, rec)
 	for i, s in ipairs(rec.lanes or {}) do
 		local ln = r.lanes[i]
 		if ln then
-			ln.n, ln.sum, ln.failed = s.n or 0, s.sum or 0, s.failed
+			ln.n, ln.sum, ln.idSum, ln.failed = s.n or 0, s.sum or 0, s.idSum or 0, s.failed
 			ln.towns = {}
 			for _, t in ipairs(s.towns or {}) do ln.towns[t.town] = { n = t.n, sum = t.sum } end
 		end
@@ -1748,7 +1815,7 @@ function L.checksumRoundRestore(engine, hashFn, rec, opts)
 	for _, s in ipairs(L.SPREAD_LANES) do spec[s.name] = s end
 	for i, s in ipairs(rec.lanes or {}) do
 		if not spec[s.name] then error("checksum round restore: unknown lane " .. tostring(s.name)) end
-		r.lanes[i] = { spec = spec[s.name], ids = L.unpackIds(s.ids), n = 0, sum = 0, towns = {}, keys = opts.detail and {} or nil }
+		r.lanes[i] = { spec = spec[s.name], ids = L.unpackIds(s.ids), n = 0, sum = 0, idSum = 0, towns = {}, keys = opts.detail and {} or nil }
 	end
 	return L.checksumRoundSync(r, rec)
 end

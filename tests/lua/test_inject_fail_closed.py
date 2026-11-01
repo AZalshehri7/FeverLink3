@@ -93,6 +93,7 @@ class InjectNative(S.FakeNative):
         self.deferred = {}        # id -> True: held commands kept until this game's own stamp apply
         self.completed = []       # (id, ok, reason) of every completion the module reported
         self.injected, self.refused, self.emptied = [], [], 0
+        self.aborts = []          # node ids whose missing BaseNodeConfig an injected text removed: the engine's abort (must stay empty)
         super().__init__(game, clock, hooks=("apply_command", "command_list_add", "inject_next", "defer", "fail"))
 
     def handle(self, seq, kind, p):
@@ -180,6 +181,12 @@ class InjectNative(S.FakeNative):
                 self.fail_held(held, "fail")
             self.flush_events()
             return "emptied"
+        # the engine does not refuse the removal of a node configuration the node lacks, it aborts the game (Engine.h:323, BaseNodeConfig,
+        # sweep crash 2026-10-13): the mock fails loudly
+        for e in re.findall(r"^proposal\.nodeConfigsToRemove\[\d+\]\tent:old#(\d+)", self.order_text(o), re.M):
+            if not self.game.lua("WORLD[%s] ~= nil and WORLD[%s].BASE_NODE_CONFIG ~= nil" % (e, e)):
+                self.aborts.append(int(e))
+                raise RuntimeError("ENGINE ASSERT Engine.h:323 GetComponentDataIndex (BaseNodeConfig, entity %s)" % e)
         self.injected.append(key)
         self.emit("injected", {"key": key, "nodes": 2, "segments": 1, "constructions": 0})
         if held:
@@ -251,11 +258,19 @@ function MAKE_API()
   local api = BASE_MAKE_API_INJECT()
   local base = api.cmd.sendCommand
   local function applyNow(c, cb, progress)
-    if INJECT_HOOK and c and c.__cmd == "makeWorldBuildProposalCmd" and INJECT_HOOK(CMD_XS(c)) == "emptied" then
+    local out = INJECT_HOOK and c and c.__cmd == "makeWorldBuildProposalCmd" and INJECT_HOOK(CMD_XS(c)) or nil
+    if out == "emptied" then
       EMPTIED = (EMPTIED or 0) + 1   -- the module emptied the command: the engine applies an empty proposal, nothing is built
       return
     end
-    return base(c, cb, progress)
+    local r = base(c, cb, progress)
+    if out == "partial" then
+      -- the mod's own command applied as it was, but it is only part of the build (a construction build's placeholder: its
+      -- constructions alone, no street part): here the road without its far node and segment
+      local xs = CMD_XS(c)
+      REMOVE_NODE(FIND_NODE(xs[#xs], 0, 0))
+    end
+    return r
   end
   api.cmd.sendCommand = function(c, cb, progress)
     -- a test sets LATE_APPLIES = {}: the engine applies build commands only after the script's step (FLUSH_LATE), in the order sent,
@@ -399,10 +414,13 @@ class InjectFailClosedTest(InjectTest):
             told = "told the player: Your build could not be built"
             verdicts = [sum(1 for l in g.lines(g.from_game) if l.split(T.TAB)[0] == "action_applied") for g in (self.A, self.B)]
             if n:
-                self.assertIn("build 1:1 was applied here (build.result verdict=applied) although the native module refused its order: the verdict says applied, the player is not told it failed", self.B.log())
+                self.assertIn("build 1:1 was applied here (build.result verdict=applied) although the native module refused its order: the verdict says applied as the placeholder", self.B.log())
                 self.assertNotIn(told, self.B.log())
-                self.assertIn("told the player: Your build was built after all", self.B.log())
-                # friend session 2026-10-23c (0:374): the verdicts follow what applied, not the module's no_command
+                # what applied is the mod's own command, not the exact copy (review 2026-10-31): never "built after all"
+                self.assertNotIn("told the player: Your build was built after all", self.B.log())
+                self.assertIn("told the player: Your build could not be copied exactly", self.B.log())
+                # friend session 2026-10-23c (0:374): the verdicts follow what applied, not the module's no_command; both applied the
+                # placeholder, so the details are equal and they agree
                 self.assertEqual((verdicts, self.relay.refused, self.relay.verdict_resyncs), ([1, 1], [], []))
                 # a refusal whose build.result never comes: the player is told after X.NOTICE_WAIT_S all the same
                 self.B.L.execute(T.FIND_UP)
@@ -415,7 +433,7 @@ class InjectFailClosedTest(InjectTest):
                 # applied it afterwards: the player is told it stands
                 self.B.L.execute('FIND_UP("G").builtLate = { ["1:98"] = true }; FIND_UP("X").buildOutcome("1:98", "applied")')
                 self.assertIn("build 1:98 was cut from its tool by the resync and applied after it", self.B.log())
-                self.assertEqual(self.B.log().count("told the player: Your build was built after all"), 2)
+                self.assertEqual(self.B.log().count("told the player: Your build was built after all"), 1)
             else:
                 self.assertIn("the verdict waits for this game's build.result", self.B.log())
                 self.assertEqual(self.B.log().count(told), 1, "nothing was built here: the player is told, once")
@@ -431,12 +449,27 @@ class InjectFailClosedTest(InjectTest):
             self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 1))
             self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], self.log())
 
+        def no_command_placeholder_on_the_originator_receiver_injects():
+            # review 2026-10-31: the receiver injects the text, the originator's module closes its order as no_command and its placeholder
+            # applies only part of the build (a construction build's: constructions alone). Both said applied with the empty detail of an
+            # exact injection, so the host saw agreement while the worlds differed; the placeholder's verdict now says how it applied
+            self.B.native.no_command = "partial"
+            self.build_on_b()
+            self.assertEqual((len(self.A.native.injected), self.B.native.refused != []), (1, True))
+            self.assertNotEqual(self.A.sig(), self.B.sig(), "the originator kept the partial build")
+            sent = [self.relay.C.parse(l.split(T.TAB, 2)[2]) for l in self.B.lines(self.B.from_game) if l.split(T.TAB)[0] == "action_applied"]
+            self.assertEqual([str((p[0] if isinstance(p, tuple) else p).detail) for p in sent], ["placeholder"])
+            self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], self.log())
+            self.assertNotIn("told the player: Your build was built after all", self.B.log())
+            self.assertIn("told the player: Your build could not be copied exactly", self.B.log())
+
         self.cases([("the happy path", {}, happy_path), ("a segment ending away from its existing node", {}, segment_away_from_its_node),
                     ("a build bigger than one Steam message", {}, bigger_than_one_steam_message),
                     ("an input-level text that cannot be read", {}, input_text_unreadable),
                     ("refused as no_command, the command applied", {}, lambda: no_command("pass")),
                     ("refused as no_command, nothing applied", {}, lambda: no_command("emptied")),
-                    ("no_command and applied on the originator only", {}, no_command_applied_on_the_originator_only)])
+                    ("no_command and applied on the originator only", {}, no_command_applied_on_the_originator_only),
+                    ("a placeholder on the originator, injected on the receiver", {}, no_command_placeholder_on_the_originator_receiver_injects)])
 
     def test_a_copy_one_game_cannot_apply_is_applied_nowhere_there_and_the_differing_verdicts_ask_for_the_repair(self):
         def receiver_refuses():
@@ -487,8 +520,26 @@ class InjectFailClosedTest(InjectTest):
             self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], "the receiver refused what the originator applied")
             self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
 
+        def receiver_lacks_the_node_config():
+            # review 2026-10-31: B's text removes the configuration of the savegame's node at (100, 0, 0), which only B has
+            # (nodeConfigs can differ between games until the resync). A refuses it from its own world before the inject: the engine's
+            # abort on the missing BaseNodeConfig (the mock's, at the inject) never fires
+            self.start()
+            self.strict_on(self.A, self.B)
+            node = int(self.B.lua("FIND_NODE(100, 0, 0)"))
+            self.B.run("WORLD[%d].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = {} })" % node)
+            self.texts(road_text() + "\nproposal.nodeConfigsToRemove.#\tn:1\nproposal.nodeConfigsToRemove[0]\tent:old#%d" % node, road_text())
+            self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+            self.tick(30)
+            self.assertEqual(self.A.native.aborts + self.B.native.aborts, [], "no game's engine aborts")
+            self.assertIn("proposal.nodeConfigsToRemove[0] names nodeConfig %d, which is not a nodeConfig here (it is: node)" % node, self.A.log())
+            self.assertEqual((self.A.native.injected, self.A.builds_applied()), ([], 0), "nothing is injected or applied on the refusing game")
+            self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], "the worlds differ: the host asks for the repair")
+            self.assertEqual((self.B.builds_applied(), self.B.native.completed), (1, [(1, True, "stamp_apply")]), "the originator has it: injected")
+
         self.cases([("a receiver that cannot inject", {}, receiver_refuses), ("the originator's own copy refused", {}, originator_refuses),
-                    ("a receiver whose placeholder cannot be made", {}, receiver_placeholder)])
+                    ("a receiver whose placeholder cannot be made", {}, receiver_placeholder),
+                    ("a receiver without the node configuration the text removes", {}, receiver_lacks_the_node_config)])
 
     def test_a_build_every_game_would_refuse_is_refused_by_its_originator_before_shipping(self):
         def own_self_check_fails():

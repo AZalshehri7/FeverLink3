@@ -61,7 +61,10 @@ class UpdateLine(unittest.TestCase):
 
     def test_save_and_quit(self):
         """Offered only for a staged update outside a session; saves as feverlink3-restart (not the player's default name),
-        quits only from the save's callback; a refused call says why and leaves the game open."""
+        quits only from the save's callback and only once the save is found and read back (review 2026-10-31):
+        only a save new or changed since the click counts (an older feverlink3-restart, here in two folders, is no proof),
+        and a file the game reports as broken (errorMsg) is unreadable; a refused call or a missing save says why and leaves
+        the game open."""
         rt = lupa.LuaRuntime(unpack_returned_tuples=True)
         with open(os.path.join(CONTENT, "feverlink3_hud.lua"), encoding="utf-8") as f:
             Hud = rt.execute(f.read())
@@ -69,27 +72,51 @@ class UpdateLine(unittest.TestCase):
         self.assertTrue(offer("idle", {"state": "ready"}) and offer("failed", {"state": "ready"}))
         for state, u in (("hosting", {"state": "ready"}), ("joined", {"state": "ready"}), ("idle", {"state": "updated"})):
             self.assertFalse(offer(state, u), (state, u))
+        rt.execute("api = { type = { SavegameId = { new = function() return {} end } } }")
         run = rt.eval('''function(Hud, refuse)
-            local calls, failed = {}, nil
+            local calls, failed, logs = {}, nil, {}
+            -- an older save of the name from an earlier update in this folder ("p", unless "first") and one in another folder
+            local saved = { { saveName = "feverlink3-restart", path = "q", timestamp = 50, size = 7 } }
+            if refuse ~= "first" then saved[2] = { saveName = "feverlink3-restart", path = "p", timestamp = 100, size = 7 } end
             local app = {
                 saveGame = function(name, cb, isMapEditor, skipSetName)
                     if refuse == "save" then error("no world") end
                     calls[#calls + 1] = "save " .. name .. " " .. tostring(isMapEditor) .. " " .. tostring(skipSetName)
                     calls.cb = cb
+                    -- "written": the save failed and left the older file as it was; the same size, only the time tells
+                    if refuse ~= "written" then saved[2] = { saveName = name, path = "p", timestamp = 200, size = 7 } end
+                end,
+                SaveGameNamespace = { getSavegame = function() return 1 end },
+                findAllSavegames = function() if refuse == "list" then error("no list") end return saved end,
+                getSavegameInfo = function(id)
+                    assert(id.path == "p", "the save written since the click is the one read")
+                    local msg = refuse == "broken" and "bad file" or ""
+                    return { get = function() return { errorMsg = msg, info = { metadata = { gameModDescs = {} } } } end }
                 end,
                 quit = function(instant)
                     if refuse == "quit" then error("no") end
                     calls[#calls + 1] = "quit " .. tostring(instant)
                 end,
             }
-            local started = Hud.saveAndQuit(app, function() end, function(r) failed = r end)
+            local started = Hud.saveAndQuit(app, function(l) logs[#logs + 1] = l end, function(r) failed = r end)
             local before = #calls
             if calls.cb then calls.cb() end
-            return started, before, table.concat(calls, ","), failed
+            return started, before, table.concat(calls, ","), failed, table.concat(logs, "|")
         end''')
-        self.assertEqual((True, 1, "save feverlink3-restart false true,quit false", None), run(Hud, None))
-        self.assertEqual((False, 0, "", "the world could not be saved"), run(Hud, "save"))
-        self.assertEqual((True, 1, "save feverlink3-restart false true", "the game did not close"), run(Hud, "quit"))
+        quit = "save feverlink3-restart false true,quit false"
+        started, n, calls, failed, logs = run(Hud, None)
+        self.assertEqual((True, 1, quit, None), (started, n, calls, failed))
+        self.assertIn("(saves of that name before: 100/7, 50/7; now: 200/7, 50/7), quitting", logs, "both stamps, no path")
+        self.assertEqual((True, 1, quit, None), run(Hud, "first")[:4], "the first save of the name")
+        self.assertEqual((False, 0, "", "the world could not be saved"), run(Hud, "save")[:4])
+        self.assertEqual((False, 0, "", "the world could not be saved"), run(Hud, "list")[:4], "no listing: no proof, no save")
+        self.assertEqual((True, 1, "save feverlink3-restart false true", "the game did not close"), run(Hud, "quit")[:4])
+        for refuse, why in (("written", "no savegame 'feverlink3-restart' written since the click"),
+                            ("broken", "savegame 'feverlink3-restart' cannot be read: bad file")):
+            started, n, calls, failed, logs = run(Hud, refuse)
+            self.assertEqual((True, 1, "save feverlink3-restart false true", "the world could not be saved"),
+                             (started, n, calls, failed), refuse)
+            self.assertIn(why, logs)
 
 
 if __name__ == "__main__":

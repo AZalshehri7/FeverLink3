@@ -368,6 +368,10 @@ pub struct Controller {
     launch_read: bool,
     /// Steam names of the accounts that asked to join, looked up once each.
     names: HashMap<u64, Option<String>>,
+    /// Every player name this run's status showed (rosters, the first player list, join requests) and every invite's host,
+    /// with the player id it last had (`None`: it asked to join and had none). Kept after the session ends and written to the
+    /// status, so that a bug report masks them in every state and the next run's report masks them in this run's logs.
+    seen: Vec<(Option<u16>, String)>,
     /// Why the last join was refused for its mods: each difference to the host's game, `true` when it blocks. Shown by the
     /// window under the failure until the next host or join.
     mod_report: Vec<(bool, String)>,
@@ -410,9 +414,31 @@ pub fn searched_game_tag() -> String {
     SEARCHED_GAME.get().map(|(b, h, _)| format!("{b}:{h}")).unwrap_or_default()
 }
 
+/// Clears the live folder of an earlier run: its bug report files ([`report::is_report_file`]) move to `previous\` (emptied first:
+/// one run is kept), every other file is deleted as before (the side files of injections can be hundreds of MB). A report made
+/// after a crash needs a running game, so the game is started again first; deleting everything here left that report nothing of
+/// the crashed session (review 2026-10-31). Nothing else lists this folder expecting it empty, and its readers take files only.
+fn keep_previous_run(dir: &Path) {
+    let previous = dir.join(crate::report::PREVIOUS_DIR);
+    let _ = fs::remove_dir_all(&previous);
+    let made = fs::create_dir_all(&previous).is_ok();
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let keep = made && crate::report::is_report_file(&entry.file_name().to_string_lossy());
+        // a file the game still holds open cannot move: it is deleted like the rest, or stays when that fails too
+        if !(keep && fs::rename(&path, previous.join(entry.file_name())).is_ok()) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 impl Controller {
-    /// Prepares the folder (files of an earlier run are removed), says the game is idle, starts listening for
-    /// commands.
+    /// Prepares the folder (the report files of an earlier run move to `previous\`, the rest is removed), says the game is
+    /// idle, starts listening for commands.
     pub fn new(dir: PathBuf, default_name: String, save_dirs: Vec<PathBuf>) -> io::Result<Controller> {
         Self::build(dir, default_name, save_dirs, None)
     }
@@ -434,11 +460,7 @@ impl Controller {
         core: Option<CoreRef>,
     ) -> io::Result<Controller> {
         fs::create_dir_all(&dir)?;
-        for entry in fs::read_dir(&dir)?.flatten() {
-            if entry.path().is_file() {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
+        keep_previous_run(&dir);
         let link = gamelink::Session::open(&dir)?;
         link.write_identity(0, &default_name, "idle")?;
         let commands = Tail::new(dir.join(CMD_FILE));
@@ -503,6 +525,7 @@ impl Controller {
             cmdline_read: false,
             launch_read: false,
             names: HashMap::new(),
+            seen: Vec::new(),
             mod_report: Vec::new(),
             mod_params: Value::Null,
             mods_wait: None,
@@ -567,6 +590,12 @@ impl Controller {
         // first, so that a command sees the state the window last saw, not the one before a session ended
         self.advance();
         let lines = self.commands.poll().unwrap_or_default();
+        if self.commands.take_lost() > 0 {
+            // this player's own window commands, never shipped: nothing forked, said only (review 2026-10-31)
+            self.append_session_log(&format!(
+                "{CMD_FILE}: window commands were deleted before the controller read them; they were not carried out"
+            ));
+        }
         for line in lines {
             let params = luatext::lua_to_json(&line.payload)
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -596,6 +625,9 @@ impl Controller {
             self.steam_last_try = Instant::now();
         }
         if let Some(probe) = &mut self.steam {
+            // a session's uplink belongs to the lockstep: no work for other players' speed tests (review 2026-10-31)
+            probe
+                .set_in_session(matches!(self.state, State::Hosting(_) | State::Joining { .. } | State::Joined { .. }));
             probe.poll();
         }
         self.invites_step();
@@ -1198,6 +1230,10 @@ impl Controller {
                     return;
                 }
                 let host_name = self.friends.friend_name(token.host);
+                // the host of a session is player 0; its Steam name goes into session.log just below
+                if let Some(name) = &host_name {
+                    self.remember(Some(0), name);
+                }
                 self.append_session_log(&format!(
                     "invites: join request from {} for {} (session {:016x})",
                     request.source.text(),
@@ -1509,6 +1545,9 @@ impl Controller {
 
     fn publish(&mut self) {
         let mut v = self.status_json();
+        self.remember_players(&v);
+        v["seenPlayers"] =
+            json!(self.seen.iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>());
         let text = v.to_string();
         if text == self.published {
             return;
@@ -1518,6 +1557,33 @@ impl Controller {
         let Some(lua) = serde_json::to_vec(&v).ok().and_then(|b| luatext::json_to_lua(&b)) else { return };
         if write_replacing(&self.dir.join(STATUS_FILE), &lua).is_ok() {
             self.published = text;
+        }
+    }
+
+    /// The player names the status `v` shows, remembered for the rest of the run ([`Controller::seen`]).
+    fn remember_players(&mut self, v: &Value) {
+        let players = v["players"].as_array().into_iter().flatten();
+        let mut found: Vec<(Option<u16>, String)> = players
+            .filter_map(|p| Some((u16::try_from(p["id"].as_u64()?).ok(), p["name"].as_str()?.to_owned())))
+            .collect();
+        let requests = v["invites"]["requests"].as_array().into_iter().flatten();
+        found.extend(
+            requests.flat_map(|r| [&r["name"], &r["steam"]]).filter_map(|n| Some((None, n.as_str()?.to_owned()))),
+        );
+        for (id, name) in found {
+            self.remember(id, &name);
+        }
+    }
+
+    /// `name` seen as player `id`: a known name takes the id it has now, a new one is added.
+    fn remember(&mut self, id: Option<u16>, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        match self.seen.iter_mut().find(|(_, n)| n == name) {
+            Some(known) => known.0 = id.or(known.0),
+            None => self.seen.push((id, name.to_owned())),
         }
     }
 
@@ -3256,6 +3322,30 @@ mod tests {
     }
 
     #[test]
+    fn a_new_controller_keeps_the_report_files_of_the_run_before_and_deletes_the_rest() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("live");
+        let previous = dir.join(crate::report::PREVIOUS_DIR);
+        fs::create_dir_all(&previous).unwrap();
+        fs::write(previous.join("mod.log"), "the run before the last").unwrap();
+        let kept =
+            ["mod.log", "mod.3.log", "mod.gen", "native_events.2.log", "session.log", STATUS_FILE, "detail_s4_9_1.txt"];
+        for name in kept {
+            fs::write(dir.join(name), format!("crashed run: {name}")).unwrap();
+        }
+        fs::write(dir.join("inject_7.lua"), "an injection's side file").unwrap();
+        drop(Controller::new(dir.clone(), "Solo".into(), Vec::new()).unwrap());
+        for name in kept {
+            assert_eq!(format!("crashed run: {name}"), fs::read_to_string(previous.join(name)).unwrap());
+            assert!(!dir.join(name).exists() || name == STATUS_FILE, "{name} moved");
+        }
+        assert!(!dir.join("inject_7.lua").exists() && !previous.join("inject_7.lua").exists());
+        // one run is kept: a second start replaces it
+        drop(Controller::new(dir.clone(), "Solo".into(), Vec::new()).unwrap());
+        assert!(!previous.join("mod.3.log").exists());
+    }
+
+    #[test]
     fn outside_a_session_the_report_holds_this_games_logs_opens_its_folder_and_the_issue_page() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("live");
@@ -3277,6 +3367,12 @@ mod tests {
 ",
         )
         .unwrap();
+        // the crashed run before: its logs are in, its players (from the status it left) masked though no roster has them now
+        let previous = dir.join(crate::report::PREVIOUS_DIR);
+        let status =
+            br#"{"name":"Solo","players":[{"id":1,"name":"Kimberly"}],"seenPlayers":[{"id":3,"name":"Robin"}]}"#;
+        fs::write(previous.join(STATUS_FILE), luatext::json_to_lua(status).unwrap()).unwrap();
+        fs::write(previous.join("mod.log"), "Kimberly built a road, Solo too, Robin left\n").unwrap();
         let mut w = Window::new(&dir);
         w.send("report", "{[\"note\"]=\"the road vanished\",[\"game\"]=\"40420\"}");
         assert!(
@@ -3294,6 +3390,10 @@ mod tests {
             assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
         }
         assert!(st["report"]["contents"].as_array().is_some_and(|c| c.len() == names.len()), "{st}");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fs::read(&zip).unwrap())).unwrap();
+        let mut before = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("player-1/previous-mod.log").unwrap(), &mut before).unwrap();
+        assert_eq!("%PREVPLAYER1% built a road, %PLAYER% too, %PREVPLAYER3% left\n", before);
         assert!(st["report"]["message"].as_str().unwrap().contains("Drag the zip"));
         let seen = opened.lock().unwrap().clone();
         assert_eq!(OpenTarget::Folder(zip), seen[0]);
@@ -3329,9 +3429,15 @@ mod tests {
         let mut top = String::new();
         std::io::Read::read_to_string(&mut archive.by_name("report.txt").unwrap(), &mut top).unwrap();
         assert!(
-            top.contains("asked by: Pat") && top.contains("note: it froze") && top.contains("missing parts: none"),
+            top.contains("asked by: player #1")
+                && top.contains("note: it froze")
+                && top.contains("missing parts: none"),
             "{top}"
         );
+        // the players' names are masked in the parts (review 2026-10-31): the host logged who made the report
+        let mut host_log = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("player-1/session.log").unwrap(), &mut host_log).unwrap();
+        assert!(host_log.contains("%PLAYER1% made a bug report") && !host_log.contains("Pat"), "{host_log}");
         // the host kept a copy in its reports folder and opened nothing; the player got the folder and the issue page
         assert!(report_zip(&host_out).is_some());
         assert!(host_opened.lock().unwrap().is_empty());
@@ -3351,5 +3457,19 @@ mod tests {
         let busy = pw.status()["report"]["message"].as_str().unwrap().to_owned();
         assert!(busy.starts_with("A bug report is already being made; it will reach "), "{busy}");
         hw.send("leave", "{}");
+        // after the session (the red icon's report, the start screen's): the names this run saw are still masked
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || pw.status()["state"] != "joined"));
+        fs::remove_file(&zip).unwrap();
+        pw.send("report", "{}");
+        assert!(
+            until(&mut [&mut player], Duration::from_secs(20), || pw.status()["report"]["state"] == "done"),
+            "{:?}",
+            pw.status()
+        );
+        let zip = report_zip(&player_out).expect("the report after the session");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(fs::read(&zip).unwrap())).unwrap();
+        let mut status = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("player-1/ctl_status.txt").unwrap(), &mut status).unwrap();
+        assert!(status.contains("%PLAYER0%") && !status.contains("Hosty") && !status.contains("Pat"), "{status}");
     }
 }

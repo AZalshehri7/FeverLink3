@@ -666,6 +666,22 @@ impl<H> HoldMachine<H> {
         out
     }
 
+    /// Takes every entry whose handle `stale` picks out of the ring, whatever its phase, with no action and no event: the caller gives
+    /// them up without the engine (held commands of a world that is gone, review 2026-10-31: released into the dead command list or
+    /// failed through the destroyed tool's callback, they were a use after free). In id order, each with whether it was still to be
+    /// released (waiting or scheduled): only then was this command the one thing that would apply its build on this game. A failed,
+    /// cancelled, deferred or completed one was never going to be released, and a due one was already being given back by the module's
+    /// own rules (holding switched off, silence, a timeout), outside the session's order.
+    pub fn take_out(&mut self, stale: impl Fn(&H) -> bool) -> Vec<(HoldId, bool, H)> {
+        if !self.entries.iter().any(|e| stale(&e.handle)) {
+            return Vec::new();
+        }
+        let (out, keep): (VecDeque<Entry<H>>, VecDeque<Entry<H>>) =
+            self.entries.drain(..).partition(|e| stale(&e.handle));
+        self.entries = keep;
+        out.into_iter().map(|e| (e.id, matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }), e.handle)).collect()
+    }
+
     /// This game applied the build of deferred command `id` at the stamp (another command, on the simulation thread): `adopt` gives the
     /// held command that apply's result, and its callback is fired at the [`take_due`](Self::take_due) after the mod's `release` of it
     /// (the interface's world has the apply). False (and `adopt` not
