@@ -203,7 +203,28 @@ class AssetsShareTest(I.InjectTest):
                 self.assertNotIn("@40", g.lua("GROUPS()"), "refused on every game: nothing applied")
             self.assertEqual(self.relay.verdict_resyncs, [], "the same refusal everywhere: no repair")
 
-        self.cases([("round trip", {}, round_trip), ("changed since the click", {}, changed)])
+        def a_scripts_removal():
+            # Pay Your Tolls takes its speed boards (decorations) down with a full Proposal's toRemove; rebuilt as a SimpleProposal the
+            # factory threw "Unknown exception" on both games (seen in play, 0.2.14). A removal of groups is rebuilt in the bulldozer's form.
+            self.start()
+            world(self.B)
+            got = self.B.lua("(function() local B = GUI_ENV.ug_require('feverlink3_cmds_build.lua')\n"
+                             "  local rec = { cons = {}, rem = { { __ref = 'grp', key = 'k1' }, { __ref = 'grp', key = 'k2' } }, old2new = {} }\n"
+                             "  local ids = { k1 = 9001, k2 = 9002 }\n"
+                             "  local a = B.plans.construction(rec, { rem = function(r) return ids[r.key] end }, {}, {})\n"
+                             "  return TYPEOF(a[1]) .. ' ' .. table.concat(a[1].toRemove, ',') end)()")
+            self.assertEqual(got, "Proposal 9001,9002")
+            # a model-only construction (its speed boards) is built by the game as a decoration: its key goes to the asset group at its place
+            key = self.B.lua("(function() local B = GUI_ENV.ug_require('feverlink3_cmds_build.lua')\n"
+                             "  GUI_API.engine.util = GUI_API.engine.util or {}\n"
+                             "  GUI_API.engine.util.octree = { findEntitiesInCircle = function(p, r, t) return t == 41 and { 9001, 9002 } or {} end }\n"
+                             "  local rec = { cons = { { file = 'pyt::/board.con', transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 11.5,23,1,1 } } }, rem = {}, old2new = {},\n"
+                             "    nodes = {}, segs = {}, rmNodes = {}, rmSegs = {}, objs = {}, rmObjs = {}, ncfg = {}, rmNcfg = {} }\n"
+                             "  local map, complete = B.commands.makeWorldBuildProposalCmd.bind({ fn = 'makeWorldBuildProposalCmd', args = { rec } }, '0:9', {})\n"
+                             "  return tostring(map['0:9#c1']) .. ' ' .. tostring(complete) end)()")
+            self.assertEqual(key, "9002 true", self.B.log())
+
+        self.cases([("round trip", {}, round_trip), ("changed since the click", {}, changed), ("a script's removal of groups", {}, a_scripts_removal)])
 
     def test_the_vegetation_menu_stays_usable_while_ticks_are_shared(self):
         """Lab v028-trees-drag 2026-10-26: the menu's model tiles (``landscaping_vegetation.::/assets/.../x.mdl``: each tree, plant and rock

@@ -2236,8 +2236,23 @@ local function setConstructions(sp, rec, R)
 	req(sp, "old2new", map)
 end
 
--- The construction half of a record as a SimpleProposal (the form of the game's own mission scripts).
+-- The construction half of a record as a SimpleProposal (the form of the game's own mission scripts). A removal that takes an asset group
+-- (a decoration, a model-only construction the game built as one) and adds nothing is a full Proposal with toRemove, the form the game's
+-- own bulldozer sends (api/tealdef: Proposal.new, toRemove : {Entity}, old2new; as the shared tree ticks, M.decodeAssets): a SimpleProposal
+-- cannot remove a decoration. Seen in play (0.2.14): Pay Your Tolls takes its speed boards down with a full Proposal; rebuilt as a
+-- SimpleProposal the factory threw "Unknown exception" on both games (actions with 2 and 4 removals), and so did the bulldozer's preview.
 local function constructionProposal(rec, R)
+	if #rec.cons == 0 then
+		for _, ref in ipairs(rec.rem) do
+			if type(ref) == "table" and ref.__ref == "grp" then
+				local _, rem, map = constructionLists(rec, R)
+				local p = api.type.Proposal.new()
+				p.toRemove = rem
+				if next(map) ~= nil then p.old2new = map end
+				return p
+			end
+		end
+	end
 	local sp = A.new("SimpleProposal")
 	setConstructions(sp, rec, R)
 	return sp
@@ -3193,7 +3208,7 @@ local function proposalCounts(proposal)
 			local ok, l = pcall(function() return obj[key] end)
 			return ok and l ~= nil and #l or nil
 		end
-		for _, k in ipairs({ "constructionsToAdd", "constructionsToRemove" }) do
+		for _, k in ipairs({ "constructionsToAdd", "constructionsToRemove", "toRemove" }) do
 			local c = n(proposal, k)
 			if c then parts[#parts + 1] = k .. "=" .. c end
 		end
@@ -3203,6 +3218,26 @@ local function proposalCounts(proposal)
 				local c = n(st, k)
 				if c then parts[#parts + 1] = k .. "=" .. c end
 			end
+		end
+	end)
+	return table.concat(parts, " ")
+end
+
+-- What a proposal's constructionsToRemove names on this game, for the "factory threw" line: each entity with its file, "group" (an asset
+-- group), "no construction" or "gone", and "TWICE" when it is listed twice. Seen in play (0.2.14): removals of Pay Your Tolls' gantries and
+-- signs made the factory throw "Unknown exception" on both games, and the line said only how many there were.
+function A.removalsLine(proposal)   -- (a field, not a local: the file stays below the game's 200 locals)
+	local parts, seen = {}, {}
+	pcall(function()
+		local list = A.list(proposal, "constructionsToRemove")
+		if #list == 0 then list = A.list(proposal, "toRemove") end
+		for i, e in ipairs(list) do
+			if i > 8 then parts[#parts + 1] = "..." break end
+			local info = A.conInfo(e)
+			local what = info and (tostring(info.file) .. "@" .. string.format("%.1f,%.1f", info.p.x, info.p.y))
+				or (not A.exists(e) and "gone") or (A.assetGroup(e) and "group") or "no construction"
+			parts[#parts + 1] = tostring(e) .. ":" .. what .. (seen[e] and " TWICE" or "")
+			seen[e] = true
 		end
 	end)
 	return table.concat(parts, " ")
@@ -3930,9 +3965,9 @@ local function decodeBuildUnsafe(body, ctx)
 			local first = tostring(errF):gsub("\nstack traceback:.*", ""):sub(1, 160)
 			lastErr = "the engine's command factory refused the " .. plan .. " build: " .. first
 			-- say what it was given: the next real run names the part that makes it throw
-			log(string.format("factory threw for %s (form %d of %d): %s; passed [%s]; record cons=%d rem=%d nodes=%d+%d segs=%d+%d objs=%d+%d; first command ie=%s pi=%s",
+			log(string.format("factory threw for %s (form %d of %d): %s; passed [%s]; record cons=%d rem=%d nodes=%d+%d segs=%d+%d objs=%d+%d; first command ie=%s pi=%s%s",
 				plan, i, #(FORMS[plan] or { {} }), first, proposalCounts(built[1]), #rec.cons, #rec.rem, #rec.nodes, #rec.rmNodes, #rec.segs, #rec.rmSegs,
-				#rec.objs, #rec.rmObjs, tostring(built[3]), tostring(built[4])))
+				#rec.objs, #rec.rmObjs, tostring(built[3]), tostring(built[4]), #rec.rem > 0 and ("; removes [" .. A.removalsLine(built[1]) .. "]") or ""))
 		end
 	end
 	if not args then return nil, lastErr or "no way to build it" end
@@ -4146,6 +4181,30 @@ local function bindCreated(body, key, made)
 					local info = A.conInfo(e)
 					if info and info.file == c.file and d3(info.p, p) <= TOL_CON then alt = e break end
 				end
+			end
+			-- A model-only construction (no street, no terrain, models only) is built by the game as a decoration: an asset group with no
+			-- CONSTRUCTION (Pay Your Tolls' own notes, P279c, and its code finds its speed boards among ASSET_GROUP entities by their models;
+			-- seen in play, 0.2.14: every speed-board build applied with the engine's ok on both games, no CONSTRUCTION appeared and the check
+			-- said RESULT DIFFERS). Looked for as a group with a model at the record's place that no other piece took; it gets the same key.
+			if not alt then
+				local bestD
+				for _, e in ipairs(octree(p, TOL_CON, "ASSET_GROUP") or {}) do
+					local list = not used[e] and A.comp(e, "CONSTRUCTION") == nil and A.comp(e, "MODEL_INSTANCE_LIST") or nil
+					local at = {}
+					for _, m in ipairs(list and A.list(list, "fatInstances") or {}) do
+						local t = A.mat16(get(m, "transf"))
+						if t then at[#at + 1] = { x = t[13], y = t[14] } end
+					end
+					for _, m in ipairs(list and A.list(list, "thinInstances") or {}) do
+						local q = A.xyz(get(m, "pos"))
+						if q then at[#at + 1] = q end
+					end
+					for _, q in ipairs(at) do
+						local d = sqrt((q.x - p.x) ^ 2 + (q.y - p.y) ^ 2)
+						if d <= TOL_CON and (bestD == nil or d < bestD) then alt, bestD = e, d end
+					end
+				end
+				if alt then log("build: construction " .. i .. " (" .. tostring(c.file) .. ") was built as a decoration: asset group " .. tostring(alt) .. " keyed " .. key .. "#c" .. i) end
 			end
 			if alt then
 				used[alt] = true

@@ -2142,6 +2142,46 @@ SIMO.kinds = setmetatable({}, { __mode = "k" })   -- a command made in this stat
 SIMO.cargs = setmetatable({}, { __mode = "k" })   -- a command made in this state -> its factory's arguments (simForeign encodes them)
 SIMO.foreign, SIMO.foreignSeen, SIMO.foreignSent = {}, {}, {}
 
+-- What made the code that sends now run, judged by the outermost function of that mod on the stack (`mod`, C.modOfSource; a dispatcher
+-- of the game's own between the game and the mod's entry is passed over): the one the game called. Returns "every" (the
+-- game runs it on every game alike: a file's own code while it loads, a game script's guiUpdate (userParams, state, guiState), its
+-- guiHandleEvent of any event but a tool's) or "local" (only this game's player can have caused it: guiHandleEvent of a "builder.*" event,
+-- which only the game whose player uses the tool gets, the other games apply the build as a command; or a function the game called that is
+-- no game-script entry, a click in a script's own GUI), and what it was, for the log. A game script's entries take (userParams, state,
+-- guiState) and guiHandleEvent also (src, id, name, param) (the mods' own handlers, e.g. Pay Your Tolls, Parallel Tracks, Advanced Track
+-- Patterns; a handler of `...` is read the same way). Which other events reach guiHandleEvent on only one game is not known yet: every
+-- other event counts as every game's, so a copy is never shipped twice; the log names each one (id, name and src), so a real session shows it.
+function X.guiTrigger(mod)
+	local outer, top
+	for level = 2, 80 do
+		local info = debug.getinfo(level, "Su")
+		if not info then break end
+		if info.what ~= "C" and C.modOfSource(info.source) == mod then outer, top = level, info end
+	end
+	if not outer then return "every", "no Lua code" end
+	if top.what == "main" then return "every", "a file's own code (" .. tostring(top.short_src) .. ")" end
+	local args, n = {}, top.nparams or 0
+	for i = 1, n do
+		local _, v = debug.getlocal(outer, i)
+		args[i] = v
+	end
+	if top.isvararg then
+		for i = 1, 16 do
+			local name, v = debug.getlocal(outer, -i)
+			if name == nil then break end
+			n = n + 1
+			args[n] = v
+		end
+	end
+	if n >= 6 and type(args[6]) == "string" then
+		local ev = tostring(args[5]) .. "/" .. args[6]
+		if args[6]:find("^builder%.") then return "local", "this game's tool event " .. ev end
+		return "every", "guiHandleEvent of " .. ev .. " src=" .. tostring(args[4])
+	end
+	if n >= 2 and (type(args[2]) == "userdata" or type(args[2]) == "table") then return "every", "a game script's guiUpdate" end
+	return "local", "a callback the game called (a click in a script's own GUI)"
+end
+
 -- FeverLink3's own code in this Lua state (the bridge, the company sender): never another mod's (C.callerOf)
 function X.ownSources()
 	if X.OWN then return X.OWN end
@@ -7391,12 +7431,37 @@ function installWrap()
 				end
 				return O.sendCommand(cmd, cb, progress)
 			end
-			-- another mod's own script event, sent in this state (a mod's game-script interface half): shipped like the player's commands
-			-- (L.markForeignEvent, the same rule as the UI hook's); one that is not plain data stays on this game as before
-			if tag.name == "makeScriptingSendEventCmd" and tag.args.foreign == nil and X.live() then
-				local okW, _, mod = pcall(C.callerOf, wrapper, X.ownSources())
-				if okW then tag.mod = mod or false end   -- for the log of an event nobody registered (X.noteUnregistered)
-				if okW and mod then
+			-- Another mod's code in this state runs on EVERY game alike when the game runs it by itself (a game script's guiUpdate, an event
+			-- every game receives), so every game's copy sends the same command or event (owner decision 2026-11-03, the simulation state's
+			-- rule): only the HOST's copy is shipped and applied at the stamp on every game, the other games drop theirs. Seen in play
+			-- (0.2.14): Pay Your Tolls' guiUpdate sends pyt.addToll and pyt.addCounts (toll income) on each game. What THIS game's player did
+			-- (its own tool's builder.* event, a click in a script's own GUI) is shipped from this game like any player action (X.guiTrigger).
+			-- A mod's window (the interface states, the UI hook) is a player's click on one game and stays shared from every player.
+			local okW, mod = false, nil
+			if X.live() and tag.args.foreign == nil then
+				local okC, _, m = pcall(C.callerOf, wrapper, X.ownSources())
+				okW, mod = okC, okC and m or nil
+				if okC then tag.mod = m or false end   -- for the log of an event nobody registered (X.noteUnregistered)
+			end
+			if mod then
+				local okT, by, why = pcall(X.guiTrigger, mod)
+				if not okT then by, why = "every", "not read (" .. tostring(by) .. ")" end
+				G.foreignGui = G.foreignGui or {}
+				local what = tag.name == "makeScriptingSendEventCmd" and ("event " .. tostring(tag.args[2]) .. "/" .. tostring(tag.args[3])) or ("command " .. tag.name)
+				local line, n = C.tally(G.foreignGui, mod .. " " .. what .. " " .. by .. " " .. why)
+				if by == "every" and C.PLAYER_ID ~= 0 then
+					if line then
+						logGui("another mod's " .. what .. " (mod=" .. tostring(mod) .. ", script-interface state, from " .. why .. ") is dropped here: the host's copy of the mod sends it for every game (" .. n .. " so far)")
+					end
+					return
+				end
+				if line then
+					logGui("another mod's " .. what .. " (mod=" .. tostring(mod) .. ", script-interface state, from " .. why .. ") is sent from "
+						.. (by == "local" and "this game (its player's action)" or "the host's copy for every game") .. " (" .. n .. " so far)")
+				end
+			end
+			if tag.name == "makeScriptingSendEventCmd" and okW then
+				if mod then
 					local okM, why = L.markForeignEvent(tag.args, mod, C.plain)
 					if not okM and why ~= "registered" then
 						logGui("another mod's event " .. tostring(tag.args[2]) .. "/" .. tostring(tag.args[3]) .. " (mod=" .. tostring(mod) .. ") stays on this game unshared: " .. tostring(why))

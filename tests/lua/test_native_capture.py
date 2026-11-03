@@ -231,6 +231,33 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertEqual((self.A.events_seen("acl"), self.B.events_seen("acl")), (1, 2), self.B.log())
         self.assertIn("another mod's event acl/setRules (mod=6414403) is shared", self.B.log())
         self.assertIn("another mod's event acl/odd (mod=6414403) stays on this game unshared", self.B.log())
+        # a file a mod loads by its mod id has that name as its source (seen in play, 0.2.14: Industry Upgrades' Buy button in its entity
+        # window, "stardorn_industry_upgrades::/industry_upgrades/ui.lua", reached the clicking game only); the game's own "::/..." stays local
+        for chunk, ev in (("stardorn_industry_upgrades::/industry_upgrades/ui.lua", "buy"), ("::/gui/main/notifications.lua", "sound")):
+            self.B.run("assert(load(%s, %s, 't', setmetatable({ api = UI_HOOK.api }, { __index = _G })))()"
+                       % (T.lua_str('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "iu", "%s", { construction = 7 }))' % ev), T.lua_str(chunk)))
+        self.tick(16)
+        self.assertEqual((self.A.events_seen("iu"), self.B.events_seen("iu")), (1, 2), self.B.log())
+        self.assertIn("another mod's event iu/buy (mod=stardorn_industry_upgrades) is shared", self.B.log())
+        # a game script's interface half runs on every game alike (Pay Your Tolls' guiUpdate sends pyt.addCounts on each): only the
+        # host's copy travels, so every game gets it once, at the stamp
+        for g in (self.A, self.B):
+            g.run("assert(load(%s, %s, 't', setmetatable({ api = GUI_API }, { __index = _G })))()"
+                  % (T.lua_str('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "pyt", "pyt.addCounts", { counts = { { 1, 2, 0, 50 } } }))'),
+                     T.lua_str("epod_pay_your_tolls_tf3_1::/pyt/pyt_toll.script.tl")))
+        self.tick(16)
+        self.assertEqual((self.A.events_seen("pyt"), self.B.events_seen("pyt")), (1, 1), self.A.log() + self.B.log())
+        self.assertIn("another mod's event pyt/pyt.addCounts (mod=epod_pay_your_tolls_tf3_1, script-interface state, from a file's own code", self.A.log())
+        self.assertIn("is sent from the host's copy for every game", self.A.log())
+        self.assertIn("is dropped here: the host's copy of the mod sends it for every game", self.B.log())
+        # ... but its guiHandleEvent of THIS game's tool event (the guest's own build) is that player's action: shipped from the guest
+        handler = self.B.L.eval("assert(load(%s, %s, 't', setmetatable({ api = GUI_API }, { __index = _G })))()"
+                                % (T.lua_str('return function(u, state, gs, src, id, name, param) api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "pyt", "pyt.setTown", { id = 1 })) end'),
+                                   T.lua_str("epod_pay_your_tolls_tf3_1::/pyt/pyt_toll.script.tl")))
+        handler(None, self.B.L.table(), self.B.L.table(), "", "constructionBuilder", "builder.proposalApply", self.B.L.table())
+        self.tick(16)
+        self.assertEqual((self.A.events_seen("pyt"), self.B.events_seen("pyt")), (2, 2), self.B.log())
+        self.assertIn("from this game's tool event constructionBuilder/builder.proposalApply) is sent from this game (its player's action)", self.B.log())
 
     def test_a_scripts_build_callback_runs_when_the_other_simulation_state_applies_it_at_the_stamp(self):
         # The real game shares one game's steps between two simulation Lua states (the mock's SIM_SPLIT). A script's build is taken in the

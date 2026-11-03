@@ -6,6 +6,13 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.14-beta.2 (2026-11-03, pre-release)
+
+### Fixed
+- Buttons in other mods' windows (for example Industry Upgrades' Buy) and the events of other mods' scripts now reach every game in a session; before, a mod whose files are named by its mod id was taken for the game itself and its action happened only on the clicking player's game.
+- What another mod's game script does by itself in the game interface (for example Pay Your Tolls finding a new toll gantry or counting toll income) now happens once for everyone: the host's copy of the mod decides for every game, as for mod scripts in the simulation, instead of each game doing it on its own. What such a script does in answer to your own action (for example your own build) is still shared from your game.
+- Removing decorations a mod's script put up (for example Pay Your Tolls' speed boards) no longer fails with "FeverLink3 could not copy it", and a decoration built that way is no longer reported as missing.
+
 ## 0.2.14-beta.1 (2026-11-03, pre-release)
 
 ### In short

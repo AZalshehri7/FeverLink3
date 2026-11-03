@@ -454,12 +454,20 @@ end
 
 -- ------------------------------------------------------------------ who called a wrapped command function
 
--- The folder of the mod a script source path belongs to, or nil when the path is not a mod's (the game's own scripts, which every
--- game runs alike). The interface half turns it into the mod's own name (Hud.modName).
+-- The mod a script source belongs to (its folder or its mod id), or nil when the source is not a mod's (the game's own scripts, which
+-- every game runs alike). The interface half turns it into the mod's own name (Hud.modName matches either).
 -- ".../mods/6414403/content/auto_line_namer/aln.script.lua" -> "6414403"
+-- A file a mod loads by its mod id (require "<mod id>::/path", a game script's "<mod id>::/path.script@fn", an entity window script)
+-- has that name as its source; the game's own files have an empty mod id ("::/gui/..."). Seen in play (0.2.14): Industry Upgrades'
+-- Buy button ("stardorn_industry_upgrades::/industry_upgrades/ui.lua") and Pay Your Tolls' window events were taken for the game's own
+-- code, so they reached the clicking game only.
+-- "stardorn_industry_upgrades::/industry_upgrades/ui.lua" -> "stardorn_industry_upgrades"; "::/gui/main/react.lua" -> nil
 function C.modOfSource(src)
 	local p = tostring(src or ""):gsub("^@", ""):gsub("\\", "/")
-	local low = p:lower()
+	local id = p:match("^([^/:]+)::/")
+	if id then return id end
+	-- a folder path; the game may name its own mods folder relatively ("mods/<folder>/content/...")
+	local low = "/" .. p:lower()
 	if not (low:find("/mods/", 1, true) or low:find("mod.io", 1, true) or low:find("staging_area", 1, true) or low:find("/workshop/", 1, true)) then
 		return nil
 	end
