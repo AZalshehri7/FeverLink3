@@ -60,6 +60,23 @@ jobs:
           FEVERLINK3_OFFICIAL_BUILD: '1'
         run: cargo build --release --workspace
 
+      # The linker writes the DLL's debug symbols beside it (target/release/feverlink3_native.pdb, public symbols: function
+      # names; the DLL's debug entry names this PDB by GUID). The release profile is not changed for it: debug info on
+      # (`debug = "line-tables-only"` or more) changes the DLL's code. The PDB goes on the release as its own asset, never
+      # in the player zip, and its name must not look like the zip (`FeverLink3-*.zip`, the updater's pattern): it stays
+      # in `symbols/`, outside `dist/`. Crash addresses: tools/dll_unwind_check.py DLL PDB --rva 0x... (docs/RELEASING.md).
+      - name: Keep the DLL's debug symbols
+        if: steps.parse.outputs.release == 'true'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          python -m pip install pefile capstone
+          python tools/dll_unwind_check.py target/release/feverlink3_native.dll target/release/feverlink3_native.pdb --match
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Force symbols | Out-Null
+          Copy-Item target/release/feverlink3_native.pdb "symbols/feverlink3_native-$env:VERSION.pdb"
+
       - name: Package
         if: steps.parse.outputs.release == 'true'
         shell: pwsh
@@ -94,6 +111,13 @@ jobs:
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
+          retention-days: 7
+      - if: steps.parse.outputs.release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbols
+          path: symbols/
           if-no-files-found: error
           retention-days: 7
 
@@ -170,6 +194,10 @@ jobs:
         with:
           name: dist
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: symbols
+          path: symbols
       # an unsigned release has no signature artifact
       - if: needs.sign.outputs.signed == 'true'
         uses: actions/download-artifact@v4
@@ -210,6 +238,11 @@ jobs:
           Set-Content -Path notes.md -Value $notes
           $assets = @("dist/$zip", "dist/$zip.sha256", "dist/manifest.json")
           if ($signed) { $assets += "dist/manifest.json.sig" }
+          # the DLL's debug symbols, for crash reports only (players do not need them)
+          $assets += "symbols/feverlink3_native-$version.pdb"
+          # the in-game updater takes the one asset named FeverLink3-*.zip; a second one would stop every update
+          $zips = @($assets | Where-Object { (Split-Path $_ -Leaf) -like 'FeverLink3-*.zip' })
+          if ($zips.Count -ne 1) { Write-Error "the release must have exactly one FeverLink3-*.zip asset: $($zips -join ', ')"; exit 1 }
           $extra = @(); if ("$version" -match '-') { $extra += '--prerelease' }
           gh release create "v$version" @assets --target "${{ github.sha }}" --title "FeverLink3 $version" --notes-file notes.md @extra
           if ($LASTEXITCODE -ne 0) { exit 1 }

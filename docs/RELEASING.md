@@ -11,6 +11,7 @@ A release is a commit on `main` whose message starts with the version, built by 
    - `FeverLink3-<version>.zip`: the files to copy into the game's folder (`winhttp.dll`, `mods/release/feverlink3/`, no program; `feverlink3_release package --layout portable` makes the developer layout with `feverlink3.exe`), plus `README.txt` (the repository's `README.md`), `HOW-TO-PLAY.txt` (`docs/PLAYING.md`), `LICENSE`, `THIRD_PARTY_NOTICES.md`)
    - `FeverLink3-<version>.zip.sha256`
    - `manifest.json`: version, every file with size and SHA-256, and the zip's SHA-256
+   - `feverlink3_native-<version>.pdb`: the debug symbols of that release's `winhttp.dll`, for crash reports only, not in the player zip (see "Debug symbols" below)
    - `manifest.json.sig` (only once signing is on): the detached signature, one line `feverlink3-ed25519 <key id> <Ed25519 signature over the exact bytes of manifest.json, hex>`. The key id is the first 8 bytes of the public key's SHA-256. The signature covers the zip through its hash in the manifest.
 
    The zip SHA-256 is also in the release notes. Until 1.0.0 every release (with or without a dash) is published without `manifest.json.sig` and its notes say so; the in-game updater accepts it on the hash checks alone ("Automatic updates" below, the trust model in `docs/SECURITY_FOR_USERS.md`). Once `RELEASE_SIGNING` is `on`, a release without a signature fails, because updaters that trust a key refuse unsigned releases.
@@ -95,11 +96,23 @@ Right after a release (0.2.1 or later; 0.2.0 was withdrawn) is published on GitH
 PowerShell, in the folder with the files:
 
 ```powershell
-(Get-FileHash FeverLink3-0.2.13.zip -Algorithm SHA256).Hash.ToLower()
-Get-Content FeverLink3-0.2.13.zip.sha256
+(Get-FileHash FeverLink3-0.2.14.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content FeverLink3-0.2.14.zip.sha256
 ```
 
 The two values must be equal, and equal to the SHA-256 in the release notes. The same hash is the `zip_sha256` field of `manifest.json`. Until 1.0.0 there is no signature to check. From then on the signature check is done by the launcher's updater (trusted public keys embedded in the exe), or by hand with `feverlink3_release verify --manifest manifest.json` from a checkout of the tagged source.
+
+## Debug symbols
+
+Every release carries `feverlink3_native-<version>.pdb`, the PDB the linker wrote for exactly that release's `winhttp.dll` (since 0.2.14). The release profile is unchanged for it: with `debug = false` the MSVC linker still writes `target/release/feverlink3_native.pdb` with the public symbols (function names, no line tables or types), and the DLL's CodeView debug entry names it by file name and GUID (no build path). Turning debug info on (`debug = "line-tables-only"` or `"full"`) would add line numbers, but it changes the DLL's code (checked 2026-11-03, rustc 1.99: `.text` 1.5 KB smaller or larger, and a 19 MB or 67 MB PDB), so the shipped DLL stays as it was tested. The `build` job checks with `tools/dll_unwind_check.py DLL PDB --match` that the PDB's GUID is the DLL's, keeps it outside `dist/` (so it is neither in the zip nor in `manifest.json`) and `publish` attaches it; `publish` also refuses a release with more than one `FeverLink3-*.zip` asset, the name the in-game updater looks for.
+
+To name the function at a crash address (the "fault offset" of a Windows crash report, Event Viewer, Application Error, when the faulting module is `winhttp.dll`):
+
+```powershell
+python tools/dll_unwind_check.py winhttp.dll feverlink3_native-0.2.14.pdb --rva 0x1234
+```
+
+A debugger (WinDbg, Visual Studio) looks for the PDB by the name in the DLL: rename the file to `feverlink3_native.pdb` and put it in a folder on the symbol path.
 
 ## SmartScreen
 

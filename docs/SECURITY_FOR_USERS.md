@@ -1,6 +1,6 @@
 # What is in winhttp.dll, and how to check it
 
-For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-11-02 (version 0.2.13). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
+For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-11-03 (version 0.2.14-beta.1, a pre-release). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
 
 ## The short version
 
@@ -145,13 +145,13 @@ From 0.2.0 on, FeverLink3 updates itself. This section says exactly what it does
 
 ## Verify what you downloaded
 
-Each release has these files: `FeverLink3-<version>.zip`, `FeverLink3-<version>.zip.sha256` and `manifest.json` (every file in the zip with its size and SHA-256, and the zip's SHA-256). The release notes repeat the zip's SHA-256. Releases are built by GitHub Actions from a commit on `main`; nothing is built on a developer's PC ([release process](https://github.com/AZalshehri7/FeverLink3/blob/main/docs/RELEASING.md)).
+Each release has these files: `FeverLink3-<version>.zip`, `FeverLink3-<version>.zip.sha256` and `manifest.json` (every file in the zip with its size and SHA-256, and the zip's SHA-256). The release notes repeat the zip's SHA-256. Since 0.2.14 a release also carries `feverlink3_native-<version>.pdb`, the debug symbols of its `winhttp.dll` (function names, used to read crash reports); you do not need it to play, it is not in the zip or in `manifest.json`, and the automatic update never downloads it. Releases are built by GitHub Actions from a commit on `main`; nothing is built on a developer's PC ([release process](https://github.com/AZalshehri7/FeverLink3/blob/main/docs/RELEASING.md)).
 
 In PowerShell, in the folder with the downloaded files:
 
 ```powershell
-(Get-FileHash .\FeverLink3-0.2.13.zip -Algorithm SHA256).Hash.ToLower()
-Get-Content .\FeverLink3-0.2.13.zip.sha256
+(Get-FileHash .\FeverLink3-0.2.14.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content .\FeverLink3-0.2.14.zip.sha256
 
 # the DLL you installed against the manifest (your game folder: Steam, right-click Transport Fever 3, Manage, Browse local files)
 $m = Get-Content .\manifest.json -Raw | ConvertFrom-Json
@@ -172,6 +172,8 @@ As a player:
 1. Do not turn your antivirus off. Compare the file's hash with the release (above).
 2. If the hash matches and you trust the project: restore the file (Windows Security, Virus and threat protection, Protection history, pick the item, Actions, Restore or Allow) and, if it comes back, add an exclusion for that one file instead of a whole folder. If you do not trust it, remove FeverLink3 ("Remove it" below).
 3. Report the false positive, so it is fixed for everyone. A report that names the exact detection and carries the file's SHA-256 is the most useful, and vendors take more notice when several people report the same file.
+
+If the antivirus removed the file, the game starts without multiplayer, and since 0.2.14 the FeverLink3 window says so: "winhttp.dll is missing" when the game folder has no `winhttp.dll`, "FeverLink3 did not start" when the file is there but the game did not load it (blocked, an older version, or another program's `winhttp.dll`), with the two fixes: restore and allow the file (step 2), or copy `winhttp.dll` again from the release zip. The window cannot see the antivirus itself, so it says the antivirus *may* be the cause.
 
 Known case: Windows Defender removed the 0.2.12 release's `winhttp.dll` as `Trojan:Win32/Posilod.CA!cl` ("!cl": a verdict of Microsoft's cloud, not a signature). Since 0.2.13 the file carries version information (product FeverLink3, its version, publisher and description), which you can see in its Properties, Details.
 

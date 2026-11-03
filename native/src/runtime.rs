@@ -1251,6 +1251,7 @@ impl Runtime {
             preview: None,
             tool: false,
             asset_tick: false,
+            empty_tick: false,
             passed: None,
         };
         let hold = match crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan)) {
@@ -1341,7 +1342,7 @@ impl Runtime {
             return args.out;
         }
         self.terrain_note_add(&args);
-        self.assets_note_add(&args, plan.tool && !plan.asset_tick);
+        self.assets_note_add(&args, plan.tool && !plan.asset_tick, plan.empty_tick);
         // both call the engine when an order is carried out: they guard their own bookkeeping
         if self.inject.enabled() {
             self.inject_on_add(&args, caller);
@@ -1412,7 +1413,15 @@ impl Runtime {
         self.ingest(&mut machine, now);
         plan.due = self.take_due_here(&mut machine, args.list, now);
         let own = script_any && self.own_send.take(now);
-        let script = script_build && !own;
+        // A command of no tool site whose Proposal is empty (the asset shape with nothing in it) changes nothing: an asset brush's tick
+        // that placed no tree. Seen in play, 0.2.13: the tree brush's fourth tick came empty from its own call off the hold list, so it
+        // passed for a script's build, was held (the hold emptied the brush's handle with 16 bytes where the handle is 8: the brush's
+        // saved register, the crash at TransportFever3.exe+0x5499e7, engine::HANDLE_SIZE) and refused by the proof ("identity unknown").
+        // There is nothing in it to share: it goes on as it is, as every asset-shaped command off the hold list does (assets.rs), and
+        // is noted as the tool's so that it is never taken for the mod's empty carrier at its apply (`assets::State::classify`).
+        let empty_tick = script_build && !own && self.changes_nothing(args);
+        plan.empty_tick = empty_tick;
+        let script = script_build && !own && !empty_tick;
 
         // a tree, plant or rock placed by a tool on the hold list goes the brush's way, not held (runtime/assets.rs)
         plan.asset_tick = tool.is_some() && self.assets_tool_tick(args);
@@ -1476,6 +1485,15 @@ impl Runtime {
         bytes[crate::assets::FLAGS + 2] == 1
             && terrain.iter().all(|&b| b == 0)
             && !crate::assets::shape_of(&bytes).is_some_and(|(rm, add)| rm + add > 0)
+    }
+
+    /// A `build_proposal` whose Proposal has the asset shape ([`crate::assets::shape_of`]) and holds nothing: no member of it is set.
+    /// Only reads memory.
+    fn changes_nothing(&self, args: &AddArgs) -> bool {
+        // SAFETY: only readable memory is read.
+        let Some(payload) = (unsafe { engine::payload_of(args.cmd) }) else { return false };
+        let Some(bytes) = dump::Mem::read(&LiveMem, payload, dump::PAYLOAD_SIZE) else { return false };
+        crate::assets::shape_of(&bytes) == Some((0, 0))
     }
 
     /// Takes the command out of the engine's hands ([`engine::capture`], the engine's move constructor) and into the
@@ -1722,6 +1740,9 @@ struct AddPlan {
     tool: bool,
     /// The tool's command is an asset tick ([`Runtime::assets_tool_tick`]): not held, it goes the brush's way.
     asset_tick: bool,
+    /// A command of no tool site, not the mod's own, whose Proposal is empty: an asset tick that changes nothing. Not held, it goes on as
+    /// it is ([`Runtime::plan_add`]).
+    empty_tick: bool,
     /// Why a tool's command that holding should have taken goes to the engine at the click (a fault, `failsafe.rs`).
     passed: Option<&'static str>,
 }
@@ -2155,6 +2176,12 @@ mod tests {
         assert_eq!(out, modded.args().out);
         assert_eq!(*modded.out, [0; HANDLE_SIZE], "held: the script's handle is emptied");
         assert_eq!(calls(), ["add kind 52 tag 1"], "only the town's build reached the engine");
+        // a player's command whose Proposal is empty (an asset brush's tick that placed nothing, seen in play 0.2.13) changes nothing:
+        // never held, and the caller's handle and what lies after it are left to the engine
+        let mut empty = player(0);
+        unsafe { rt.on_add(empty.args(), at(0x1234)) };
+        assert_eq!(calls(), ["add kind 52 tag 0"], "nothing to share: it goes on as it is");
+        assert_eq!(*empty.out, [0xEE; HANDLE_SIZE], "not touched by the hook");
         ctl(
             dir.path(),
             "own_next	1	{}

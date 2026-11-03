@@ -727,6 +727,14 @@ fn build_proved(
                         ));
                         copy_constructions(c, &mut p, &from, say)?;
                     }
+                    Take::Run { off, stride, at, n, of } => {
+                        say(&format!(
+                            "inject: the text's {n} edge object(s) are the conversion's {at}..{} of {of}; the other {} (what the conversion adds around the build, a level crossing's) stay in the donor's copy",
+                            at + n,
+                            of - n
+                        ));
+                        take_run(c, &mut z, &mut p, off, stride, at, n, say);
+                    }
                 }
             }
             Ok(())
@@ -802,6 +810,10 @@ enum Take {
     /// Engine copies of these constructions of the donor's copy (index in its `toAdd`, address), in the text's order, go into the
     /// source's own empty `toAdd` ([`copy_constructions`]); `of`: how many the conversion has (the others stay and die with its copy).
     Copies { from: Vec<(usize, usize)>, of: usize },
+    /// The donor copy's elements `at..at + n` of the list at this payload offset (its stride `stride`), out of `of`, go into the source
+    /// as a list of their own: the engine's Proposal copy constructor copies the donor's copy with that list narrowed to them, and the
+    /// copy's list moves into the source ([`take_run`]). The others stay and die with the donor's copy.
+    Run { off: usize, stride: usize, at: usize, n: usize, of: usize },
 }
 
 /// Which elements of donor member `m` (the text adds `n` of them) [`build_proved`] takes from the donor's copy `z`; reads only, nothing
@@ -809,9 +821,11 @@ enum Take {
 ///
 /// Constructions are picked by what tells one from another (the same file, the same placement: [`pick_constructions`], the rule of
 /// [`same_constructions`]), each once, in the text's order: the conversion of a station or depot that moves town buildings has the
-/// text's construction and the moved buildings, in an order the engine chooses. Edge objects keep the exact count: no conversion has
-/// been seen to add any (the command must carry the text's number of them, [`check_destination`]), and only the constructions have an
-/// engine copy and vector insert that are verified.
+/// text's construction and the moved buildings, in an order the engine chooses. Edge objects are taken whole when the conversion has
+/// the text's number of them (the proof compares each); a conversion with more (a road with a stop across rails: the level crossing's
+/// objects too, [`check_destination`]) gives the text's ones, picked by what tells one edge object from another ([`same_edge_object`]),
+/// each once. There is no verified engine copy of a single edge object, so the picks must be one run of the conversion's list in the
+/// text's order ([`Take::Run`]: the Proposal copy constructor copies them); any other pick is refused.
 fn donor_take(
     mem: &dyn Mem,
     z: &[u8],
@@ -823,7 +837,26 @@ fn donor_take(
     let have = if e >= b { (e - b) / m.2 as u64 } else { u64::MAX };
     let counts = || format!("the conversion in the script command has {have} {}, the text has {n}", m.0);
     if m.1 != TO_ADD {
-        return if have == n { Ok(Take::Whole(m.1)) } else { Err(counts()) };
+        if have == n {
+            return Ok(Take::Whole(m.1));
+        }
+        if have < n || have > PLACE_MAX as u64 || !pointer_like(b) {
+            return Err(counts());
+        }
+        let want = text_edge_objects(lines)?;
+        let conv = edge_objects_at(mem, b as usize, have as usize)?;
+        let picks = pick(&conv, &want, same_edge_object).map_err(|i| {
+            format!(
+                "the conversion in the script command does not add the text's edge object: {}",
+                edge_object_miss(&conv, &want, i)
+            )
+        })?;
+        if picks.windows(2).any(|w| w[1] != w[0] + 1) {
+            return Err(format!(
+                "the text's edge objects are the conversion's {picks:?} of {have}, not one run in the text's order: taking them apart needs an engine copy of a single edge object, which is not verified"
+            ));
+        }
+        return Ok(Take::Run { off: m.1, stride: m.2, at: picks[0], n: picks.len(), of: have as usize });
     }
     if have < n || have > PLACE_MAX as u64 || (n > 0 && !pointer_like(b)) {
         return Err(counts());
@@ -841,6 +874,42 @@ fn donor_take(
     }
     let from = picks.into_iter().map(|k| (k, b as usize + k * CONSTRUCTION_STRIDE)).collect();
     Ok(Take::Copies { from, of: conv.len() })
+}
+
+/// Puts the donor copy `z`'s elements `at..at + n` of the list at payload offset `off` into the source `p`'s empty list there, with the
+/// engine's own functions only: `z`'s list is narrowed to those elements (begin, end and capacity inside its own block), the Proposal
+/// copy constructor copies `z` into a third scratch (a new list of exactly those elements, allocated and copied by the engine), `z`'s list
+/// is restored at once, the copy's list moves into `p` and the rest of the copy dies with its destructor. `z` keeps all its elements, so
+/// its destructor frees what the engine built for it, nothing twice.
+#[allow(clippy::too_many_arguments)]
+fn take_run(
+    c: &Ctx,
+    z: &mut Scratch,
+    p: &mut Scratch,
+    off: usize,
+    stride: usize,
+    at: usize,
+    n: usize,
+    say: &mut dyn FnMut(&str),
+) {
+    let whole: [u8; 24] = z.bytes()[off..off + 24].try_into().unwrap_or([0; 24]);
+    let b = u64_at(&whole, 0) + (at * stride) as u64;
+    let e = b + (n * stride) as u64;
+    for (k, v) in [b, e, e].into_iter().enumerate() {
+        z.bytes_mut()[off + k * 8..off + k * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let mut y = Scratch::new();
+    say("inject: calling the engine copy constructor on the donor's copy with its edge objects narrowed to the text's");
+    // SAFETY: `z` holds a constructed Proposal whose narrowed list lies inside its own block (only read by the copy constructor, which
+    // allocates its own list); `y` is scratch.
+    unsafe { (c.fns.copy)(y.ptr(), z.addr() as *const u8) };
+    z.bytes_mut()[off..off + 24].copy_from_slice(&whole);
+    let (yb, pb) = (y.bytes_mut(), p.bytes_mut());
+    pb[off..off + 24].copy_from_slice(&yb[off..off + 24]);
+    yb[off..off + 24].fill(0);
+    say("inject: calling the engine destructor on that copy");
+    // SAFETY: constructed above, destroyed once; its narrowed list now belongs to `p`.
+    unsafe { (c.fns.dtor)(y.ptr()) };
 }
 
 /// Puts engine copies of the donor copy's constructions `from` (in the text's order) into the source's empty `toAdd`, as the engine's
@@ -1501,15 +1570,112 @@ fn text_constructions(lines: &std::collections::BTreeMap<&str, &str>) -> Result<
 /// ([`same_construction`]): the indices into `have`. `have` may hold more (the town buildings a conversion moves) and in another order.
 /// `Err(i)`: `want[i]` has none left.
 fn pick_constructions(have: &[Construction], want: &[Construction]) -> Result<Vec<usize>, usize> {
+    pick(have, want, same_construction)
+}
+
+/// For each element of `want`, in its order, the first element of `have` not taken yet that is the same one (`same`): the indices into
+/// `have`. `Err(i)`: `want[i]` has none left.
+fn pick<T>(have: &[T], want: &[T], same: fn(&T, &T) -> bool) -> Result<Vec<usize>, usize> {
     let mut taken = vec![false; have.len()];
     want.iter()
         .enumerate()
         .map(|(i, w)| {
-            let k = (0..have.len()).find(|&k| !taken[k] && same_construction(&have[k], w)).ok_or(i)?;
+            let k = (0..have.len()).find(|&k| !taken[k] && same(&have[k], w)).ok_or(i)?;
             taken[k] = true;
             Ok(k)
         })
         .collect()
+}
+
+/// What tells one edge object of a proposal from another: its category, its model, its position along its segment, and the segment
+/// when it is an existing one (a new segment's id is a placeholder the two sides number differently, [`set_edge_object_placeholders`]).
+#[derive(Debug, Clone, PartialEq)]
+struct EdgeObj {
+    category: u32,
+    model: Vec<u8>,
+    param: f32,
+    segment: u32,
+}
+
+/// The largest difference of two positions along a segment (0..1) that are the same place.
+const EDGE_PARAM_EPS: f32 = 1e-4;
+
+/// The two edge objects are the same: the same category and model exactly, the same position within [`EDGE_PARAM_EPS`], and on the same
+/// existing segment or both on a new one.
+fn same_edge_object(have: &EdgeObj, want: &EdgeObj) -> bool {
+    let new = |s: u32| s >= 0x8000_0000;
+    have.category == want.category
+        && have.model == want.model
+        && (have.param - want.param).abs() <= EDGE_PARAM_EPS
+        && (new(have.segment) && new(want.segment) || have.segment == want.segment)
+}
+
+/// The text's edge objects, in its order.
+fn text_edge_objects(lines: &std::collections::BTreeMap<&str, &str>) -> Result<Vec<EdgeObj>, String> {
+    let n = count(lines, "proposal.edgeObjectsToAdd.#");
+    if n > PLACE_MAX as u64 {
+        return Err(format!("the text has {n} edge objects, more than {PLACE_MAX}"));
+    }
+    (0..n as usize)
+        .map(|i| {
+            let get = |m: &str| lines.get(format!("proposal.edgeObjectsToAdd[{i}].{m}").as_str()).copied();
+            let hex =
+                |m: &str, p: &str| get(m).and_then(|v| v.strip_prefix(p)).and_then(|h| u32::from_str_radix(h, 16).ok());
+            let bad = |m: &str| format!("edge object {i}: the text has no {m}");
+            let model = get("modelName").and_then(|v| v.strip_prefix("str:")).ok_or_else(|| bad("modelName"))?;
+            let segment = get("segmentEntity")
+                .and_then(|v| {
+                    v.strip_prefix("ent:new#")
+                        .and_then(|k| k.parse::<i32>().ok().map(|k| (-k) as u32))
+                        .or_else(|| v.strip_prefix("ent:old#")?.split('@').next()?.parse::<u32>().ok())
+                })
+                .ok_or_else(|| bad("segmentEntity"))?;
+            Ok(EdgeObj {
+                category: hex("category", "u32:").ok_or_else(|| bad("category"))?,
+                model: rebuild::unescape(model)?,
+                param: f32::from_bits(hex("param", "f32:").ok_or_else(|| bad("param"))?),
+                segment,
+            })
+        })
+        .collect()
+}
+
+/// `n` edge objects from `b` on (a proposal's `edgeObjectsToAdd` begin).
+fn edge_objects_at(mem: &dyn Mem, b: usize, n: usize) -> Result<Vec<EdgeObj>, String> {
+    (0..n)
+        .map(|i| {
+            let at = b + i * EDGE_OBJECT_STRIDE;
+            let e = mem.read(at, 0x30).ok_or_else(|| format!("edge object {i} of the conversion is not readable"))?;
+            let model = crate::assets::read_str(mem, at + 0x90).map_err(|e| format!("edge object {i}'s model: {e}"))?;
+            Ok(EdgeObj {
+                category: u32_at(&e, 4),
+                model,
+                param: f32::from_bits(u32_at(&e, 0x28)),
+                segment: u32_at(&e, 8),
+            })
+        })
+        .collect()
+}
+
+/// Why `want[i]` is none of `have` ([`pick`] with [`same_edge_object`]), for the log: the text's object and the conversion's.
+fn edge_object_miss(have: &[EdgeObj], want: &[EdgeObj], i: usize) -> String {
+    let show = |o: &EdgeObj| {
+        format!(
+            "category {} model {:?} param {} segment {}",
+            o.category,
+            String::from_utf8_lossy(&o.model),
+            o.param,
+            o.segment as i32
+        )
+    };
+    let theirs: Vec<String> = have.iter().take(8).map(show).collect();
+    format!(
+        "edge object {i} is {} in the text; the command's {}: {}{}",
+        show(&want[i]),
+        have.len(),
+        theirs.join("; "),
+        if have.len() > theirs.len() { "; ..." } else { "" }
+    )
 }
 
 /// Why `want[i]` is none of `have` ([`pick_constructions`]), for the log: how far the first construction of the same file stands from
@@ -2082,6 +2248,93 @@ mod tests {
         );
         assert_eq!(&p[0x258..0x270], &[0u8; 24], "no construction of the conversion is carried");
         release(&ctx, built);
+    }
+
+    #[test]
+    fn a_stop_across_rails_takes_the_text_s_edge_object_and_leaves_the_level_crossing_s() {
+        // a street with a stop across two rail tracks: the conversion adds the level crossing's 2 edge objects beside the stop
+        let obj = |model: &str, category: u32, param: f32| {
+            let mut o = [0u8; 0x1a0];
+            o[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+            o[4..8].copy_from_slice(&category.to_le_bytes());
+            o[8..12].copy_from_slice(&(-3i32).to_le_bytes());
+            o[0x28..0x2c].copy_from_slice(&param.to_le_bytes());
+            o[0x90..0x90 + model.len()].copy_from_slice(model.as_bytes());
+            o[0xa0] = model.len() as u8;
+            for s in [0x90, 0x168] {
+                o[s + 0x18] = 15; // inline std::strings
+            }
+            o
+        };
+        let stop = obj("stop.mdl", 1, 0.25);
+        let crossing = obj("crossing.mdl", 2, 0.5);
+        // the stop first, last, and missing (only crossings): taken from 0, taken from 2, refused
+        for (conversion, want) in [
+            ([stop, crossing, crossing], Some(0usize)),
+            ([crossing, crossing, stop], Some(2)),
+            ([crossing, crossing, crossing], None),
+        ] {
+            let (fake, at) = synthetic();
+            let arena = Arena::new(0x3000_0000_0000);
+            for (addr, data) in fake.0 {
+                arena.put(addr, data);
+            }
+            arena.write(at + 0x258, &[0u8; 24]);
+            let block = arena.add(&conversion.concat()) as u64;
+            let s = block + 0x1a0 * want.unwrap_or(0) as u64;
+            let triple = |b: u64, e: u64| -> Vec<u8> { [b, e, e].iter().flat_map(|v| v.to_le_bytes()).collect() };
+            // the text: the tool's command with the stop alone
+            arena.write(s as usize, &stop);
+            arena.write(at + 0x128, &triple(s, s + 0x1a0));
+            let head = portable::Header {
+                seq: 0,
+                event: "held",
+                hold_id: None,
+                site_rva: None,
+                tool: None,
+                t_ms: 0,
+                wall_ms: 0,
+                payload: at,
+            };
+            let mem = Both(&arena);
+            let text =
+                portable::encode(&mem, Env { image_base: BASE }, graph_skip(settings()), "40420", &head).unwrap().text;
+            assert_eq!(donor_counts(&text), vec![1, 0]);
+            // the receiver's conversion: all three
+            arena.write(block as usize, &conversion.concat());
+            arena.write(at + 0x128, &triple(block, block + 3 * 0x1a0));
+            check_destination(&mem, at, 0, 1).expect("more edge objects than the text's");
+            let ctx = Ctx {
+                fns: fns(),
+                alloc: &arena,
+                mem: &mem,
+                base: BASE,
+                set: settings(),
+                build_name: "40420",
+                cons: None,
+            };
+            WORLD.with(|w| w.set(&arena));
+            let mut said = Vec::new();
+            let r = build_verified(&ctx, &ArenaPoke(&arena), &text, Some(at), &mut |l| said.push(l.to_string()));
+            WORLD.with(|w| w.set(core::ptr::null()));
+            match want {
+                Some(k) => {
+                    let built = r.expect("proved equal to the text");
+                    let p = built.proposal.bytes();
+                    assert_eq!(u64_at(p, 0x128), block + 0x1a0 * k as u64, "the conversion's stop: {said:?}");
+                    assert_eq!(u64_at(p, 0x130) - u64_at(p, 0x128), 0x1a0, "the stop alone");
+                    assert!(
+                        said.iter().any(|l| l.contains(&format!("the conversion's {k}..{} of 3", k + 1))),
+                        "{said:?}"
+                    );
+                    release(&ctx, built);
+                }
+                None => {
+                    let e = r.err().expect("no stop in the conversion: refused");
+                    assert!(e.contains("does not add the text's edge object"), "{e}");
+                }
+            }
+        }
     }
 
     /// The engine's `ConstructionEntity` functions as the injection calls them: the insert puts the old elements and a byte copy of the

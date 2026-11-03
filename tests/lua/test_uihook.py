@@ -230,6 +230,39 @@ class UiHookTest(unittest.TestCase):
         self.assertEqual([("speed", 4), ("speed", 0)], [(r[0], r[1]["n"]) for r in self.records()], "another speed goes at once")
         self.assertEqual(0, self.sent(), "the session speed is the host's to decide")
 
+    def test_the_speed_control_reads_the_sessions_speed_not_the_barriers_holds(self):
+        # seen all through play, 0.2.13: the game's speed control (gui/main/game.tl, GameSpeedHelper) draws GAME_SPEED's speedup, which
+        # the bridge sets to 0 at every barrier, pacing or pause hold, so its icon flickered. In the window state it reads the session's.
+        engine = ('api.type.ComponentType = { GAME_SPEED = 2, ACCOUNT = 3 }; ENGINE_SPEED, READS = 0, 0; api.engine = { util = { getWorld = '
+                  'function() return 1 end }, getComponent = function(e, t) READS = READS + 1; if t == 2 then return { speedup = ENGINE_SPEED, '
+                  'millisPerDay = 2000 } end return { balance = 5 } end }')
+        icon = "(function() local g = api.engine.getComponent(api.engine.util.getWorld(), api.type.ComponentType.GAME_SPEED); return g.speedup .. '/' .. g.millisPerDay end)()"
+        self.runtime(session=False)
+        self.lua.execute(engine)
+        self.lua.execute("Hook.install(); ENGINE_SPEED = 3")
+        self.assertEqual("3/2000", self.lua.eval(icon), "no session: the engine's own speed")
+        self.runtime()
+        self.lua.execute(engine)
+        self.lua.execute("Hook.install(); Hook.SESSION_READ_S = 0")
+        self.lua.execute("Hook.installed = false; package.loaded['ug:feverlink3_uihook.lua'] = nil; Hook = ug_require('feverlink3_uihook.lua'); "
+                         "Hook.install(); Hook.SESSION_READ_S = 0")   # a savegame reload: the file runs again in the same state
+        self.lua.execute("H = ug_require('feverlink3_hud.lua'); HUD = H.new(1, 'p'); SNAP = {}; "
+                         "function SESSION(s) H.setSession(HUD, s); H.writeSnapshot(C, HUD, SNAP) end")
+        self.assertEqual("0/2000", self.lua.eval(icon), "waiting for the host's start: paused")
+        self.lua.execute("SESSION({ started = true, speed = 2 })")
+        for engine_speed in (0, 1, 3, 0):   # the barrier holds and the catch-up to a checksum mark
+            self.lua.execute("ENGINE_SPEED = %d; READS = 0" % engine_speed)
+            self.assertEqual("2/2000", self.lua.eval(icon))
+        self.assertEqual(1, self.lua.eval("READS"), "the engine is read once: the reload did not wrap the wrapper")
+        self.assertEqual(5, self.lua.eval("api.engine.getComponent(1, api.type.ComponentType.ACCOUNT).balance"), "other components untouched")
+        self.lua.execute("SESSION({ started = true, speed = 2, pauseAt = 4000 })")
+        self.assertEqual("0/2000", self.lua.eval(icon), "the session's pause shows")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(4), function() CLICKED = true end)")
+        self.assertEqual(([("speed", 4)], 0), ([(r[0], r[1]["n"]) for r in self.records()], self.sent()), "the speed buttons still ask the host")
+        self.lua.execute("SESSION({ started = true, speed = 4 }); Hook.poll()")
+        self.assertTrue(self.lua.eval("CLICKED == true"), "the button's callback runs once the session shows the speed")
+        self.assertEqual("4/2000", self.lua.eval(icon))
+
     def test_the_timing_line_shows_where_the_time_between_two_commands_of_one_handler_went(self):
         # Friend test 2026-10-16: a clone of two vehicles stood the game still for 16 s, 8 s between its two purchases, with no
         # line saying whether the window, the engine or this hook took it. Here the window spends 5 s between its two commands.

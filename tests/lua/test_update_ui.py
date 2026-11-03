@@ -61,6 +61,31 @@ class UpdateLine(unittest.TestCase):
         self.assertIn("return box(V, { fixedColumn(POP_W, rows) })", ui)
         self.assertEqual(1, ui.count("s.padding = "), "the padding is set in one place")
 
+    def test_missing_native_module_says_why_and_what_to_do(self):
+        """No status from the native module: the window names winhttp.dll, antivirus software and the two fixes, says "missing"
+        only when the game's exe is found in the working folder and the DLL is not, and every line fits the window."""
+        rt = lupa.LuaRuntime(unpack_returned_tuples=True)
+        with open(os.path.join(CONTENT, "feverlink3_text.lua"), encoding="utf-8") as f:
+            T = rt.execute(f.read())
+        with open(os.path.join(CONTENT, "feverlink3_hud.lua"), encoding="utf-8") as f:
+            Hud = rt.execute(f.read())
+        heads = {}
+        for file in ("missing", "present", "unknown", None):
+            head, lines = T.nativeMissing(file)
+            lines = list(lines.values())
+            heads[file] = head
+            body = " ".join(lines)
+            for word in ("winhttp.dll", "Antivirus", "quarantine", "release zip", "azalshehri7.github.io/FeverLink3"):
+                self.assertIn(word, body, file)
+            self.assertTrue(all(len(x) <= 54 for line in lines for x in Hud.wrapLines(line, 54).values()), file)
+        self.assertEqual("winhttp.dll is missing", heads["missing"])
+        self.assertEqual(heads["unknown"], heads[None])
+        self.assertEqual(3, len(set(heads.values())))
+        with open(os.path.join(CONTENT, "feverlink3_ui.script.lua"), encoding="utf-8") as f:
+            ui = f.read()
+        part = ui[ui.index('elseif state == "missing" then'):ui.index('elseif state == "starting" then')]
+        self.assertLess(part.index('C.fileSize("TransportFever3.exe")'), part.index('C.fileSize("winhttp.dll")'))
+
     def test_save_and_quit(self):
         """Offered only for a staged update outside a session; saves as feverlink3-restart (not the player's default name),
         quits only from the save's callback and only once the save is found and read back (review 2026-10-31):

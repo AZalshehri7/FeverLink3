@@ -16,7 +16,8 @@
 //!   lives inside the object and the pointer points at the object itself; otherwise the pointer is to the heap.
 //!   `Add` itself relies on slot 4 of the implementation's vtable being `_Delete_this(bool dealloc)` with
 //!   `dealloc = impl != this`; slot 1 is `_Move(void* where)` of the STL's `_Func_base`.
-//! - `progress` is 16 bytes (a weak pointer), `out` is a 16-byte handle that a zeroed value empties.
+//! - `progress` is 16 bytes (a weak pointer), `out` is an 8-byte handle (one pointer to a 16-byte heap block) that a zeroed
+//!   value empties: [`HANDLE_SIZE`].
 //!
 //! All of it is `unsafe` code that can only be exercised for real in the game; the tests run it against fake
 //! engine functions and a fake `std::function` laid out the same way, which checks the sequence and the offsets.
@@ -31,7 +32,13 @@ pub const FUNCTION_SIZE: usize = 0x40;
 /// Where an MSVC `std::function` keeps the pointer to its callable.
 pub const FUNCTION_IMPL: usize = 0x38;
 pub const PROGRESS_SIZE: usize = 0x10;
-pub const HANDLE_SIZE: usize = 0x10;
+/// The handle `Add` writes through `out`: ONE pointer. Build 40425's own code: the handle's constructors (0x3056390, 0x3056330) store
+/// one pointer to a fresh 16-byte block and its destructor (0x30563e0) reads only `[rcx]`. It was 16 before 0.2.14, and emptying the
+/// handle then zeroed the caller's next 8 bytes too. The asset brush passes its home slot as `out` (`lea rdx,[rsp+0x4e0]` in 0x549c80:
+/// its entry rsp + 8), so those next 8 bytes were its saved `rbx`: seen in play, 0.2.13, an empty brush tick held as a script's build,
+/// then an access violation reading 0x0 at TransportFever3.exe+0x5499e7 (`mov rax,[rbx]` right after the brush's send returned; the
+/// crash dump's stack holds 0 in exactly that slot, the saved `rbp` beside it intact).
+pub const HANDLE_SIZE: usize = 0x8;
 /// Where the apply function stores the verdict inside a `Command`.
 pub const RESULT_OFFSET: usize = 0x30;
 
@@ -804,9 +811,12 @@ mod tests {
         );
     }
 
+    /// The handle and the 8 bytes after it: the caller's own (the asset brush's saved register), which nothing may touch.
+    const OUT_ROOM: usize = HANDLE_SIZE + 8;
+
     struct Call {
         list: Box<[u8; 8]>,
-        out: Box<Room<HANDLE_SIZE>>,
+        out: Box<Room<OUT_ROOM>>,
         progress: Box<Room<PROGRESS_SIZE>>,
     }
 
@@ -814,7 +824,7 @@ mod tests {
         let mut progress = Box::new(Room::<PROGRESS_SIZE>([0; PROGRESS_SIZE]));
         progress.0[0] = 0xAB;
         progress.0[8] = 0xCD;
-        Call { list: Box::new([1; 8]), out: Box::new(Room([0xFF; HANDLE_SIZE])), progress }
+        Call { list: Box::new([1; 8]), out: Box::new(Room([0xFF; OUT_ROOM])), progress }
     }
 
     fn args(c: &mut Call, cmd: &mut Cmd, done: *mut u8) -> AddArgs {
@@ -842,7 +852,8 @@ mod tests {
         assert_eq!(unsafe { *(held.cmd.0.as_ptr() as *const usize) }, payload, "the command is in the held struct");
         assert_eq!(held.cmd.0[0x20], 0x77, "and carries its fields");
         assert_eq!(unsafe { *(cmd.command.0.as_ptr() as *const usize) }, 0, "the caller's command is empty");
-        assert_eq!(c.out.0, [0; HANDLE_SIZE], "the handle the caller gets is empty");
+        assert_eq!(c.out.0[..HANDLE_SIZE], [0; HANDLE_SIZE], "the handle the caller gets is empty");
+        assert_eq!(c.out.0[HANDLE_SIZE..], [0xFF; OUT_ROOM - HANDLE_SIZE], "and not one byte after it is written");
         assert_eq!(c.progress.0, [0; PROGRESS_SIZE], "progress is consumed");
         assert_eq!((held.progress.0[0], held.progress.0[8]), (0xAB, 0xCD), "and was kept");
         // the inline callable was asked to move itself into the held object and the original was destroyed in place
@@ -956,7 +967,7 @@ mod tests {
         assert!(unsafe { capture(&fns(), &a) }.is_none(), "a command with no payload");
         assert!(take_log().is_empty(), "no engine function was called");
         assert_eq!(c.progress.0[0], 0xAB, "progress untouched");
-        assert_eq!(c.out.0, [0xFF; HANDLE_SIZE], "out untouched");
+        assert_eq!(c.out.0, [0xFF; OUT_ROOM], "out untouched");
         assert_ne!(unsafe { *(done.0.as_ptr().add(FUNCTION_IMPL) as *const usize) }, 0, "done untouched");
     }
 

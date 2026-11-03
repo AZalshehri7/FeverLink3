@@ -170,8 +170,9 @@ impl Runtime {
     }
 
     /// The command list's `Add`: an asset tick from a site off the hold list (the hold list's tools, the bulldozer among them, are never
-    /// asset tools) is the interface's own tick.
-    pub(super) fn assets_note_add(&self, args: &AddArgs, hold_site: bool) {
+    /// asset tools) is the interface's own tick. `empty_tick`: the command is a tick that changes nothing (`Runtime::plan_add`, not the
+    /// mod's own send): noted all the same, so that its apply never takes it for the mod's empty carrier ([`as_::State::classify`]).
+    pub(super) fn assets_note_add(&self, args: &AddArgs, hold_site: bool, empty_tick: bool) {
         if !self.assets.share() || hold_site {
             return;
         }
@@ -188,7 +189,11 @@ impl Runtime {
             // `note_apply_orders`), so the game's reforestation (reforestation.script.tl, the same builder, playerInitiated false) and other
             // mods' simulation-state commands are never noted here and apply as they are on every game. The flag is required as well (the
             // brush's command had 1, trees1), so that no command a script marks as not the player's is ever taken for a tick.
-            if bytes[as_::FLAGS + 2] == 1 && as_::shape_of(&bytes).is_some_and(|(rm, add)| rm + add > 0) {
+            let shape = as_::shape_of(&bytes);
+            if bytes[as_::FLAGS + 2] == 1 && shape.is_some_and(|(rm, add)| rm + add > 0) {
+                self.assets.note_tool(payload);
+            } else if empty_tick && shape == Some((0, 0)) {
+                self.say("assets: a tick of no tool site that changes nothing (an empty Proposal): nothing to share, it goes on as it is");
                 self.assets.note_tool(payload);
             }
         });
@@ -258,6 +263,7 @@ impl Runtime {
         let Some((payload, apply)) = decided else { return false };
         match apply {
             Apply::Pass => false,
+            Apply::Nothing => true,
             Apply::Tool => {
                 // the lab (FEVERLINK3_DUMP_COMMANDS=2): the tick as the tool made it, before it is emptied, its groups' subconstructions
                 // and models followed (dump.rs)

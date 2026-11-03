@@ -38,6 +38,14 @@
 //! carries the thread and step of the append; with `FEVERLINK3_FREE_ORDER=0` they are taken at the next `AddEntity` or
 //! `RemoveEntity` and carry that call's thread and step instead. Parsers skip the `#`/`@` tokens.
 //!
+//! Who ended the modification (2026-11-03, the freeq resync seen in play, 0.2.13): two games did the same ops for 209,950 ops, with
+//! the same step on every op, and then one game ran two `AddEntity` calls and one freed batch a step EARLIER than the other (and two
+//! other freed batches in another order around it): an engine job that applies its result at a step of its own choosing, not an
+//! order inside one step. The trace could not say which engine code that was. A line whose freed batches came through the free-order
+//! hook now ends with ` src=<k>:<caller>/<caller's caller>,...` after `ops`: `k` is the index (in this line's `+`/`-` ops) of the
+//! batch's first id and the two RVAs are the game's return addresses above `EndModification` (hex), so the next fork names the
+//! system whose modification moved. Written only when there is one; parsers that read `ops=(\S*)` are unaffected.
+//!
 //! This file is the pure part (unit-tested); the hooks that feed it live in [`crate::ids`].
 
 /// The switch the mod's trace.log uses too: on unless `0`.
@@ -48,6 +56,8 @@ pub const GAP_MS: u64 = 10;
 
 /// A line never holds more ops than this (a load creates tens of thousands of entities in one burst).
 pub const MAX_OPS_PER_LINE: usize = 4096;
+/// A line names the origin of at most this many freed batches (`src=`); the rest are left out.
+pub const MAX_ORIGINS_PER_LINE: usize = 256;
 
 /// Every this many ops an engine keeps a checkpoint `(n, h)` of its stream for the checksum's `freeq` part ([`EngineOrder::check_part`]).
 /// Friend test 2026-10-21: 170-270 ops a second at x4, so a checkpoint every few seconds.
@@ -109,6 +119,10 @@ pub struct EngineOrder {
     expected_free: u64,
     last_ms: u64,
     pending: Vec<(Op, Ctx)>,
+    /// The freed batches of the pending line whose origin is known: (index of the batch's first op in `pending`, origin).
+    origins: Vec<(usize, String)>,
+    /// How many freed ids the current call's [`EngineOrder::enter`] took (the batch [`EngineOrder::freed_from`] names).
+    last_freed: usize,
     removed: u32,
     started: String,
     /// The call being handled (its ops carry it), the line's first call, and the step of its last call.
@@ -142,6 +156,8 @@ impl EngineOrder {
             expected_free: free,
             last_ms: 0,
             pending: Vec::new(),
+            origins: Vec::new(),
+            last_freed: 0,
             removed: 0,
             started: String::new(),
             cur: Ctx::default(),
@@ -197,10 +213,12 @@ impl EngineOrder {
         }
         self.last_ms = now_ms;
         self.note_call(ctx);
+        self.last_freed = 0;
         if free_now > self.expected_free {
             let k = (free_now - self.expected_free) as usize;
             for id in tail(k) {
                 self.push(Op::Freed(id), out);
+                self.last_freed += 1;
             }
         } else if shrank {
             // shrank without an AddEntity: the queue was rebuilt (a load), the stream starts over from here
@@ -224,6 +242,17 @@ impl EngineOrder {
         self.expected_free = free_after;
         self.free = free_after;
         self.ents = ents;
+    }
+
+    /// The freed ids the current call took (its [`EngineOrder::enter`]) came from `origin` (the game's code that ended the
+    /// modification, as the hook read it); an empty origin, or a call that took none, names nothing.
+    pub fn freed_from(&mut self, origin: &str) {
+        let at = self.pending.len().checked_sub(self.last_freed);
+        if let Some(at) = at.filter(|_| self.last_freed > 0 && !origin.is_empty()) {
+            if self.origins.len() < MAX_ORIGINS_PER_LINE {
+                self.origins.push((at, origin.to_owned()));
+            }
+        }
     }
 
     /// A `RemoveEntity` request (the id joins the queue later, when the modification ends).
@@ -321,11 +350,17 @@ impl EngineOrder {
             threads.push_str(&format!("+{}more", self.more_threads));
         }
         let cross = if self.cross > 0 { format!(" xs={}", self.cross) } else { String::new() };
+        let src = if self.origins.is_empty() {
+            String::new()
+        } else {
+            format!(" src={}", join(self.origins.iter().map(|(k, o)| format!("{k}:{o}"))))
+        };
         out.push(format!(
-            "idorder e={:x} g={} n={} at={} ents={} free={} r={} h={:016x} s={steps} th={threads}{cross} ops={ops}",
+            "idorder e={:x} g={} n={} at={} ents={} free={} r={} h={:016x} s={steps} th={threads}{cross} ops={ops}{src}",
             self.tag, self.burst, self.ops, self.started, self.ents, self.free, self.removed, self.hash
         ));
         self.pending.clear();
+        self.origins.clear();
         self.removed = 0;
         self.threads.clear();
         self.more_threads = 0;
@@ -549,16 +584,26 @@ mod tests {
         e.alloc(8, 1, 6, &mut out);
         e.flush(&mut out);
         assert!(out[0].ends_with(" s=10..11 th=1+2 xs=1 ops=+5,@2,-8,-9,#11,@1,+8"), "{}", out[0]);
+        // a freed batch with a known origin: named after `ops` by the index of its first id; a call that freed nothing names none
+        call(&mut e, 1, Some(11), 1, vec![], &mut out);
+        e.alloc(9, 0, 6, &mut out);
+        e.freed_from("ignored");
+        call(&mut e, 1, Some(11), 1, vec![4], &mut out);
+        e.freed_from("1f2e3d/abc");
+        e.flush(&mut out);
+        assert!(out[1].ends_with(" s=11 th=1 ops=+9,-4 src=1:1f2e3d/abc"), "{}", out[1]);
+        e.flush(&mut out);
+        assert_eq!(out.len(), 2);
         // the step's first thread is kept across lines: step 11 began on thread 1, so thread 3 in a new line counts
         call(&mut e, 3, Some(11), 1, vec![], &mut out);
         e.alloc(9, 0, 6, &mut out);
         e.flush(&mut out);
-        assert!(out[1].contains(" s=11 th=3 xs=1 ops=+9"), "{}", out[1]);
+        assert!(out[2].contains(" s=11 th=3 xs=1 ops=+9") && !out[2].contains("src="), "{}", out[2]);
         // one thread in a new step: no xs, no marks
         call(&mut e, 3, Some(12), 0, vec![], &mut out);
         e.alloc(10, 0, 7, &mut out);
         e.flush(&mut out);
-        assert!(out[2].contains(" s=12 th=3 ops=+10"), "{}", out[2]);
+        assert!(out[3].contains(" s=12 th=3 ops=+10"), "{}", out[3]);
     }
 
     #[test]

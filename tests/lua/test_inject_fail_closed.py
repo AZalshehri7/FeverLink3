@@ -804,6 +804,13 @@ class InjectFailClosedTest(InjectTest):
                   "local n1 = 0; for _, w in pairs(WORLD) do if w.BASE_EDGE then n1 = n1 + 1 end end; "
                   "if ok then ACCOUNT.balance = ACCOUNT.balance - 10000 * math.max(n1 - n0, 0) + 5000 * math.max(n0 - n1, 0) end; "
                   "return ok, res end")
+            # the interface's refundable list (api.gui.construction, script-doc api/gui.html): the game's own tool fills it on the game that
+            # made the build only; another player's build enters it through updateRefundableEntities({Engine.Entity}, Proposal.StreetProposal)
+            g.run("REFUNDABLE = {}; GUI_API.type.Proposal = { new = function() return { proposal = { __type = 'StreetProposal' } } end }; "
+                  "GUI_API.gui = GUI_API.gui or {}; GUI_API.gui.construction = { "
+                  "getRefundableEntities = function() local m = {}; for e in pairs(REFUNDABLE) do m[{ e, -1 }] = { { num = { 1000 + e, 0, 0 } }, 1 } end; return m end, "
+                  "updateRefundableEntities = function(l, sp) assert(type(sp) == 'table' and sp.__type == 'StreetProposal', 'StreetProposal expected'); "
+                  "for _, e in ipairs(l) do assert(type(e) == 'number'); REFUNDABLE[e] = true end end }")
         self.A.split_sim("function(t) return math.floor(t / 200) % 2 + 1 end")
         self.build_naming_a_node_a_world_event_removes((self.A, self.B))   # the refused build: 1:1
         self.texts(road_text())
@@ -830,6 +837,12 @@ class InjectFailClosedTest(InjectTest):
                              % ("originator" if g is self.B else "replay", edges[g.label]), g.label)
             self.assertRegex(removal, r"kind=bulldoze .*verdict=applied announced=yes entities\[.*-BASE_EDGE\[1:%d\]\S*\] .*spent=-5000 .*refund=5000\(account\)"
                              % edges[g.label], g.label)
+        # seen in play (0.2.13): only the builder's bulldozer refunded a just-built road. The game that replayed the street puts what it made into its
+        # own refundable list (X.peerRefundable), so its bulldozer refunds it too; the builder's list stays its tool's own.
+        self.assertTrue(self.A.lua("REFUNDABLE[%d] == true" % edges["host"]), "the replayed street is in the host's refundable list")
+        self.assertIn("refund: 1:2 (another player's build):", self.A.log())
+        self.assertIn("added to this game's refundable list with an empty street proposal", self.A.log())
+        self.assertNotIn("(another player's build)", self.B.log())
 
 
 if __name__ == "__main__":

@@ -193,7 +193,7 @@ fn count(v: (u64, u64, u64), stride: usize, what: &str) -> Result<usize, String>
 }
 
 /// An MSVC `std::string` (buffer or pointer, size, capacity): its bytes, bounded, no NUL.
-fn read_str(mem: &dyn Mem, at: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn read_str(mem: &dyn Mem, at: usize) -> Result<Vec<u8>, String> {
     let b = mem.read(at, 0x20).ok_or("a string cannot be read")?;
     let (size, cap) = (u64_at(&b, 0x10) as usize, u64_at(&b, 0x18) as usize);
     if size > MAX_STR || size > cap {
@@ -908,6 +908,9 @@ pub enum Apply {
     Pass,
     /// A tool's own tick: capture, empty, ship.
     Tool,
+    /// A tool's tick that changes nothing: it applies as it is (nothing in it), and no other path (a terrain or inject order) may take
+    /// it for its empty carrier.
+    Nothing,
     Carrier(Order),
 }
 
@@ -1001,7 +1004,12 @@ impl State {
         };
         let Some((rm, add)) = shape else { return Apply::Pass };
         // an order first: during a pause the interface half sends the mod's own carrier, which passes the command list's `Add` from a
-        // site off the hold list like a tool's tick (as a terrain carrier does, terrain.rs) and must never be taken for one
+        // site off the hold list like a tool's tick (as a terrain carrier does, terrain.rs) and must never be taken for one. A tool's
+        // tick that changes nothing (noted at `Add` as not the mod's own send, `Runtime::plan_add`) is never a carrier: an empty carrier
+        // and an empty tick look alike, and the tick would take the groups of another game's tick off its stamp.
+        if tool && rm == 0 && add == 0 {
+            return Apply::Nothing;
+        }
         if add == 0 && player && self.pending() && ids.len() == rm {
             if let Some(o) = self.take_order(ids, o2n) {
                 return Apply::Carrier(o);
@@ -1301,6 +1309,11 @@ mod tests {
             "other entities: a bulldozer's replay keeps its own way"
         );
         assert!(matches!(s.classify(0x20, Some((2, 0)), &[4, 5], 1, true), Apply::Carrier(o) if o.key == 8));
+        // an empty carrier waits: the brush's empty tick (noted at Add, seen in play 0.2.13) never takes it, the mod's carrier does
+        s.arm(Order { o2n: 0, ..order(9, &[]) });
+        s.note_tool(0x30);
+        assert_eq!(s.classify(0x30, Some((0, 0)), &[], 0, true), Apply::Nothing, "a tool's tick that changes nothing");
+        assert!(matches!(s.classify(0x40, Some((0, 0)), &[], 0, true), Apply::Carrier(o) if o.key == 9));
         assert_eq!(s.expire(101).len(), 1);
         assert!(!s.pending());
     }

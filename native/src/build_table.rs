@@ -217,7 +217,7 @@ pub struct BuildAddrs {
     pub command_move: Option<CallSite>,
     /// `Command::~Command()`: runs on a released command (moved-from) and on a cancelled one.
     pub command_destroy: Option<CallSite>,
-    /// Destructor of the 16-byte handle `CommandList::Add` writes through its `out` argument.
+    /// Destructor of the 8-byte handle (one pointer, `engine::HANDLE_SIZE`) `CommandList::Add` writes through its `out` argument.
     pub handle_destroy: Option<CallSite>,
     /// Return addresses (RVA of the byte after the `call`) of the calls to `command_list_add` made by the
     /// interface's construction tools. Only a command added from one of them may be held: the tool merely destroys

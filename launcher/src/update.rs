@@ -1023,6 +1023,9 @@ mod tests {
         let two = RELEASE_JSON.replace("FeverLink3-1.2.0.zip.sha256", "FeverLink3-1.2.0-b.zip");
         assert_eq!(parse_release(&two).unwrap_err(), UpdateError::AmbiguousAsset("FeverLink3-*.zip"));
         assert!(matches!(parse_release("not json"), Err(UpdateError::BadJson(_))));
+        // the release job's debug symbols (docs/RELEASING.md) sit beside the zip and are never picked
+        let symbols = RELEASE_JSON.replace("manifest.json.sig", "feverlink3_native-1.2.0.pdb");
+        assert_eq!(parse_release(&symbols).unwrap().0.zip.name, "FeverLink3-1.2.0.zip");
     }
 
     #[test]

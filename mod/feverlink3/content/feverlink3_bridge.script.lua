@@ -1261,6 +1261,21 @@ function X.answerBuild(st, e, snaps, after, changes, announced, shared)
 		success and "" or " (nothing of it is seen here: failed)", (shared and #shared > 0) and (" (shared with " .. table.concat(shared, " ") .. ")") or ""))
 end
 
+-- What another player's build made here, for this game's refundable list (X.peerRefundable): its result entities (X.bresAdded, the
+-- same set a WorldBuildProposalCommandData's resultEntities names) with this game's revision of each right after the apply, { e, r }.
+-- Seen in play (0.2.13, shared company): a road one player built refunded on that player's bulldozing only. The game's tool puts a build
+-- into the interface's refundable list in its own callback, which runs only on the game that made the build; the other game's bulldozer
+-- copied a list without the road, so its removal travelled with no refundable entities and every game paid nothing.
+function X.peerResult(before, after)
+	local out = {}
+	for _, id in ipairs(X.bresAdded(before, after)) do
+		local _, num = nil, nil
+		if Build and Build.adapter then _, num = Build.adapter.revision(id) end
+		out[#out + 1] = { e = id, r = num }
+	end
+	return out
+end
+
 -- "+BASE_EDGE[1:50012] -CONSTRUCTION[2:54 60]" (at most 12 ids a list), "" when nothing changed
 function X.bresDiff(before, after)
 	local parts = {}
@@ -1326,6 +1341,18 @@ function X.simBuildResults(st, now)
 		-- what really happened here, on every game: a verdict and a refusal notice that wait for it (X.tellRefused). Every role, not
 		-- only the originator: a receiver's module can close its order as no_command too, and its verdict must say what it applied.
 		st.results[#st.results + 1] = { key = tostring(e.key) .. "#outcome", of = e.key, at = e.at, success = true, outcome = okW and errW or "?" }
+		-- another player's build applied here: the interface half puts what it made into this game's refundable list (X.peerRefundable)
+		if e.role == "replay" and okW and errW == "applied" and e.snap and snaps[e.snap] then
+			local okP, made = pcall(function()
+				after = after or X.bresSnapshot()
+				return X.peerResult(snaps[e.snap], after)
+			end)
+			if okP and #made > 0 then
+				st.results[#st.results + 1] = { key = tostring(e.key) .. "#refundable", of = e.key, at = e.at, success = true, refundable = made }
+			elseif not okP then
+				logSim("build.result of " .. tostring(e.key) .. ": its result entities for the refundable list cannot be read: " .. tostring(made))
+			end
+		end
 		if e.answer then
 			local okA, errA = pcall(X.answerBuild, st, e, snaps, after, changes, announced, shared)
 			if not okA then
@@ -3816,6 +3843,66 @@ function X.buildCmdData(args, list)
 	return { proposal = args[1], context = args[2], ignoreErrors = args[3] == true, doDust = args[5], resultEntities = list }
 end
 
+-- Another player's build, applied on this game: its result entities go into this game's refundable list the way the game's own windows
+-- put a build there in its callback (bridge_and_tunnel.tl:195-203): api.gui.construction.updateRefundableEntities(resultEntities :
+-- {Engine.Entity}, proposal : Proposal.StreetProposal) (script-doc api/gui.html, Gui.Construction; interface state). So this game's
+-- bulldozer offers the refund of a just-built item another player of the same company made, within the game's own window. Deterministic:
+-- the list only feeds this game's bulldozer, whose Context carries its entries to every game by reference (cmds_build refundRefs and
+-- refundIdsOf), so every game removes with the same entries. `made`: { e, r } (X.peerResult); an entity gone or changed since the apply
+-- (another revision) is left out, as the game's windows leave out what changed (entity_util.entityChanged). `sp`: the engine's own street
+-- proposal of the command when this game has it (the pause path's callback data); otherwise an empty one (api.type.Proposal.new()'s
+-- `proposal`, typed Proposal.StreetProposal: a script's SimpleStreetProposal is refused, lab 2026-10-18 X6A). Separate companies: not
+-- here (only the builder's company may get the refund; that mode decides it with its own rule).
+function X.peerRefundable(key, made, sp)
+	if type(made) ~= "table" or #made == 0 then return end
+	if X.separateCompanies() then
+		logGui("refund: " .. tostring(key) .. " is another player's build; separate companies: not added to this game's refundable list")
+		return
+	end
+	local valid, changed = {}, 0
+	for _, x in ipairs(made) do
+		local e = type(x) == "table" and x.e or nil
+		local okE, exists = pcall(function() return api.engine.entityExists(e) end)
+		local same = okE and exists == true
+		if same and type(x.r) == "table" and Build and Build.adapter then
+			local _, num = Build.adapter.revision(e)
+			same = num ~= nil and num[1] == x.r[1] and num[2] == x.r[2] and num[3] == x.r[3]
+		end
+		if same then valid[#valid + 1] = e else changed = changed + 1 end
+	end
+	if #valid == 0 then
+		logGui("refund: " .. tostring(key) .. " (another player's build): its " .. #made .. " result entities are gone or changed here; none added to the refundable list")
+		return
+	end
+	local function count()
+		local ok, v = pcall(function() return api.gui.construction.getRefundableEntities() end)
+		if not ok or v == nil or not (Build and Build.adapter) then return nil, {} end
+		local has = {}
+		for _, x in ipairs(Build.adapter.refundEntries(v)) do has[x.e] = true end
+		local n = 0
+		for _ in pairs(has) do n = n + 1 end
+		return n, has
+	end
+	local n0 = count()
+	local how = "the engine's street proposal"
+	local ok, err = false, nil
+	if sp ~= nil then ok, err = pcall(function() api.gui.construction.updateRefundableEntities(valid, sp) end) end
+	if not ok then
+		if sp ~= nil then how = "an empty street proposal (the engine's: " .. tostring(err):sub(1, 120) .. ")" else how = "an empty street proposal" end
+		ok, err = pcall(function() api.gui.construction.updateRefundableEntities(valid, api.type.Proposal.new().proposal) end)
+	end
+	if not ok then
+		logGui("refund: " .. tostring(key) .. " (another player's build): updateRefundableEntities failed: " .. tostring(err):sub(1, 200))
+		return
+	end
+	local n1, has = count()
+	local held = 0
+	for _, e in ipairs(valid) do if has[e] then held = held + 1 end end
+	logGui(string.format("refund: %s (another player's build): %d result entit%s added to this game's refundable list with %s%s; the list holds %s -> %s entries, %d of them [%s]",
+		tostring(key), #valid, #valid == 1 and "y" or "ies", how, changed > 0 and (" (" .. changed .. " gone or changed, left out)") or "",
+		tostring(n0 or "?"), tostring(n1 or "?"), held, table.concat(valid, " ", 1, math.min(#valid, 12)) .. (#valid > 12 and " ..." or "")))
+end
+
 local function deliverResult(key, data, success, entities)
 	local cb = G.pending[key]
 	local args = G.pendingArgs and G.pendingArgs[key]
@@ -4041,6 +4128,14 @@ local function guiApplyNow(it, now)
 		if success and isBuildAction and it.from ~= C.PLAYER_ID then
 			G.pauseApplied = G.pauseApplied or {}
 			G.pauseApplied[it.key] = true
+			-- and into this game's refundable list, as at the stamp (X.peerRefundable), with the engine's own street proposal
+			local okR, errR = pcall(function()
+				if not bresBefore then return end
+				local sp = nil
+				pcall(function() sp = data.proposal.proposal end)
+				X.peerRefundable(it.key, X.peerResult(bresBefore, X.bresSnapshot()), sp)
+			end)
+			if not okR then logGui("refund: " .. tostring(it.key) .. " (another player's build): " .. tostring(errR)) end
 		end
 		-- this game's deferred held command took this apply's result (inject_next / complete_next): its world has the apply now
 		if it.deferId and X.deferApplied then pcall(X.deferApplied, it.deferId) end
@@ -7883,6 +7978,11 @@ function collectFromSim(state)
 			if r.release and r.of and G.nat then pcall(natRelease, r.of) end
 			-- this game's build.result of its player's own build: a refusal notice may wait for it (X.tellRefused)
 			if r.outcome and r.of then pcall(X.buildOutcome, r.of, r.outcome) end
+			-- another player's build applied here: into this game's refundable list (X.peerRefundable)
+			if r.refundable and r.of then
+				local okR, errR = pcall(X.peerRefundable, r.of, r.refundable, nil)
+				if not okR then logGui("refund: " .. tostring(r.of) .. " (another player's build): " .. tostring(errR)) end
+			end
 			-- a build applied at its stamp: this game's verdict, for the host (X.verdictOf)
 			if r.verdict then
 				local okV, errV = pcall(X.verdictOf, r)

@@ -1,6 +1,6 @@
-# Nexus Mods page: the form fields (0.2.13)
+# Nexus Mods page: the form fields (0.2.14)
 
-Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-11-02, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.13.
+Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-11-03, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.14.
 
 ## Name
 
@@ -21,7 +21,7 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 ## Version
 
 ```
-0.2.13
+0.2.14
 ```
 
 ## Category, tags, flags
@@ -33,13 +33,13 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 
 ## Main file
 
-- Upload: `FeverLink3-0.2.13.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.13.zip.sha256` on the release page.
-- Name on Nexus: `FeverLink3 0.2.13`
-- Category: Main files. Version: 0.2.13.
+- Upload: `FeverLink3-0.2.14.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.14.zip.sha256` on the release page.
+- Name on Nexus: `FeverLink3 0.2.14`
+- Category: Main files. Version: 0.2.14.
 - File description (under 255 characters):
 
 ```
-Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.13. Updates itself (can be turned off).
+Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.14. Updates itself (can be turned off).
 ```
 
 (200 characters.)
@@ -88,6 +88,13 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Changelog tab
 
 ```
+0.2.14
+- Painting trees, plants or rocks with a brush no longer crashes the game.
+- Bulldozing something another player of your company has just built gives the refund.
+- The game's speed control no longer flickers in a session.
+- The FeverLink3 window says when winhttp.dll is missing or was not loaded (antivirus software can remove it) and how to get it back.
+- Adding tram tracks to a road with a bus or tram stop on it works; the case that was refused is fixed (not yet reproduced in a test).
+
 0.2.13
 - Roads can cross railway tracks again in a session.
 - A player missing one of the world's mods is refused at once, the session's first player too.
@@ -164,7 +171,7 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Pinned post (known issues and how to report)
 
 ```
-Known issues in 0.2.13
+Known issues in 0.2.14
 - Between two PCs a game stood still for about 3-4 s at each autosave and the other game waited. Until this is fixed, set the autosave to 10 minutes or more.
 - Trees, plants and rocks are shared since 0.2.8, new and seen only with two game windows on one PC so far: tell us if the trees look different for someone.
 - Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.

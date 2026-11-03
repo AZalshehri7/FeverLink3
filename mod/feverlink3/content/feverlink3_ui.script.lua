@@ -815,8 +815,26 @@ local function setup(react, builtin, X)
 		if state == "launcher" then
 			add(text("This game was started by the FeverLink3 launcher (developer mode); the session is managed there."))
 		elseif state == "missing" then
-			add(heading("FeverLink3 is not running", "error"))
-			add(text("winhttp.dll is not next to TransportFever3.exe. Close the game, copy it there (see HOW-TO-PLAY.txt) and start the game from Steam."))
+			-- the module never wrote its status. What the game folder holds, looked at once: the game runs with its folder as the
+			-- working folder (relative names), and only when TransportFever3.exe is found there is a missing winhttp.dll a fact.
+			-- Antivirus software removed the release's file from players' game folders (Defender, Posilod.CA!cl, a false positive).
+			if U.nativeFile == nil then
+				if not C.fileSize("TransportFever3.exe") then U.nativeFile = "unknown"
+				else U.nativeFile = C.fileSize("winhttp.dll") and "present" or "missing" end
+				log("native module: no status after 15 s; game folder: winhttp.dll " .. U.nativeFile)
+			end
+			local T = texts()
+			if T and T.nativeMissing then
+				local head, lines = T.nativeMissing(U.nativeFile)
+				add(heading(head, "error"))
+				for i, line in ipairs(lines) do
+					if i > 1 and i < #lines then add(gap()) end
+					add(text(line))
+				end
+			else
+				add(heading("FeverLink3 is not running", "error"))
+				add(text("winhttp.dll is missing from the game folder or was not loaded (antivirus software may have removed it). Restore it or copy it again from the release zip, then restart the game."))
+			end
 		elseif state == "starting" then
 			add(text("Starting the multiplayer module..."))
 		elseif state == "idle" or state == "failed" then

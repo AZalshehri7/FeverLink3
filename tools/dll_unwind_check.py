@@ -5,6 +5,7 @@ abort "panic in a function that cannot unwind", and maps an RVA to the nearest P
     python tools/dll_unwind_check.py target/release/feverlink3_native.dll target/release/feverlink3_native.pdb
     python tools/dll_unwind_check.py DLL PDB --rva 0xb7bf5       # which function is this address in?
     python tools/dll_unwind_check.py DLL PDB --check             # exit 1 unless the build unwinds
+    python tools/dll_unwind_check.py DLL PDB --match             # exit 1 unless the PDB is this DLL's own (release job)
 
 Why: the DLL must unwind (root Cargo.toml; --check fails otherwise). In a panic = "abort" build a plain Rust function (or closure) that calls a game
 function which may throw has a terminate pad, and the game's own exceptions (script errors in command handlers, say)
@@ -23,7 +24,8 @@ import capstone
 import pefile
 
 
-def read_publics(pdb_path, pe):
+def read_streams(pdb_path):
+    """The PDB's streams (MSF 7.0), as bytes; a stream that is not there is b""."""
     d = open(pdb_path, "rb").read()
     bs, _fbm, _nblocks, dirsize, _unk, dirptr = struct.unpack_from("<IIIIII", d, 32)
 
@@ -45,6 +47,25 @@ def read_publics(pdb_path, pe):
         lst = struct.unpack_from("<%dI" % n, dr, off)
         off += 4 * n
         streams.append(blocks(lst, s))
+    return streams
+
+
+def pdb_matches(dll, pdb):
+    """True when the PDB is the one the linker wrote for this DLL: the GUID in the DLL's CodeView debug entry (RSDS)
+    is the GUID in the PDB's info stream (stream 1: version, signature, age, GUID). Debuggers refuse a PDB without it."""
+    pe = pefile.PE(dll)
+    guids = []
+    for e in getattr(pe, "DIRECTORY_ENTRY_DEBUG", []):
+        if e.struct.Type == 2:  # IMAGE_DEBUG_TYPE_CODEVIEW
+            cv = pe.get_data(e.struct.AddressOfRawData, e.struct.SizeOfData)
+            if cv[:4] == b"RSDS":
+                guids.append(cv[4:20])
+    info = read_streams(pdb)[1]
+    return len(guids) == 1 and len(info) >= 28 and info[12:28] == guids[0]
+
+
+def read_publics(pdb_path, pe):
+    streams = read_streams(pdb_path)
     sym = streams[3]  # DBI
     rec = streams[struct.unpack_from("<H", sym, 20)[0]]
     secs = [s.VirtualAddress for s in pe.sections]
@@ -68,6 +89,10 @@ def main():
         rva = int(sys.argv[sys.argv.index("--rva") + 1], 0)
         args = [a for a in args if a != sys.argv[sys.argv.index("--rva") + 1]]
     dll, pdb = args[0], args[1]
+    if "--match" in sys.argv:
+        ok = pdb_matches(dll, pdb)
+        print("the PDB belongs to this DLL" if ok else "the PDB does NOT belong to this DLL (another build)")
+        sys.exit(0 if ok else 1)
     pe = pefile.PE(dll)
     pubs = read_publics(pdb, pe)
     addrs = [a for a, _ in pubs]

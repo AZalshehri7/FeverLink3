@@ -150,6 +150,35 @@ T.UPDATE = {
 		"(Esc, then Save), then restart the game to finish.",
 }
 
+-- The window when the native module never wrote its status (feverlink3_ui.script.lua, state "missing"). Antivirus software has
+-- removed the release's winhttp.dll from players' game folders (Windows Defender, Trojan:Win32/Posilod.CA!cl, a false positive;
+-- docs/SECURITY_FOR_USERS.md). `file` says what the mod could see in the game's working folder (T.nativeMissing): "missing" (the
+-- game's exe is there, winhttp.dll is not), "present" (both are there, the game did not load ours or it stopped), anything else
+-- (the working folder is not the game folder: the mod cannot tell). The page link is the site's, short enough for one line.
+T.NATIVE = {
+	missingHeading = "winhttp.dll is missing",
+	missing = "FeverLink3's file winhttp.dll is not in the game folder (next to TransportFever3.exe), so multiplayer " ..
+		"cannot start. Antivirus software may have removed it by mistake.",
+	presentHeading = "FeverLink3 did not start",
+	present = "winhttp.dll is in the game folder, but the game did not load it, or it stopped. Antivirus software may " ..
+		"have blocked it, or it is an older or another program's winhttp.dll.",
+	unknownHeading = "FeverLink3 is not running",
+	unknown = "FeverLink3's file winhttp.dll in the game folder (next to TransportFever3.exe) is missing or was not " ..
+		"loaded. Antivirus software may have removed it by mistake.",
+	fix = "To fix it: restore the file from your antivirus's quarantine and allow it (Windows Security, Virus and " ..
+		"threat protection, Protection history, Restore or Allow), or copy winhttp.dll again from the release zip " ..
+		"into the game folder (see HOW-TO-PLAY.txt). Then restart the game from Steam.",
+	more = "How to check the file and report a false positive: \"Security for players\" on",
+	link = "azalshehri7.github.io/FeverLink3",
+}
+
+-- The missing-module window's heading and its lines (T.NATIVE), for what the mod saw in the game folder (`file`).
+function T.nativeMissing(file)
+	local N = T.NATIVE
+	local key = (file == "missing" or file == "present") and file or "unknown"
+	return N[key .. "Heading"], { N[key], N.fix, N.more, N.link }
+end
+
 -- Why another game could not build it ({cause}), from the technical reason (which stays in the log).
 T.CAUSES = {
 	missing = "a road or building it connects to is missing there",

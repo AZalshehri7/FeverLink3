@@ -239,13 +239,41 @@ mod imp {
         order_write(out);
     }
 
-    /// The free-order hook appended freed ids to `queue`: taken now (see [`super::freed`]).
+    /// The free-order hook appended freed ids to `queue`: taken now (see [`super::freed`]), with the game code that ended the
+    /// modification ([`modification_origin`], the line's `src=`).
     pub fn freed(queue: u64) {
         if !COMPACT.load(Ordering::Relaxed) || queue < FREE_QUEUE_OFFSET {
             return;
         }
         let engine = (queue - FREE_QUEUE_OFFSET) as usize;
-        let _ = crate::log::guarded("id order trace", || order_call(engine, |_, _| {}));
+        let _ = crate::log::guarded("id order trace", || {
+            let from = modification_origin();
+            order_call(engine, |o, _| o.freed_from(&from))
+        });
+    }
+
+    /// The game's two return addresses above `EndModification` (`<rva>/<rva>`, hex), read from the stack of the free-order hook:
+    /// the first frame inside the game's image is the return into `EndModification` (the hook's thunk jumped, it did not call), the
+    /// next two are the code that ended the modification and its caller. Empty when the walk finds fewer. Read-only: the OS walks
+    /// the stack with the image's unwind data and stops at a frame it cannot unwind; a few microseconds per freed batch.
+    fn modification_origin() -> String {
+        let base = BASE.load(Ordering::Relaxed);
+        if base == 0 {
+            return String::new();
+        }
+        let mut frames = [core::ptr::null_mut(); 16];
+        // SAFETY: sixteen output slots; the hash pointer may be null.
+        let got = unsafe { RtlCaptureStackBackTrace(0, 16, frames.as_mut_ptr(), core::ptr::null_mut()) } as usize;
+        let game: Vec<usize> = frames[..got.min(16)]
+            .iter()
+            .map(|f| *f as usize)
+            .filter(|a| *a >= base && *a < base + 0x0400_0000)
+            .map(|a| a - base)
+            .collect();
+        match game.get(1..3) {
+            Some([a, b]) => format!("{a:x}/{b:x}"),
+            _ => String::new(),
+        }
     }
 
     /// A mark line in the order trace (`what`: the session's holding switched), after every engine's pending line, written

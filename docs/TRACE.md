@@ -66,7 +66,7 @@ the order the engine appended them, which is the order they will be handed out a
 less than 10 ms apart), only when something happened:
 
 ```
-idorder e=<engine> g=<burst> n=<ops so far> at=<HH:MM:SS.mmm> ents=<id slots> free=<queue size> r=<removal requests> h=<rolling hash> s=<step>[..<step>] th=<thread>[+<thread>..] [xs=<n>] ops=+12,-9,#4711,@9012,-7
+idorder e=<engine> g=<burst> n=<ops so far> at=<HH:MM:SS.mmm> ents=<id slots> free=<queue size> r=<removal requests> h=<rolling hash> s=<step>[..<step>] th=<thread>[+<thread>..] [xs=<n>] ops=+12,-9,#4711,@9012,-7 [src=<k>:<rva>/<rva>,..]
 idorder e=<engine> first seen at=.. ents=.. free=.. fifo=<hash of the whole queue> head=<first ids>
 idorder e=<engine> reset at=.. free=.. (was ..)        the queue shrank without an AddEntity: a load
 ```
@@ -85,6 +85,12 @@ Reading a fork: `freed_id_diff.py` prints, at the first differing op, each game'
 by (step, thread). Same step on both games and a free run split across two threads on one of them (or `xs=` on that line): threads
 interleave within a step. The same ids freed at different steps (the run's `s` differs between the games): an engine job frees at
 another step.
+
+Who freed a batch (since 0.2.14): a line whose freed batches came through the free-order hook ends with `src=` after `ops`, one entry
+per batch: `k` is the index of the batch's first id among the line's `+`/`-` ops, the two hex RVAs are the game's return addresses
+above `EndModification` (the code that ended the modification, then its caller). Seen in play (0.2.13): two games equal on every op
+and every op's step for 209,950 ops, then one game ran two `AddEntity` calls and a freed batch a step earlier than the other; `src=`
+names the engine code of such a batch the next time. Parsers that read `ops=(\S*)` skip it.
 
 A burst is not a simulation step (a game catching up runs several steps in one burst), so compare the flattened streams:
 `python -I tools/gametest/freed_id_diff.py` (local tool) prints the first op where the two games differ and whether only the order of a

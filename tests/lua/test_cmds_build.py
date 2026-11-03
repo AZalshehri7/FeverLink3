@@ -3007,8 +3007,10 @@ class PureBuildTest(unittest.TestCase):
         self.assertTrue(got.startswith("refused: inject_refused: proposal.addedSegments[0].node1 names node 89384, which the originator has at"), got)
         # real session 2026-10-23c, held 246 (the text in the fixture): a street re-laid under a road-side stop. The tool numbers its new
         # entities in one sequence (segments -2,-4,-6,-7, the stop on -6); the placeholder kept those numbers and the engine's conversion
-        # asserts that an edge object's new segment is its place in edgesToAdd (-6 of 4: "Unknown exception", always cancelled).
-        self.assertEqual(str(self.L.eval(self.STOP_UNDER_STREET)(fixture("street_stop_input.txt"))), "built street inject|segment -3 of 4")
+        # asserts that an edge object's new segment is its place in edgesToAdd (-6 of 4: "Unknown exception", always cancelled). The new
+        # nodes are numbered after the segments: numbered from -1 as well, node -1 stood beside segment -1 and the factory threw at
+        # CreateShapes (real play 0.2.13, 2026-11-02, a tram track added to a road with a stop).
+        self.assertEqual(str(self.L.eval(self.STOP_UNDER_STREET)(fixture("street_stop_input.txt"))), "built street inject|segment -3 of 4|-5,-6,-1,-2,-3,-4")
 
     # the world, the record and the inject decode of a native text with edge objects on new segments, in the tool's own numbering
     STOP_UNDER_STREET = """(function(txt)
@@ -3045,7 +3047,13 @@ class PureBuildTest(unittest.TestCase):
         local args, why = M.commands.makeWorldBuildProposalCmd.decode(body, { player = 7, canInject = true, traceKey = '0:246', resolve = RESOLVE_KEY })
         if not args then return 'refused: ' .. tostring(why) end
         local ssp = STORE(STORE(args[1]).streetProposal)
+        -- no new node shares a placeholder with a new segment (real play 0.2.13, 2026-11-02: node -1 beside segment -1, CreateShapes 'pr.second')
+        local ids = {}
+        for _, list in ipairs({ ssp.nodesToAdd, ssp.edgesToAdd }) do
+            for _, x in ipairs(list) do local id = STORE(x).entity; ids[#ids + 1] = tostring(id) end
+        end
         return 'built ' .. tostring(args.plan) .. (args.inject and ' inject' or '') .. '|segment ' .. tostring(STORE(ssp.edgeObjectsToAdd[1]).edgeEntity) .. ' of ' .. #ssp.edgesToAdd
+            .. '|' .. table.concat(ids, ',')
     end)"""
 
 

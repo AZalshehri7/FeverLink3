@@ -12,6 +12,8 @@
 --       native_refused_* / native_inject_*, world.lock (a handle held open as a presence sign); and the mod's own files between its
 --       Lua states (hud_state.txt, companies.txt, binds.txt, ui_out.log, ui_in.log, resync_cursor.txt), which the native module
 --       cleans with the session folder at game start. The interface state hides the `io` global: it is taken from package.loaded.
+--       When the native module never writes its status, the window opens TransportFever3.exe and winhttp.dll in the game's
+--       working folder for reading (C.fileSize, nothing read) to tell the player whether the file is gone.
 --   os.getenv (C.env)    the session folder, player id and name of a dev-launched game, LOCALAPPDATA (the folder the native module
 --                        uses), and the test and lab switches (FEVERLINK3_*). The game passes no environment or launch option to scripts.
 --   os.clock (C.clock)   real seconds: timeouts, pacing and cost budgets that must run while the game is paused, and the C runtime's

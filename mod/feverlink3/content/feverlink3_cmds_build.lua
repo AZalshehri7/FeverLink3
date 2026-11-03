@@ -2069,19 +2069,26 @@ local function withStreet(sp, fn)
 	sp.streetProposal = ssp
 end
 
--- The record with its placeholders renumbered the way a script proposal numbers them: nodes and segments each from -1 in
--- list order (a tool numbers all new entities in one sequence). `skip(s)`: a segment that is left out of the proposal (a
--- construction's own piece under `drop`); the added ones are numbered first, so a placeholder is the segment's place in edgesToAdd.
+-- The record with its placeholders renumbered so that an edge object can name its new segment the way the engine's conversion reads
+-- it: the segments from -1 in list order, so a segment's placeholder is its place in edgesToAdd (proposal_util.cpp:141), then the new
+-- nodes after the last segment, so that no node and no segment share a placeholder (a tool numbers all its new entities in one
+-- sequence too). Real play 0.2.13, 2026-11-02 (a tram track added to a road with a bus stop, 19 + 5 times; a rail laid across a road with
+-- a stop): with nodes and segments each numbered from -1, node -1 and segment -1 were both in the proposal, and the factory threw
+-- "Unknown exception" at street_util::CreateShapes, construction_util_street.cpp:1502, assertion 'pr.second' (an insert of an id that is
+-- already there) for every such build with a new node; the same records with the tool's own (unique) numbers had passed the factory
+-- (friend test 2026-10-21, 0:15, a stop moved with a new node). `skip(s)`: a segment that is left out of the proposal (a construction's
+-- own piece under `drop`); the added ones are numbered first.
 local function renumbered(rec, skip)
-	local nodeMap, segMap, kn, ks = {}, {}, 0, 0
-	for _, n in ipairs(rec.nodes) do
-		if type(n.id) == "number" and n.id < 0 then kn = kn + 1; nodeMap[n.id] = -kn end
-	end
+	local nodeMap, segMap, ks = {}, {}, 0
 	for pass = 1, 2 do
 		for _, s in ipairs(rec.segs) do
 			local left = skip ~= nil and skip(s) == true
 			if type(s.id) == "number" and s.id < 0 and left == (pass == 2) then ks = ks + 1; segMap[s.id] = -ks end
 		end
+	end
+	local kn = ks
+	for _, n in ipairs(rec.nodes) do
+		if type(n.id) == "number" and n.id < 0 then kn = kn + 1; nodeMap[n.id] = -kn end
 	end
 	local function mapN(v) if type(v) == "number" and nodeMap[v] then return nodeMap[v] end return v end
 	local function mapS(v) if type(v) == "number" and segMap[v] then return segMap[v] end return v end

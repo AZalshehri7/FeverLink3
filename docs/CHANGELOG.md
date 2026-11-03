@@ -6,6 +6,28 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.14-beta.1 (2026-11-03, pre-release)
+
+### In short
+- Painting trees, plants or rocks with a brush no longer crashes your game.
+- Bulldozing something another player of your company has just built now gives the refund.
+- The game's speed control no longer flickers in a session.
+- When `winhttp.dll` is missing or was not loaded (antivirus software can remove it), the FeverLink3 window says so and how to get it back.
+- Adding tram tracks to a road with a bus or tram stop on it works in a session, and the case that was refused (the tracks splitting the road next to the stop) is fixed; that exact case was not reproduced in a test yet.
+
+### Added
+- When `winhttp.dll` is missing from the game folder or was not loaded (antivirus software can remove it by mistake), the FeverLink3 window now says so and how to get it back, instead of only "FeverLink3 is not running".
+- Each release on GitHub also carries the debug symbols of its `winhttp.dll` (`feverlink3_native-<version>.pdb`), so a crash report can name the function. Players do not need it; it is not in the zip.
+
+### Changed
+- Bug reports: the trace of the game's id order names the game code behind each batch of freed ids, to help find the cause of an automatic repair.
+
+### Fixed
+- Painting trees, plants or rocks with a brush could crash the game of the player painting, when a brush stroke placed nothing: FeverLink3 cleared a few bytes too many of the game's memory while it held that stroke. Seen fixed with two games on one PC.
+- Bulldozing a road or other item another player of your company has just built now gives the refund, as when its builder bulldozes it: the preview shows it and every game books the same amount.
+- The game's speed control no longer flickers in a session: it shows the session's speed (and pause) instead of the short holds that keep the games in step.
+- Upgrading a road that has a bus or tram stop on it (adding tram tracks, a street upgrade) was refused on every game ("Your build could not be shared"), and so was a road with a stop laid across railway tracks; you had to remove the stop first. Both are built again, with the stop. Tram tracks added over stops built alike on both games in every test (two games on one PC); the exact case refused in play (the tracks splitting the road next to the stop) was not reproduced in a test yet.
+
 ## 0.2.13 (2026-11-02)
 
 ### In short

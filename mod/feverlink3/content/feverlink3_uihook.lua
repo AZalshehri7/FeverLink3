@@ -559,6 +559,35 @@ local function handle(tag, cmd, cb, progress, t0)
 	return true
 end
 
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"), a display hint only: api.engine.getComponent is
+-- replaced in this (the window) state, for the GAME_SPEED component only and only while a session is on. The game's speed control
+-- (gui/main/game.tl, GameSpeedHelper) draws `speedup` of that component, the engine's speed of the moment; in a session the
+-- bridge sets that speed every frame to what the lockstep allows: 0 at every input-barrier, pacing or pause-order hold, 1..3 at x4 to
+-- land a batch on a checksum mark. The icon flickered with each of them (seen all through play, 0.2.13). Here `speedup` is the
+-- session's speed (M.sessionSpeed: 0 when the session is paused or not started); `millisPerDay` and every other component are the
+-- engine's own. The engine, the bridge's state and the simulation are untouched: this state only draws, and the speed buttons still
+-- send makeGameSetSpeedCmd (handle). No documented API sets what the speed control shows (its only input is this component).
+-- Installed once per Lua state (orig.speedView marks it): a savegame reload runs this file again in the same state, and wrapping
+-- anew would drop a wrapper installed after it (feverlink3_ui.script.lua, companyLoans); the reload's own M.sessionSpeed is used.
+function M.installSpeedView(orig)
+	local E = api.engine
+	local kind = api.type.ComponentType.GAME_SPEED
+	if type(E) ~= "table" or kind == nil then error("no api.engine or ComponentType.GAME_SPEED") end
+	if orig.speedView == nil then
+		local get = E.getComponent
+		if get == nil then error("no api.engine.getComponent") end
+		E.getComponent = function(entity, k, ...)
+			local c = get(entity, k, ...)
+			if k ~= kind or c == nil then return c end
+			local okS, shown = pcall(orig.speedView)
+			if not okS or shown == nil then return c end
+			local okM, mpd = pcall(function() return c.millisPerDay end)
+			return { speedup = shown, millisPerDay = okM and mpd or nil }
+		end
+	end
+	orig.speedView = M.sessionSpeed
+end
+
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): the window state's command factories and sendCommand are
 -- replaced: a window command must be held and stamped before any game applies it, and the API has no command hook.
 function M.install()
@@ -643,7 +672,9 @@ function M.install()
 		end
 		api.cmd.sendCommand = wrapper
 	end)
-	log("UI hook installed: " .. wrapped .. " command functions wrapped" .. (oks and "" or "; sendCommand is read-only"))
+	local okV, whyV = pcall(M.installSpeedView, orig)
+	log("UI hook installed: " .. wrapped .. " command functions wrapped" .. (oks and "" or "; sendCommand is read-only")
+		.. (okV and "; the speed control shows the session's speed" or ("; the speed control shows the engine's speed (" .. tostring(whyV) .. ")")))
 	return oks
 end
 
