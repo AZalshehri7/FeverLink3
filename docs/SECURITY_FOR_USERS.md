@@ -1,6 +1,6 @@
 # What is in winhttp.dll, and how to check it
 
-For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-11-03 (version 0.2.14-beta.2, a pre-release). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
+For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-11-03 (version 0.2.14). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
 
 ## The short version
 

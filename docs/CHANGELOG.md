@@ -6,16 +6,10 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
-## 0.2.14-beta.2 (2026-11-03, pre-release)
-
-### Fixed
-- Buttons in other mods' windows (for example Industry Upgrades' Buy) and the events of other mods' scripts now reach every game in a session; before, a mod whose files are named by its mod id was taken for the game itself and its action happened only on the clicking player's game.
-- What another mod's game script does by itself in the game interface (for example Pay Your Tolls finding a new toll gantry or counting toll income) now happens once for everyone: the host's copy of the mod decides for every game, as for mod scripts in the simulation, instead of each game doing it on its own. What such a script does in answer to your own action (for example your own build) is still shared from your game.
-- Removing decorations a mod's script put up (for example Pay Your Tolls' speed boards) no longer fails with "FeverLink3 could not copy it", and a decoration built that way is no longer reported as missing.
-
-## 0.2.14-beta.1 (2026-11-03, pre-release)
+## 0.2.14 (2026-11-04)
 
 ### In short
+- Other mods work for every player: what you click in a mod's own window (for example buying an upgrade in Industry Upgrades) now reaches every game, and what a mod does by itself (for example Pay Your Tolls counting toll income) happens once for everyone. [The mods we have played with](site/compatible-mods.html).
 - Painting trees, plants or rocks with a brush no longer crashes your game.
 - Bulldozing something another player of your company has just built now gives the refund.
 - The game's speed control no longer flickers in a session.
@@ -30,10 +24,18 @@ The changes of each version that matter to a player or tester. Earlier test buil
 - Bug reports: the trace of the game's id order names the game code behind each batch of freed ids, to help find the cause of an automatic repair.
 
 ### Fixed
+- Buttons in other mods' windows (for example Industry Upgrades' Buy) and the events of other mods' scripts now reach every game in a session; before, a mod whose files are named by its mod id was taken for the game itself and its action happened only on the clicking player's game.
+- What another mod's game script does by itself in the game interface (for example Pay Your Tolls finding a new toll gantry or counting toll income) now happens once for everyone: the host's copy of the mod decides for every game, as for mod scripts in the simulation, instead of each game doing it on its own. This also holds for what such a script does in answer to a guest's own build: the game gives FeverLink3 no way to tell that apart, so only the host's copy counts.
+- A pause now holds while another mod works by itself (for example Pay Your Tolls booking toll income): such a mod's changes made during the pause wait and are applied on every game once play resumes, instead of moving the paused world a few steps each time.
+- A sync no longer fails with "games still differ after the reload: balance" when another mod books money right after the world is loaded (for example Pay Your Tolls charging the vehicles standing at its tolls again): what such a mod does before the session has picked up the reloaded world now waits and is applied once, on every game, when play resumes.
+- Removing decorations a mod's script put up (for example Pay Your Tolls' speed boards) no longer fails with "FeverLink3 could not copy it", and a decoration built that way is no longer reported as missing.
 - Painting trees, plants or rocks with a brush could crash the game of the player painting, when a brush stroke placed nothing: FeverLink3 cleared a few bytes too many of the game's memory while it held that stroke. Seen fixed with two games on one PC.
 - Bulldozing a road or other item another player of your company has just built now gives the refund, as when its builder bulldozes it: the preview shows it and every game books the same amount.
 - The game's speed control no longer flickers in a session: it shows the session's speed (and pause) instead of the short holds that keep the games in step.
 - Upgrading a road that has a bus or tram stop on it (adding tram tracks, a street upgrade) was refused on every game ("Your build could not be shared"), and so was a road with a stop laid across railway tracks; you had to remove the stop first. Both are built again, with the stop. Tram tracks added over stops built alike on both games in every test (two games on one PC); the exact case refused in play (the tracks splitting the road next to the stop) was not reproduced in a test yet.
+
+### Known issue
+- Upgrading a street station to a newer era with the button in its window can crash every game in a session: do not use the era upgrade buttons of stations while playing together.
 
 ## 0.2.13 (2026-11-02)
 

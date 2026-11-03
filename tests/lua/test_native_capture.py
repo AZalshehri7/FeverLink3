@@ -247,17 +247,28 @@ class NativeCaptureTest(unittest.TestCase):
                      T.lua_str("epod_pay_your_tolls_tf3_1::/pyt/pyt_toll.script.tl")))
         self.tick(16)
         self.assertEqual((self.A.events_seen("pyt"), self.B.events_seen("pyt")), (1, 1), self.A.log() + self.B.log())
-        self.assertIn("another mod's event pyt/pyt.addCounts (mod=epod_pay_your_tolls_tf3_1, script-interface state, from a file's own code", self.A.log())
-        self.assertIn("is sent from the host's copy for every game", self.A.log())
-        self.assertIn("is dropped here: the host's copy of the mod sends it for every game", self.B.log())
-        # ... but its guiHandleEvent of THIS game's tool event (the guest's own build) is that player's action: shipped from the guest
-        handler = self.B.L.eval("assert(load(%s, %s, 't', setmetatable({ api = GUI_API }, { __index = _G })))()"
-                                % (T.lua_str('return function(u, state, gs, src, id, name, param) api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "pyt", "pyt.setTown", { id = 1 })) end'),
-                                   T.lua_str("epod_pay_your_tolls_tf3_1::/pyt/pyt_toll.script.tl")))
-        handler(None, self.B.L.table(), self.B.L.table(), "", "constructionBuilder", "builder.proposalApply", self.B.L.table())
-        self.tick(16)
-        self.assertEqual((self.A.events_seen("pyt"), self.B.events_seen("pyt")), (2, 2), self.B.log())
-        self.assertIn("from this game's tool event constructionBuilder/builder.proposalApply) is sent from this game (its player's action)", self.B.log())
+        self.assertIn("another mod's event pyt/pyt.addCounts (mod=epod_pay_your_tolls_tf3_1, script-interface state) is sent from the host's copy for every game", self.A.log())
+        self.assertIn("another mod's event pyt/pyt.addCounts (mod=epod_pay_your_tolls_tf3_1, script-interface state) is dropped here", self.B.log())
+        # seen in play (0.2.14-beta.2): its toll bookings during the host's pause became items of the pause order, each one stepped every
+        # game, so the pause never held. No player made them: they wait for the resume and are applied at an ordinary stamp everywhere.
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(30)
+        paused = (self.A.time(), self.B.time())
+        self.assertEqual(paused, (self.relay.pauseAt, self.relay.pauseAt))
+        self.A.run("assert(load(%s, %s, 't', setmetatable({ api = GUI_API }, { __index = _G })))()"
+                   % (T.lua_str('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "pyt", "pyt.addCounts", { counts = { { 1, 2, 0, 60 } } }))'),
+                      T.lua_str("epod_pay_your_tolls_tf3_1::/pyt/pyt_toll.script.tl")))
+        self.tick(20)
+        self.assertEqual((self.A.time(), self.B.time()), paused, "the pause holds: no game stepped")
+        self.assertEqual((self.A.events_seen("pyt"), self.B.events_seen("pyt")), (1, 1))
+        self.assertNotIn("pause order #", self.A.log() + self.B.log())
+        self.assertIn("is no player's action: it waits for the resume", self.A.log())
+        self.relay.pauseAt = None
+        self.relay.session()
+        self.tick(30)
+        self.assertEqual((self.A.events_seen("pyt"), self.B.events_seen("pyt")), (2, 2), self.A.log())
+        self.assertIn("pause over: 1 action(s) no player made are shipped now", self.A.log())
 
     def test_a_scripts_build_callback_runs_when_the_other_simulation_state_applies_it_at_the_stamp(self):
         # The real game shares one game's steps between two simulation Lua states (the mock's SIM_SPLIT). A script's build is taken in the

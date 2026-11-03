@@ -43,9 +43,10 @@ class ResyncPauseTest(unittest.TestCase):
             self.A.step()
             self.B.step()
 
-    def paused_then_loaded(self, overshoot):
+    def paused_then_loaded(self, overshoot, at_load=None):
         """A started session paused at P, then both games reloaded with the host's save taken `overshoot` steps past P. The relay keeps
-        saying pauseAt P after the load (the lines held for the load, and a host core that did not move the pause). Returns (P, loaded)."""
+        saying pauseAt P after the load (the lines held for the load, and a host core that did not move the pause). `at_load(g)`: what
+        runs in a reloaded game before its first frame. Returns (P, loaded)."""
         self.tick(3)
         self.relay.started, self.relay.speed = True, 2
         self.relay.session()
@@ -63,6 +64,8 @@ class ResyncPauseTest(unittest.TestCase):
             self.assertTrue(g.reload_pending())
             g.run("GAME.time = %d" % loaded)   # the save's time: where the host's game stood still
             g.reload()
+            if at_load:
+                at_load(g)
         self.relay.stops = {}
         self.relay.session()   # still pauseAt P
         self.tick(6)
@@ -114,6 +117,27 @@ class ResyncPauseTest(unittest.TestCase):
                     self.tearDown()
                     self.setUp()
                 case(*self.paused_then_loaded(3))
+
+
+    def test_another_mods_send_before_the_first_frame_after_the_load_waits_for_the_session(self):
+        # seen in play (0.2.14-beta.2 lab, 0.2.14-beta.1 two-PC session): after the resync load Pay Your Tolls booked the vehicles at
+        # its tolls again on each game before the bridge's first frame; each copy went to its engine alone and the paused checksum
+        # after the reload differed in balance. The game's interface sends its events (idAdded) before the first frame.
+        def at_load(g):
+            g.run("GUI.guiHandleEvent(nil, STATE, GSTATE, '', 'menu.construction.roads.roads_tools.tab', 'idAdded', {})")
+            g.run("assert(load(%s, %s, 't', setmetatable({ api = GUI_API }, { __index = _G })))()"
+                  % (T.lua_str('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "pyt", "pyt.addCounts", { counts = { { 1, 2, 0, 40 } } }))'),
+                     T.lua_str("epod_pay_your_tolls_tf3_1::/pyt/pyt_toll.script.tl")))
+        p, loaded = self.paused_then_loaded(3, at_load)
+        self.tick(10)
+        self.assertEqual((self.A.events_seen("pyt"), self.B.events_seen("pyt")), (0, 0), "no game applied its own copy in the pause")
+        self.assertIn("is made before this game's session began (a reload): it waits for the session", self.A.log())
+        self.assertIn("is dropped here: the host's copy of the mod sends it for every game", self.B.log())
+        self.relay.pauseAt, self.relay.speed = None, 2
+        self.relay.session()
+        self.tick(20)
+        self.assertEqual((self.A.events_seen("pyt"), self.B.events_seen("pyt")), (1, 1), self.A.log())
+        self.assertEqual(self.A.sig(), self.B.sig())
 
 
 class LoadedAtTest(unittest.TestCase):

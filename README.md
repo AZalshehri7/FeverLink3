@@ -8,7 +8,7 @@
 [![Platform](https://img.shields.io/badge/platform-Transport%20Fever%203%20%C2%B7%20Windows-informational)](#install)
 [![Status: beta](https://img.shields.io/badge/status-beta-yellow)](docs/site/status.md)
 
-[Playing guide](docs/PLAYING.md) · [Changelog](docs/CHANGELOG.md) · [Roadmap](docs/ROADMAP.md) · [FAQ](docs/site/faq.md) · [Privacy](docs/site/privacy.md) · [Architecture](docs/ARCHITECTURE.md)
+[Playing guide](docs/PLAYING.md) · [Changelog](docs/CHANGELOG.md) · [Roadmap](docs/ROADMAP.md) · [FAQ](docs/site/faq.md) · [Other mods](docs/site/compatible-mods.md) · [Privacy](docs/site/privacy.md) · [Architecture](docs/ARCHITECTURE.md)
 
 ![A road drawn on the host appears on the second game: at game speed x1 after 1.4 s, at x4 after 0.8 s, in real time](docs/media/demo-build.gif)
 
@@ -18,7 +18,7 @@
 
 - **Built into the game, no separate launcher.** Start Transport Fever 3 from Steam as usual: hosting, joining, chat, syncing and updates all live in the game's bottom bar and window. There is no extra program to run.
 - **Build together.** Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
-- **Your other mods work together too.** Mods that change your world by themselves, such as Auto Line Namer, Auto Color Lines or Auto Assign Terminals, stay in sync: the host's copy makes the change and every game applies it at the same moment, and what you set in such a mod's own window reaches every game (new in 0.2.4; seen with two games on one PC).
+- **Your other mods work together too.** New in 0.2.14: the buttons of mods from mod.io, such as Industry Upgrades, reach every player's game, so an upgrade bought in a mod's window happens for everyone. Mods that change your world by themselves, such as Auto Line Namer, Auto Color Lines or Auto Assign Terminals, stay in sync: the host's copy makes the change and every game applies it at the same moment. [The mods we have played with](docs/site/compatible-mods.md).
 - **Companies.** The host starts the session with one shared company: everyone builds and pays from one account, as before. A company for each player, with its own money, is upcoming: it shows as a grayed button until it has been played between two PCs.
 - **The full game.** Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 - **Easy to join.** Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.

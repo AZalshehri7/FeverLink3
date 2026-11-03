@@ -175,6 +175,7 @@ Known issues in 0.2.14
 - Between two PCs a game stood still for about 3-4 s at each autosave and the other game waited. Until this is fixed, set the autosave to 10 minutes or more.
 - Trees, plants and rocks are shared since 0.2.8, new and seen only with two game windows on one PC so far: tell us if the trees look different for someone.
 - Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.
+$L
 - A mod change FeverLink3 cannot share yet causes extra syncs (FeverLink3 names the mod in a warning).
 - After a Transport Fever 3 update, FeverLink3 searches the new build by itself; if it cannot find every place, it needs an update (the window says so).
 - About one automatic repair (about 15 s) every 40 minutes in a long session over the internet.

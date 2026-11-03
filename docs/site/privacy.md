@@ -4,7 +4,7 @@ title: FeverLink3 privacy
 
 # Privacy
 
-Last updated 2026-11-02 (version 0.2.13). [Back to the start page](../index.html)
+Last updated 2026-11-04 (version 0.2.14). [Back to the start page](../index.html)
 
 FeverLink3 has no accounts, no analytics, no advertising, and no server of the project that collects anything. This page says what leaves your PC and who sees it. The technical detail is in [What is in winhttp.dll, and how to check it](../SECURITY_FOR_USERS.html).
 

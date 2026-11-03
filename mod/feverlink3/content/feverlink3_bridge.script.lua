@@ -2142,46 +2142,6 @@ SIMO.kinds = setmetatable({}, { __mode = "k" })   -- a command made in this stat
 SIMO.cargs = setmetatable({}, { __mode = "k" })   -- a command made in this state -> its factory's arguments (simForeign encodes them)
 SIMO.foreign, SIMO.foreignSeen, SIMO.foreignSent = {}, {}, {}
 
--- What made the code that sends now run, judged by the outermost function of that mod on the stack (`mod`, C.modOfSource; a dispatcher
--- of the game's own between the game and the mod's entry is passed over): the one the game called. Returns "every" (the
--- game runs it on every game alike: a file's own code while it loads, a game script's guiUpdate (userParams, state, guiState), its
--- guiHandleEvent of any event but a tool's) or "local" (only this game's player can have caused it: guiHandleEvent of a "builder.*" event,
--- which only the game whose player uses the tool gets, the other games apply the build as a command; or a function the game called that is
--- no game-script entry, a click in a script's own GUI), and what it was, for the log. A game script's entries take (userParams, state,
--- guiState) and guiHandleEvent also (src, id, name, param) (the mods' own handlers, e.g. Pay Your Tolls, Parallel Tracks, Advanced Track
--- Patterns; a handler of `...` is read the same way). Which other events reach guiHandleEvent on only one game is not known yet: every
--- other event counts as every game's, so a copy is never shipped twice; the log names each one (id, name and src), so a real session shows it.
-function X.guiTrigger(mod)
-	local outer, top
-	for level = 2, 80 do
-		local info = debug.getinfo(level, "Su")
-		if not info then break end
-		if info.what ~= "C" and C.modOfSource(info.source) == mod then outer, top = level, info end
-	end
-	if not outer then return "every", "no Lua code" end
-	if top.what == "main" then return "every", "a file's own code (" .. tostring(top.short_src) .. ")" end
-	local args, n = {}, top.nparams or 0
-	for i = 1, n do
-		local _, v = debug.getlocal(outer, i)
-		args[i] = v
-	end
-	if top.isvararg then
-		for i = 1, 16 do
-			local name, v = debug.getlocal(outer, -i)
-			if name == nil then break end
-			n = n + 1
-			args[n] = v
-		end
-	end
-	if n >= 6 and type(args[6]) == "string" then
-		local ev = tostring(args[5]) .. "/" .. args[6]
-		if args[6]:find("^builder%.") then return "local", "this game's tool event " .. ev end
-		return "every", "guiHandleEvent of " .. ev .. " src=" .. tostring(args[4])
-	end
-	if n >= 2 and (type(args[2]) == "userdata" or type(args[2]) == "table") then return "every", "a game script's guiUpdate" end
-	return "local", "a callback the game called (a click in a script's own GUI)"
-end
-
 -- FeverLink3's own code in this Lua state (the bridge, the company sender): never another mod's (C.callerOf)
 function X.ownSources()
 	if X.OWN then return X.OWN end
@@ -4371,6 +4331,45 @@ function X.routeOwn(it)
 	end
 end
 
+-- An action no player made (`auto`: another mod's automatic send, the host's copy of it from the script-interface state or from the
+-- simulation, see the wrapped sendCommand and simForeign) that would be stamped at the pause waits here, on the host, unshipped, until
+-- the pause is over; X.autoFlush ships it then with an ordinary stamp, applied at that stamp on every game alike. Shipped in the pause
+-- it became an item of the pause order, and every item of it runs every game on a step: seen in play (0.2.14-beta.2), Pay Your Tolls'
+-- toll bookings (makeJournalBookAssetCmd from its guiUpdate) made 113 pause order items in 76 s after the host paused, each one moved the
+-- world, vehicles passed more tolls and more bookings followed, so the pause never held. A player's own action in a pause keeps the
+-- pause order. Returns true when `send` (the ship call to repeat) was kept.
+X.AUTO_WAIT_MAX = 1000
+function X.autoDefer(at, what, send)
+	if not X.isPauseStamp(at) then return false end
+	local W = G.autoWait or {}
+	G.autoWait = W
+	if #W >= X.AUTO_WAIT_MAX then
+		G.autoDropped = (G.autoDropped or 0) + 1
+		if G.autoDropped == 1 or G.autoDropped % 100 == 0 then
+			logGui("pause: " .. tostring(what) .. " (no player's action) NOT kept: " .. X.AUTO_WAIT_MAX .. " wait for the resume already; applied on no game (" .. G.autoDropped .. " so far)")
+		end
+		return true
+	end
+	W[#W + 1] = send
+	if #W == 1 or #W % 50 == 0 then
+		logGui("pause: " .. tostring(what) .. " is no player's action: it waits for the resume (no pause order, the world stays still); " .. #W .. " waiting")
+	end
+	return true
+end
+
+-- Each frame: once the session has no pause (the resume), what waited for it is shipped, in the order it was made (a ship call that finds the
+-- session paused again keeps it again).
+function X.autoFlush()
+	local W = G.autoWait
+	if not W or #W == 0 or G.session.pauseAt ~= nil then return end
+	G.autoWait, G.autoDropped = nil, nil
+	logGui("pause over: " .. #W .. " action(s) no player made are shipped now, each applied at its stamp on every game")
+	for _, send in ipairs(W) do
+		local ok, err = pcall(send)
+		if not ok then logGui("pause over: shipping a waiting action failed: " .. tostring(err)) end
+	end
+end
+
 -- Where this game really stands during a pause (ClockMessage.stop: the host stamps the actions of the pause one step past the furthest):
 -- its time once it has not moved for X.STOP_SECONDS of real time and X.STOP_FRAMES frames with speed 0 set (the interface sees the time
 -- of the last frame the simulation finished; a few frames of one time prove nothing at x1). nil while it may still move.
@@ -4888,9 +4887,14 @@ function shipNative(o)
 		X.slotClose("this game's build was applied here at t=" .. tostring(o.at) .. " and its record sent", o.at, nil)
 		return true
 	end
+	local at = stampAfterFastest(now)
+	-- another mod's own command captured on the host (simForeign) is no player's action: never an item of the pause order (X.autoDefer)
+	if o.foreign and X.autoDefer(at, "another mod's " .. tostring(body.fn) .. " (simulation)", function()
+		local ok, why = shipNative(o)
+		if not ok then logGui("pause over: another mod's " .. tostring(body.fn) .. " (simulation) not shipped: " .. tostring(why)) end
+	end) then return true end
 	G.seq = G.seq + 1
 	local key = L.itemKey(C.PLAYER_ID, G.seq)
-	local at = stampAfterFastest(now)
 	-- a script's command made during the pause is applied in the host's pause order (X.routeOwn)
 	local pause = (o.script and X.hostStamps(at)) or nil
 	local applied = nil
@@ -5046,8 +5050,16 @@ function shipLocal(tag, cb)
 	local now = engine.gameTime()
 	local note = L.recentNotes(G.notes, now)
 	if #note > 0 then body.diverged = note end
-	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
+	-- no player's action (tag.auto, the host's copy of another mod's send): never an item of the pause order (X.autoDefer)
+	if tag.auto and X.autoDefer(at, "another mod's " .. tostring(tag.name), function()
+		local ok, why = shipLocal(tag, cb)
+		if not ok then
+			logGui("pause over: another mod's " .. tostring(tag.name) .. " not shipped: " .. tostring(why) .. "; applied on no game")
+			if cb then pcall(cb, {}, false, {}) end
+		end
+	end) then return true end
+	G.seq = G.seq + 1
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.hostStamps(at) or nil }
 	-- the category rides along so the host can mark an action its sender had no grant for (docs/PROTOCOL.md, Permissions)
 	local okS, whyS = X.sendOwn({ stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args), pause = it.pause })
@@ -7434,31 +7446,34 @@ function installWrap()
 			-- Another mod's code in this state runs on EVERY game alike when the game runs it by itself (a game script's guiUpdate, an event
 			-- every game receives), so every game's copy sends the same command or event (owner decision 2026-11-03, the simulation state's
 			-- rule): only the HOST's copy is shipped and applied at the stamp on every game, the other games drop theirs. Seen in play
-			-- (0.2.14): Pay Your Tolls' guiUpdate sends pyt.addToll and pyt.addCounts (toll income) on each game. What THIS game's player did
-			-- (its own tool's builder.* event, a click in a script's own GUI) is shipped from this game like any player action (X.guiTrigger).
+			-- (0.2.14): Pay Your Tolls' guiUpdate sends pyt.addToll and pyt.addCounts (toll income) on each game. Telling a send in answer
+			-- to THIS game's player (its own tool's builder.* event) apart is not possible here: the game's debug library has no getlocal
+			-- (seen in play, 0.2.14-beta.2: "attempt to call field 'getlocal' (a nil value)" at every send), so a handler's event cannot be
+			-- read, and the game calls each script's guiHandleEvent on its own, in an order FeverLink3 does not know, so no flag of the
+			-- bridge's own handler brackets another mod's. Every such send is the host's copy's (`auto`: no player made it, X.autoDefer).
 			-- A mod's window (the interface states, the UI hook) is a player's click on one game and stays shared from every player.
+			-- Read whenever a session is on for this game, also before this state has begun it (below: the frames of a reload before the
+			-- session's first frame). `tag.auto` already set: the host's copy kept from then, sent again now; its maker was read then.
 			local okW, mod = false, nil
-			if X.live() and tag.args.foreign == nil then
+			if C.ACTIVE == true and tag.args.foreign == nil and not tag.auto then
 				local okC, _, m = pcall(C.callerOf, wrapper, X.ownSources())
 				okW, mod = okC, okC and m or nil
 				if okC then tag.mod = m or false end   -- for the log of an event nobody registered (X.noteUnregistered)
 			end
 			if mod then
-				local okT, by, why = pcall(X.guiTrigger, mod)
-				if not okT then by, why = "every", "not read (" .. tostring(by) .. ")" end
 				G.foreignGui = G.foreignGui or {}
 				local what = tag.name == "makeScriptingSendEventCmd" and ("event " .. tostring(tag.args[2]) .. "/" .. tostring(tag.args[3])) or ("command " .. tag.name)
-				local line, n = C.tally(G.foreignGui, mod .. " " .. what .. " " .. by .. " " .. why)
-				if by == "every" and C.PLAYER_ID ~= 0 then
+				local line, n = C.tally(G.foreignGui, mod .. " " .. what)
+				if C.PLAYER_ID ~= 0 then
 					if line then
-						logGui("another mod's " .. what .. " (mod=" .. tostring(mod) .. ", script-interface state, from " .. why .. ") is dropped here: the host's copy of the mod sends it for every game (" .. n .. " so far)")
+						logGui("another mod's " .. what .. " (mod=" .. tostring(mod) .. ", script-interface state) is dropped here: the host's copy of the mod sends it for every game (" .. n .. " so far)")
 					end
 					return
 				end
 				if line then
-					logGui("another mod's " .. what .. " (mod=" .. tostring(mod) .. ", script-interface state, from " .. why .. ") is sent from "
-						.. (by == "local" and "this game (its player's action)" or "the host's copy for every game") .. " (" .. n .. " so far)")
+					logGui("another mod's " .. what .. " (mod=" .. tostring(mod) .. ", script-interface state) is sent from the host's copy for every game (" .. n .. " so far)")
 				end
+				tag.auto = true
 			end
 			if tag.name == "makeScriptingSendEventCmd" and okW then
 				if mod then
@@ -7469,6 +7484,27 @@ function installWrap()
 				end
 			end
 			if not X.live() then
+				-- A session is on but this state has not begun it yet: a reloaded world (a resync, a join) runs other mods' interface code
+				-- before the bridge's first frame. Seen in play (lab 0.2.14-beta.2 and a two-PC session 0.2.14-beta.1): after the resync
+				-- load Pay Your Tolls, whose memory of the vehicles it charged starts empty, booked the vehicles standing at its tolls again
+				-- (+4000 on each game) before either game's session began; each game's own copy went to its engine alone, at its own
+				-- moment, and the paused checksum after the reload differed in balance ("games still differ after the reload: balance")
+				-- while the next round was identical. The host's copy waits like one made in a pause (X.autoDefer: shipped at the resume,
+				-- applied at its stamp on every game; the other games dropped theirs above), so every action is either in the save or
+				-- applied after it on every game, never on one game alone.
+				if C.ACTIVE == true and tag.auto then
+					local W = G.autoWait or {}
+					G.autoWait = W
+					if #W >= X.AUTO_WAIT_MAX then
+						if cb then pcall(cb, {}, false, {}) end
+						return
+					end
+					W[#W + 1] = function() wrapper(cmd, cb, progress) end
+					if #W == 1 or #W % 50 == 0 then
+						logGui("another mod's " .. tostring(tag.name) .. " (mod=" .. tostring(tag.mod) .. ") is made before this game's session began (a reload): it waits for the session, shipped from the host's copy for every game; " .. #W .. " waiting")
+					end
+					return
+				end
 				-- no session (none began, or it ended: X.sessionOff): every command goes straight to the engine as in single-player, the
 				-- speed buttons included. A mod-level action has no engine command: it fails.
 				if L.COMMANDS[tag.name] and L.COMMANDS[tag.name].virtual then
@@ -8649,6 +8685,7 @@ function X.sessionOff(why, state)
 	G.parkCapped, G.pauseApplied, G.forked = nil, nil, nil   -- keys of this session (X.park, guiApplyNow, X.forkHere)
 	pcall(X.tallyOut, "session over")   -- what this state's wrap counted instead of logging each time: the session's counts
 	G.pauseQ, G.pauseOwn, G.pauseLast, G.slot = nil, nil, nil, nil
+	G.autoWait, G.autoDropped = nil, nil   -- actions no player made that waited for a resume (X.autoDefer): of this session
 	G.bresOutcome, G.bresOrder, G.noticeWait, G.builtLate, G.emptiedKeys = nil, nil, nil, nil, nil   -- build keys start again in the next session (X.buildOutcome)
 	-- where this game stood still at the pause (the clock's `stop`); the run on to a host's pause stamp (pauseRun) goes with G.session
 	G.still, X.curStop, G.lastStop = nil, nil, nil
@@ -8891,6 +8928,8 @@ local function guiUpdate(userParams, state, guiState)
 		if not okD then logGui("veto check failed: " .. tostring(errD)) end
 		local okP, errP = pcall(X.slotPump)
 		if not okP then logGui("pause slot pump failed: " .. tostring(errP)) end
+		local okA, errA = pcall(X.autoFlush)
+		if not okA then logGui("shipping the actions that waited for the resume failed: " .. tostring(errA)) end
 		pcall(X.frameMark, "nat")
 		coGuard("local company", syncLocalCompany)
 		coGuard("interface player", X.syncInterfacePlayer)
@@ -9148,6 +9187,13 @@ end
 -- list no GUI event names.
 local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	if not C.ACTIVE or type(name) ~= "string" then return end
+	-- the wrap is in place before any script's first guiUpdate: a loaded world's interface sends its events (idAdded of the tool
+	-- windows) seconds before the first frame (lab 0.2.14-beta.2: 00:14:04 events, 00:14:10 first frame), and another mod's
+	-- guiUpdate may run before the bridge's in that frame (the wrapped sendCommand keeps its sends for the session)
+	if not X.wrapped then
+		X.wrapped = true
+		installWrap()
+	end
 	if not name:find("^builder%.") then
 		local okS, errS = pcall(X.noteSelection, id, name, param)
 		if not okS then logGui("company: reading the selection failed: " .. tostring(errS)) end
